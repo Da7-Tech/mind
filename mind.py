@@ -502,11 +502,22 @@ class Hippocampus:
             except ImportError:
                 try:
                     import msvcrt
+                except ImportError:            # neither fcntl nor msvcrt:
+                    lock_backend = None        # degrade to atomic-write-only
+                else:
                     lockf.seek(0)
-                    msvcrt.locking(lockf.fileno(), msvcrt.LK_LOCK, 1)
+                    # LK_LOCK is not an indefinite blocking lock like flock:
+                    # the CRT retries once per second, 10 times, then raises
+                    # OSError — so a save contended for >10s would crash the
+                    # very scenario the lock exists for. Keep waiting instead,
+                    # exactly like the POSIX path.
+                    while True:
+                        try:
+                            msvcrt.locking(lockf.fileno(), msvcrt.LK_LOCK, 1)
+                            break
+                        except OSError:
+                            continue
                     lock_backend = ("msvcrt", msvcrt)
-                except ImportError:
-                    lock_backend = None
             try:
                 if self.path.exists():
                     try:
