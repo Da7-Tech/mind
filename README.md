@@ -1,5 +1,12 @@
 # mind — brain-like memory for any coding agent
 
+[![tests](https://github.com/Da7-Tech/mind/actions/workflows/ci.yml/badge.svg)](https://github.com/Da7-Tech/mind/actions/workflows/ci.yml)
+[![python](https://img.shields.io/badge/python-3.9%2B-blue)](https://github.com/Da7-Tech/mind/blob/main/.github/workflows/ci.yml)
+[![deps](https://img.shields.io/badge/dependencies-0-brightgreen)](https://github.com/Da7-Tech/mind/blob/main/mind.py)
+[![recall@1](https://img.shields.io/badge/recall%401-0.95_measured-success)](https://github.com/Da7-Tech/mind/blob/main/bench/bench.py)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![العربية](https://img.shields.io/badge/README-العربية-8A2BE2)](README.ar.md)
+
 **One Python file. Zero dependencies. Zero API keys. Fully offline. Bilingual (EN + AR).**
 
 Your coding agent forgets everything between sessions. `mind` gives it a memory
@@ -147,3 +154,13 @@ python3 bench/bench.py                  # reproduce the numbers above
 
 Design rationale: [docs/DESIGN.md](docs/DESIGN.md) ·
 Arabic README: [README.ar.md](README.ar.md) · License: MIT
+
+## Contributing
+
+Issues and PRs welcome — the [roadmap issues](https://github.com/Da7-Tech/mind/issues)
+are scoped and ready to pick up. Ground rules: keep `mind.py` a single
+stdlib-only file, every change needs a test, and claims need measurements
+(`bench/bench.py` must stay green). Questions →
+[Discussions](https://github.com/Da7-Tech/mind/discussions).
+
+If `mind` remembers something useful for you, a ⭐ helps other agents' humans find it.
