@@ -4,7 +4,8 @@ mind — brain-like memory for any coding agent.
 
 Three layers (working / hippocampus / cortex) + spreading-activation recall
 + Ebbinghaus forgetting + dream consolidation between sessions + export to
-every agent (AGENTS.md / CLAUDE.md / GEMINI.md). One file. Zero dependencies.
+common agent rule files (AGENTS.md / CLAUDE.md / GEMINI.md / tool-specific
+dotfiles). One file. Zero dependencies.
 Fully offline. Bilingual (English + Arabic) tokenization built in.
 
 Usage: python3 mind.py <command> [args]
@@ -14,7 +15,7 @@ Usage: python3 mind.py <command> [args]
   recall "question"    spreading-activation recall (RRF + IDF fusion)
   correct "old" "new"  reconsolidate: rewrite a wrong memory, keep history
   dream [--dry-run]    run the sleep cycle (light -> deep -> REM)
-  export               regenerate AGENTS.md / CLAUDE.md / GEMINI.md
+  export               regenerate agent rule files
   status               memory health report
 
 Design: docs/DESIGN.md  |  License: MIT  |  https://github.com/Da7-Tech/mind
@@ -70,7 +71,8 @@ def _atomic_write(path, data):
     if path.is_symlink():
         raise ValueError(f"refusing to write through a symlink: {path}")
     tmp = str(path) + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_TRUNC, 0o644)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | nofollow | os.O_TRUNC, 0o644)
     try:
         os.write(fd, data.encode("utf-8") if isinstance(data, str) else data)
     finally:
@@ -944,7 +946,15 @@ class Dreamer:
 class Active:
     BEGIN = "<!-- mind:memory begin (auto-generated, do not edit) -->"
     END = "<!-- mind:memory end -->"
-    TARGETS = ("AGENTS.md", "CLAUDE.md", "GEMINI.md")
+    TARGETS = (
+        "AGENTS.md",
+        "CLAUDE.md",
+        "GEMINI.md",
+        ".cursorrules",
+        ".windsurfrules",
+        ".clinerules",
+        ".roo/rules/mind.md",
+    )
 
     def __init__(self, mind_dir, hippo, cortex):
         self.dir = mind_dir
@@ -998,10 +1008,22 @@ class Active:
         src = self.path.read_text("utf-8") if self.path.exists() else ""
         written = []
         for target in self.TARGETS:
-            tpath = project_root / target
+            target_path = Path(target)
+            tpath = project_root / target_path
+            parent = project_root
+            skip = False
+            for part in target_path.parent.parts:
+                parent = parent / part
+                if parent.exists() and parent.is_symlink():
+                    written.append("%s (skipped: symlink parent)" % target)
+                    skip = True
+                    break
+            if skip:
+                continue
             if tpath.is_symlink():
                 written.append("%s (skipped: symlink)" % target)
                 continue
+            tpath.parent.mkdir(parents=True, exist_ok=True)
             user_content = ""
             if tpath.exists():
                 content = tpath.read_text("utf-8")
@@ -1071,6 +1093,7 @@ agent files exported:
   AGENTS.md   (Codex, Cursor, Zed, ...)
   CLAUDE.md   (Claude Code)
   GEMINI.md   (Gemini CLI)
+  .cursorrules / .windsurfrules / .clinerules / .roo/rules/mind.md
 
 start with:  python3 mind.py remember "first thing to remember"
 then:        python3 mind.py recall "your question"
