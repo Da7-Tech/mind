@@ -19,4 +19,4 @@ hardening suggestions. You can expect an initial response within a few days.
   refused or skipped — never written through.
 - Memory text is stripped of terminal control characters on write.
 - No network access, no subprocess execution, no eval — the file can be
-  fully audited in one sitting (~1,300 lines).
+  fully audited in one sitting (~1,500 lines).

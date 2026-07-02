@@ -866,6 +866,104 @@ class TestAuditFindings2(TmpDirTest):
         self.assertEqual(src.count("datetime.now()"), 1,
                          "only _now() may call datetime.now()")
 
+    def test_correct_cleans_control_chars_and_hashes_like_remember(self):
+        """correct() is a write path: it must apply the same control-char
+        hygiene as remember(), and store the text under the id remember()
+        would produce for it — otherwise a later remember() of the same
+        (cleaned) text creates a duplicate node."""
+        h = self.hippo()
+        h.remember("the database is mysql eight")
+        dirty = "the database is \x1b[31mpostgres\x1b[0m 16"
+        old = h.correct("database mysql", dirty)
+        self.assertIsNotNone(old)
+        expected_id = h._id(h._clean_text(dirty))
+        self.assertIn(expected_id, h.nodes)
+        self.assertNotIn("\x1b", h.nodes[expected_id]["text"])
+
+    def test_correct_to_empty_text_refused(self):
+        """An empty (or control-chars-only) replacement must never blank
+        a memory."""
+        h = self.hippo()
+        h.remember("the deploy target is hetzner via docker")
+        with self.assertRaises(ValueError):
+            h.correct("deploy hetzner", "   ")
+        with self.assertRaises(ValueError):
+            h.correct("deploy hetzner", "\x1b\x07")
+        self.assertTrue(any("hetzner" in n["text"] for n in h.nodes.values()))
+
+    def test_self_link_refused(self):
+        """A self-loop edge would feed a node its own activation on every
+        spreading hop, silently inflating its rank."""
+        h = self.hippo()
+        nid = h.remember("solo fact about the caching layer")
+        with self.assertRaises(ValueError):
+            h.link("solo fact about the caching layer",
+                   "solo fact about the caching layer")
+        # a control-char variant cleans to the same text → same id → refused
+        with self.assertRaises(ValueError):
+            h.link("solo fact about the caching layer",
+                   "solo fact about\x1b the caching layer")
+        self.assertNotIn(nid, h.edges.get(nid, {}))
+
+    def test_non_string_timestamp_does_not_crash_decay(self):
+        """A hand-edited graph with a numeric last_accessed must degrade
+        gracefully (repair on load; treat as fresh in decay), not crash
+        the whole dream with TypeError."""
+        gpath = self.mind_dir / "graph.json"
+        gpath.write_text('{"nodes":{"aaa":{"text":"fact with numeric time",'
+                         '"last_accessed":12345,"created":67890}},"edges":{}}',
+                         encoding="utf-8")
+        h = Hippocampus(gpath)
+        self.assertIsInstance(h.nodes["aaa"]["last_accessed"], str)
+        h.decay()                                    # must not raise
+        self.assertIn("aaa", h.nodes)
+        # and the in-memory mutation path (bypasses _load's repair):
+        h.nodes["aaa"]["last_accessed"] = 12345
+        h.decay()                                    # must not raise
+        self.assertIn("aaa", h.nodes)
+
+    def test_key_extraction_deterministic_across_hash_seeds(self):
+        """The [:24] key truncation must pick the same subset on every
+        machine: set iteration order varies with str-hash randomization,
+        which silently made identical `remember` calls store different
+        keys per run."""
+        import subprocess
+        root = str(Path(__file__).resolve().parent.parent)
+        snippet = (
+            "import sys, tempfile\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, %r)\n"
+            "import mind\n"
+            "h = mind.Hippocampus(Path(tempfile.mkdtemp()) / 'g.json')\n"
+            "text = ' '.join('word%%d unique%%d' %% (i, i) for i in range(20))\n"
+            "print('|'.join(h._extract_keys(text)))\n" % root)
+        outs = []
+        for seed in ("0", "1"):
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            r = subprocess.run([sys.executable, "-c", snippet],
+                               capture_output=True, text=True, env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            outs.append(r.stdout.strip())
+        self.assertEqual(outs[0], outs[1],
+                         "key truncation must not depend on the hash seed")
+        self.assertTrue(outs[0].startswith("word0|"),
+                        "keys must preserve first-appearance order")
+
+    def test_working_memory_budget_not_quadrupled(self):
+        """The hot list must respect ACTIVE_TOKEN_BUDGET as documented
+        (characters), not 4× it: a 3000-char memory must be skipped."""
+        h, c = self.hippo(), Cortex(self.mind_dir / "cortex")
+        a = Active(self.mind_dir, h, c)
+        h.remember("big " * 750)                     # ~3000 chars
+        h.remember("small fact that fits the working set")
+        a.generate(self.tmp)
+        active = (self.mind_dir / "ACTIVE.md").read_text("utf-8")
+        hot_section = active.split("## Hot memories")[1].split("##")[0]
+        hot = [ln for ln in hot_section.splitlines() if ln.startswith("- ")]
+        self.assertTrue(any("small fact" in ln for ln in hot))
+        self.assertLessEqual(sum(len(ln) for ln in hot),
+                             M.ACTIVE_TOKEN_BUDGET)
+
 
 # ─────────────────────────────── CLI ───────────────────────────────
 class TestCLI(TmpDirTest):

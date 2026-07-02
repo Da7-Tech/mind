@@ -1,5 +1,33 @@
 # Changelog
 
+## 5.4.2 — 2026-07-02
+
+Full-repository precision review (every file, line by line). Six defects
+found and fixed, each with a regression test that fails on 5.4.1 (94 total):
+
+- **`correct` skipped the control-char sanitizer** that `remember` applies:
+  a corrected memory could carry ANSI escapes back to the terminal on
+  recall (violating the SECURITY.md hygiene claim) and was stored under an
+  id `remember()` would never produce, so re-remembering the same cleaned
+  text created a duplicate node. An empty or control-chars-only
+  replacement also silently blanked the memory — both now refused (CLI
+  validates too).
+- **`link` accepted self-links**, creating a self-loop edge that fed a
+  node its own activation on every spreading hop and silently inflated
+  its rank.
+- **Working memory grew to 4× its documented size**: the hot-list budget
+  applied a leftover ×4 token→char conversion on top of a constant already
+  expressed in characters, so ACTIVE.md could reach ~800 tokens while the
+  README promised ~200.
+- **Key extraction was nondeterministic across machines**: the [:24]
+  truncation iterated a set, whose order varies with str-hash
+  randomization — identical `remember` calls could store different key
+  subsets per run/machine. Keys now preserve first-appearance order.
+- **A non-string timestamp crashed `dream`**: `decay` caught only
+  ValueError, so a hand-edited numeric `last_accessed` raised TypeError.
+  Repaired on load and tolerated in decay, like every other field.
+- Cosmetic: redundant dict copy in the save merge.
+
 ## 5.4.1 — 2026-07-02
 
 Follow-up to the 5.4.0 edge-merge fix (caught by a third adversarial pass):

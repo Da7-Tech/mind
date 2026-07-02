@@ -60,7 +60,7 @@ first monthly recall; decayed weight vetoing exact matches) — both fixed
 with regression tests. The one benchmark miss (`"what css framework"`
 → tailwind) is an honest limitation documented below, not hidden.
 
-Test suite: **88 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **94 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, and corrupt-graph recovery.
 
@@ -181,7 +181,7 @@ nothing else to configure. A ready-made Hermes skill lives in
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 88 tests
+python3 -m unittest discover -s tests   # 94 tests
 python3 bench/bench.py                  # reproduce the numbers above
 ```
 

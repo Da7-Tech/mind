@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "5.4.1"
+__version__ = "5.4.2"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -448,6 +448,12 @@ class Hippocampus:
             n.setdefault("keys", [])
             n.setdefault("last_accessed", _now().isoformat())
             n.setdefault("created", _now().isoformat())
+            # timestamps must be ISO strings: a hand-edit that leaves a
+            # number here would crash decay with TypeError, not ValueError
+            # (auditor finding) — repair to "now" like the numeric fields
+            for f in ("last_accessed", "created"):
+                if not isinstance(n.get(f), str):
+                    n[f] = _now().isoformat()
             # coerce numeric fields: a hand-edit or bad restore that leaves a
             # non-numeric weight must repair to a default, not brick every
             # command on the first arithmetic use (auditor finding)
@@ -519,7 +525,7 @@ class Hippocampus:
                             merged_e[k] = {nbr: e for nbr, e in v.items()
                                            if nbr not in self._deleted
                                            and (k, nbr) not in self._pruned_edges}
-                        merged_e.update({k: v for k, v in self.edges.items()})
+                        merged_e.update(self.edges)
                         # drop node-keys the disk left empty after stripping
                         merged_e = {k: v for k, v in merged_e.items() if v}
                         self.nodes, self.edges = merged_n, merged_e
@@ -565,20 +571,26 @@ class Hippocampus:
             if phrase in cleaned:
                 cleaned = cleaned.replace(phrase, " %s " % rep)
         words = re.findall(r'[\w؀-ۿ]{3,}', cleaned.lower())
-        keys = set()
+        # insertion-ordered dict, not a set: the [:24] truncation below must
+        # be deterministic. Set iteration order varies with str-hash
+        # randomization, so the same text could store a different key subset
+        # on every machine/run — breaking the "same input, same graph"
+        # property the dream cycle's determinism rests on (auditor finding).
+        keys = {}
         for w in words:
             if w in STOPWORDS:
                 continue
-            keys.add(NORMALIZE.get(w, w))
+            keys.setdefault(NORMALIZE.get(w, w))
         text_tokens = set(re.findall(r'[\w؀-ۿ]+', cleaned.lower()))
         if text_tokens & PRONOUN_FALLBACK or (is_query and len(keys) == 0):
-            keys.update(IDENTITY_KEYS)
+            for k in sorted(IDENTITY_KEYS):
+                keys.setdefault(k)
         self._ensure_related()
         if self.related is not None:
             for w in list(keys):
                 for term, sc in self.related.related(w, top_k=4):
                     if sc >= 0.15:
-                        keys.add(term)
+                        keys.setdefault(term)
         return list(keys)[:24]
 
     @staticmethod
@@ -631,6 +643,10 @@ class Hippocampus:
         # at a phantom id and is dropped on next load (auditor finding)
         text_a, text_b = self._clean_text(text_a), self._clean_text(text_b)
         id_a, id_b = self._id(text_a), self._id(text_b)
+        # a self-loop would feed a node its own activation on every hop of
+        # spreading recall, silently inflating its rank (auditor finding)
+        if id_a == id_b:
+            raise ValueError("cannot link a memory to itself")
         if id_a not in self.nodes:
             self.remember(text_a)
         if id_b not in self.nodes:
@@ -656,6 +672,13 @@ class Hippocampus:
         Destructive-op gate: the match must share at least two content
         tokens with the hint (or cover half of a short hint) — a one-word
         coincidence must never rewrite an unrelated memory."""
+        # same control-char hygiene and hashing as remember(): correct is a
+        # write path too, and an uncleaned new_text would store text under
+        # an id remember() would never produce (auditor finding). An empty
+        # replacement would silently blank a memory — refuse it.
+        new_text = self._clean_text(new_text)
+        if not new_text:
+            raise ValueError("corrected text must not be empty")
         if not self.nodes:
             return None
         results, _, _ = self.recall(old_hint, top_k=1)
@@ -670,8 +693,8 @@ class Hippocampus:
         old_text = node["text"]
         history = node.setdefault("history", [])
         history.append({"text": old_text, "replaced": _now().isoformat()})
-        new_nid = self._id(new_text.strip())
-        node["text"] = new_text.strip()
+        new_nid = self._id(new_text)
+        node["text"] = new_text
         node["keys"] = self._extract_keys(new_text)
         node["confidence"] = round(node.get("confidence", 1.0) * 0.7, 3)
         node["last_accessed"] = _now().isoformat()
@@ -867,7 +890,10 @@ class Hippocampus:
             n = self.nodes[nid]
             try:
                 days = (now - datetime.fromisoformat(n["last_accessed"])).days
-            except ValueError:
+            except (TypeError, ValueError):
+                # TypeError too: an in-memory non-string timestamp (mutated
+                # after load bypasses _load's repair) must degrade to
+                # "fresh", not crash the whole dream (auditor finding)
                 days = 0
             # a future last_accessed (clock skew / cross-machine sync — this
             # IS synced agent memory, and _now() is naive local time) makes
@@ -1177,7 +1203,11 @@ class Active:
         hot, used = [], 0
         for n in nodes_sorted:
             line = "- %s" % n["text"]
-            if used + len(line) > ACTIVE_TOKEN_BUDGET * 4:
+            # the budget constant is already in characters (~200 tokens);
+            # a leftover ×4 token→char conversion applied on top let the
+            # hot list grow to 4× the documented working-memory size
+            # (auditor finding)
+            if used + len(line) > ACTIVE_TOKEN_BUDGET:
                 continue    # skip oversized memories, keep filling the budget
             hot.append(line)
             used += len(line)
@@ -1504,8 +1534,8 @@ def main(argv=None):
                 _die('usage: python3 mind.py confirm <id> [<id>...] (ids come from recall output)')
             m.confirm(argv[1:])
         elif cmd == "correct":
-            if len(argv) < 3:
-                _die('usage: python3 mind.py correct "old text hint" "corrected fact"')
+            if len(argv) < 3 or not argv[1].strip() or not argv[2].strip():
+                _die('usage: python3 mind.py correct "old text hint" "corrected fact" (neither may be empty)')
             m.correct(argv[1], argv[2])
         elif cmd == "dream":
             m.dream(dry_run="--dry-run" in argv[1:])
