@@ -4,7 +4,8 @@ mind — brain-like memory for any coding agent.
 
 Three layers (working / hippocampus / cortex) + spreading-activation recall
 + Ebbinghaus forgetting + dream consolidation between sessions + export to
-every agent (AGENTS.md / CLAUDE.md / GEMINI.md). One file. Zero dependencies.
+every agent (AGENTS.md / CLAUDE.md / GEMINI.md / rules files). One file.
+Zero dependencies.
 Fully offline. Bilingual (English + Arabic) tokenization built in.
 
 Usage: python3 mind.py <command> [args]
@@ -14,7 +15,7 @@ Usage: python3 mind.py <command> [args]
   recall "question"    spreading-activation recall (RRF + IDF fusion)
   correct "old" "new"  reconsolidate: rewrite a wrong memory, keep history
   dream [--dry-run]    run the sleep cycle (light -> deep -> REM)
-  export               regenerate AGENTS.md / CLAUDE.md / GEMINI.md
+  export               regenerate agent instruction files
   status               memory health report
 
 Design: docs/DESIGN.md  |  License: MIT  |  https://github.com/Da7-Tech/mind
@@ -944,7 +945,15 @@ class Dreamer:
 class Active:
     BEGIN = "<!-- mind:memory begin (auto-generated, do not edit) -->"
     END = "<!-- mind:memory end -->"
-    TARGETS = ("AGENTS.md", "CLAUDE.md", "GEMINI.md")
+    TARGETS = (
+        {"path": "AGENTS.md", "separator": "---\n<!-- user content below -->"},
+        {"path": "CLAUDE.md", "separator": "---\n<!-- user content below -->"},
+        {"path": "GEMINI.md", "separator": "---\n<!-- user content below -->"},
+        {"path": ".cursorrules", "separator": "# user content below"},
+        {"path": ".windsurfrules", "separator": "# user content below"},
+        {"path": ".clinerules", "separator": "# user content below"},
+        {"path": ".roo/rules/mind.md", "separator": "---\n<!-- user content below -->"},
+    )
 
     def __init__(self, mind_dir, hippo, cortex):
         self.dir = mind_dir
@@ -997,7 +1006,9 @@ class Active:
         preserving any user content outside the guard markers."""
         src = self.path.read_text("utf-8") if self.path.exists() else ""
         written = []
-        for target in self.TARGETS:
+        for spec in self.TARGETS:
+            target = spec["path"]
+            separator = spec["separator"]
             tpath = project_root / target
             if tpath.is_symlink():
                 written.append("%s (skipped: symlink)" % target)
@@ -1010,9 +1021,7 @@ class Active:
                     after = content.split(self.END)[-1] if self.END in content else ""
                     user_content = (before + after).strip()
                     # strip our own separator artifacts so re-export is idempotent
-                    user_content = re.sub(
-                        r'^---\s*\n<!-- user content below -->\s*\n?', '',
-                        user_content).strip()
+                    user_content = self._strip_export_separator(user_content)
                 else:
                     stripped = content.strip()
                     # Do not re-ingest our own stale block as "user content"
@@ -1022,14 +1031,22 @@ class Active:
                         user_content = stripped
             block = "%s\n%s\n%s" % (self.BEGIN, src, self.END)
             if user_content:
-                new_content = "%s\n\n---\n<!-- user content below -->\n%s\n" % (
-                    block, user_content)
+                new_content = "%s\n\n%s\n%s\n" % (block, separator, user_content)
                 written.append("%s (memory + preserved content)" % target)
             else:
                 new_content = block + "\n"
                 written.append("%s (memory)" % target)
+            tpath.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(tpath, new_content)
         return written
+
+    @classmethod
+    def _strip_export_separator(cls, content):
+        out = content
+        for spec in cls.TARGETS:
+            sep = re.escape(spec["separator"])
+            out = re.sub(r"^%s\s*\n?" % sep, "", out).strip()
+        return out
 
 
 # ────────────────────────────────────────────────────────────────
@@ -1071,6 +1088,7 @@ agent files exported:
   AGENTS.md   (Codex, Cursor, Zed, ...)
   CLAUDE.md   (Claude Code)
   GEMINI.md   (Gemini CLI)
+  .cursorrules / .windsurfrules / .clinerules / .roo/rules/mind.md
 
 start with:  python3 mind.py remember "first thing to remember"
 then:        python3 mind.py recall "your question"
@@ -1092,7 +1110,7 @@ between sessions:  python3 mind.py dream""" % self.dir)
         self.active.export_to_agents(self.root)
         print("remembered: %s" % text)
         print("  (node %s, total nodes: %d)" % (nid, len(self.hippo.nodes)))
-        print("  ACTIVE.md + AGENTS.md/CLAUDE.md/GEMINI.md updated")
+        print("  ACTIVE.md + agent instruction files updated")
 
     def link(self, a, b, relation="related"):
         self._ensure()

@@ -471,10 +471,18 @@ class TestActiveExport(TmpDirTest):
         h.remember("exported fact")
         a.generate(self.tmp)
         a.export_to_agents(self.tmp)
-        for f in ("AGENTS.md", "CLAUDE.md", "GEMINI.md"):
+        for f in [spec["path"] for spec in Active.TARGETS]:
             content = (self.tmp / f).read_text("utf-8")
             self.assertIn("exported fact", content)
             self.assertIn(Active.BEGIN, content)
+
+    def test_export_creates_nested_roo_rules_parent(self):
+        h, c, a = self.parts()
+        h.remember("roo memory")
+        a.generate(self.tmp)
+        a.export_to_agents(self.tmp)
+        content = (self.tmp / ".roo" / "rules" / "mind.md").read_text("utf-8")
+        self.assertIn("roo memory", content)
 
     def test_export_preserves_user_content(self):
         h, c, a = self.parts()
@@ -486,6 +494,22 @@ class TestActiveExport(TmpDirTest):
         content = (self.tmp / "AGENTS.md").read_text("utf-8")
         self.assertIn("My own rules", content)
         self.assertIn("a fact", content)
+
+    def test_export_preserves_rules_file_user_content(self):
+        h, c, a = self.parts()
+        (self.tmp / ".cursorrules").write_text("Keep answers short.\n",
+                                               encoding="utf-8")
+        h.remember("cursor memory")
+        a.generate(self.tmp)
+        a.export_to_agents(self.tmp)
+        first = (self.tmp / ".cursorrules").read_text("utf-8")
+        a.export_to_agents(self.tmp)
+        second = (self.tmp / ".cursorrules").read_text("utf-8")
+        self.assertEqual(first, second)
+        self.assertIn("cursor memory", second)
+        self.assertIn("Keep answers short.", second)
+        self.assertIn("# user content below", second)
+        self.assertEqual(second.count("Keep answers short."), 1)
 
     def test_reexport_is_idempotent(self):
         h, c, a = self.parts()

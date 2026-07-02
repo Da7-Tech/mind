@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Export working memory to Cursor, Windsurf, Cline, and Roo rules files while
+  preserving existing user content behind the same guard-marker contract.
+
 ## 5.1.0 — 2026-07-02
 
 Soak-hardened forgetting. A new 180-day simulated-usage soak test

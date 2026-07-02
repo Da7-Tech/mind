@@ -57,14 +57,14 @@ first monthly recall; decayed weight vetoing exact matches) — both fixed
 with regression tests. The one benchmark miss (`"what css framework"`
 → tailwind) is an honest limitation documented below, not hidden.
 
-Test suite: **61 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **63 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, and corrupt-graph recovery.
 
 ## How it works — three layers, like a brain
 
 ```
-Layer 1  WORKING MEMORY   .mind/ACTIVE.md  → injected into AGENTS.md/CLAUDE.md/GEMINI.md
+Layer 1  WORKING MEMORY   .mind/ACTIVE.md  → injected into agent instruction files
          the ~200 tokens the agent always sees: hottest memories + cortex index
 
 Layer 2  HIPPOCAMPUS      .mind/graph.json → weighted concept graph
@@ -103,7 +103,7 @@ python3 mind.py correct "database mysql" "the database is postgres 16"
 | HippoRAG 2 | ✓ PageRank | ✗ | ✗ (batch RAG lib) | ✗ GPU/API | ✗ |
 | OpenClaw dreams | ✗ | ✓ | ✗ (OpenClaw only) | ✓ inside OpenClaw | ✗ burns tokens |
 | claude-mem | ✗ | ✗ compression | ~ several agents | ✗ Bun + worker + Chroma | ✗ |
-| **mind** | **✓** | **✓ deterministic** | **✓ AGENTS/CLAUDE/GEMINI** | **✓ one file** | **✓** |
+| **mind** | **✓** | **✓ deterministic** | **✓ AGENTS/CLAUDE/GEMINI + rules files** | **✓ one file** | **✓** |
 
 Honest note: [Brain Memory](https://github.com/omelas-tech/brain) is the
 closest project in spirit (files + decay + sleep phases) — credit where due.
@@ -121,7 +121,7 @@ reproducible benchmark instead of claims.
 | `recall "question"` | spreading-activation recall |
 | `correct "old" "new"` | reconsolidate a wrong memory (history kept) |
 | `dream [--dry-run]` | run the sleep cycle; journal in `.mind/dreams/` |
-| `export` | regenerate `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` |
+| `export` | regenerate agent instruction files |
 | `status` | health report |
 
 Reinforcement is explicit: `recall` is pure read (repeated queries can't
@@ -132,7 +132,7 @@ skew weights); agents confirm useful hits via the `bump()` API.
 - **Atomic, symlink-refusing writes** everywhere (no torn files, no symlink attacks)
 - **Never silently destroys data**: corrupt graphs are quarantined, not erased;
   memories pruned by decay are archived to `.mind/archive.md`, not destroyed;
-  user content in `AGENTS.md`/`CLAUDE.md` is preserved outside guard markers
+  user content in exported agent files is preserved outside guard markers
 - **`dream --dry-run`** previews the full plan without touching disk
 - **File-locked saves** — safe under concurrent agent processes
 - Memory files are plain JSON + Markdown: `git diff` them, sync them, read them
@@ -154,16 +154,16 @@ skew weights); agents confirm useful hits via the `bump()` API.
 
 ## Using with Hermes, Claude Code, Codex, Gemini CLI...
 
-`mind init` writes the working memory into `AGENTS.md`, `CLAUDE.md` and
-`GEMINI.md` with guard markers, preserving your existing content. Any agent
-that reads those files gets the memory and the instructions to use it —
-nothing else to configure. A ready-made Hermes skill lives in
-[`SKILL.md`](SKILL.md).
+`mind init` writes the working memory into `AGENTS.md`, `CLAUDE.md`,
+`GEMINI.md`, `.cursorrules`, `.windsurfrules`, `.clinerules`, and
+`.roo/rules/mind.md` with guard markers, preserving your existing content. Any
+agent that reads those files gets the memory and the instructions to use it —
+nothing else to configure. A ready-made Hermes skill lives in [`SKILL.md`](SKILL.md).
 
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 61 tests
+python3 -m unittest discover -s tests   # 63 tests
 python3 bench/bench.py                  # reproduce the numbers above
 ```
 

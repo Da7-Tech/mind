@@ -24,7 +24,7 @@ dreams between sessions, and portable to any agent through one standard file.
    but conflicts are *flagged*, never auto-deleted; `correct` performs
    explicit reconsolidation with history.
 5. **One `init` + automatic export** for every agent
-   (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`) behind guard markers.
+   (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, and rules files) behind guard markers.
 6. **Writes during the session, dreams between sessions** — the agent
    itself is the live half of the loop; the dreamer is the offline half.
 7. **Measure before claiming** — accuracy/latency/size are benchmarked
