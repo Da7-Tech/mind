@@ -3,12 +3,12 @@
 [![tests](https://github.com/Da7-Tech/mind/actions/workflows/ci.yml/badge.svg)](https://github.com/Da7-Tech/mind/actions/workflows/ci.yml)
 [![python](https://img.shields.io/badge/python-3.9%2B-blue)](https://github.com/Da7-Tech/mind/blob/main/.github/workflows/ci.yml)
 [![deps](https://img.shields.io/badge/dependencies-0-brightgreen)](https://github.com/Da7-Tech/mind/blob/main/mind.py)
-[![recall@1](https://img.shields.io/badge/recall%401-0.95_measured-success)](https://github.com/Da7-Tech/mind/blob/main/bench/bench.py)
+[![recall@1](https://img.shields.io/badge/recall%401-1.00_measured-success)](https://github.com/Da7-Tech/mind/blob/main/bench/bench.py)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![English](https://img.shields.io/badge/README-English-2ea44f)](README.md)
 [![العربية](https://img.shields.io/badge/README-%EF%BA%8D%EF%BB%9F%EF%BB%8C%EF%BA%AE%EF%BA%91%EF%BB%B4%EF%BA%94-8A2BE2)](README.ar.md)
 
-**One Python file. Zero dependencies. Zero API keys. Fully offline. Bilingual (EN + AR).**
+**One Python file. Zero dependencies. Zero API keys. Fully offline. Multilingual — engineered for EN + AR, measured on 10 languages.**
 
 Your coding agent forgets everything between sessions. `mind` gives it a memory
 that works the way yours does: a weighted concept graph that recalls by
@@ -65,6 +65,21 @@ real calibration bugs before release (facts pruned one day before their
 first monthly recall; decayed weight vetoing exact matches) — both fixed
 with regression tests.
 
+**Multilingual, measured** (`bench/multilang.py`, runs in CI): the tool is
+*engineered* for English + Arabic, but the core (Unicode tokenizer, IDF,
+char-n-gram fallback) is language-neutral, and 5.6.0 adds character-bigram
+indexing for scripts written without spaces. Recall@1 on 8 languages it
+was never tuned for, each against distractor noise:
+
+| French | German | Spanish | Russian | Turkish | Chinese | Japanese | Korean |
+|---|---|---|---|---|---|---|---|
+| 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 | 3/3 |
+
+(Chinese/Japanese were 3/6 before the bigram tokenizer. 3 queries per
+language is a smoke benchmark, not the 20-query EN/AR suite; heavy
+inflection without stemming will cost precision in cases it doesn't
+cover. Thai is tokenized the same way but not yet benchmarked.)
+
 **Fuzzed** (`bench/fuzz.py`, seeded + deterministic, runs in CI): 420
 adversarial cases — hostile graph files (NaN/Infinity, wrong-typed fields,
 control characters, truncated JSON, dangling edges) and hostile CLI input.
@@ -80,7 +95,7 @@ Surviving mutants are triaged in the tool's output: unreachable `get()`
 defaults, display-only constants, and ranking-calibration values guarded
 by the CI benchmark gate (recall@1 ≥ 0.9) rather than unit assertions.
 
-Test suite: **118 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **122 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, corrupt-graph recovery, and
 a mutation-kill class where every test pins a behavior the suite
@@ -182,7 +197,13 @@ so connections that never earn a confirmation decay and prune away.
   close the remainder at the cost of the zero-dependency promise; a
   pluggable backend is on the roadmap.
 - Arabic stemming is light (prefix/suffix + broken-plural seed), not a full
-  morphological analyzer.
+  morphological analyzer. Other languages get no stemming or stopword
+  lists at all — IDF and character n-grams carry them (measured above),
+  but inflection-heavy queries will miss more often than in EN/AR.
+- No-space scripts (Chinese, Japanese, Korean, Thai) are indexed as
+  character bigrams, not true word segmentation — the standard
+  search-engine tradeoff: excellent recall, occasional false bigram
+  overlap between unrelated phrases.
 - Optimized for personal/project agent memory (10²–10³ nodes), not
   enterprise RAG over millions of documents — use a real graph DB for that.
 - Tokens shorter than 3 characters (`db`, `ai`, `os`) are not indexed —
@@ -208,7 +229,8 @@ nothing else to configure. A ready-made Hermes skill lives in
 
 ```bash
 python3 -m unittest discover -s tests   # 118 tests
-python3 bench/bench.py                  # reproduce the numbers above
+python3 bench/bench.py                  # reproduce the EN/AR numbers
+python3 bench/multilang.py              # 8 untuned languages
 python3 bench/soak.py                   # 180 simulated days
 python3 bench/fuzz.py                   # 420 adversarial cases
 python3 bench/mutate.py                 # does the suite actually bite?

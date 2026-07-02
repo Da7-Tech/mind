@@ -1125,6 +1125,47 @@ class TestV550(TmpDirTest):
         self.assertIn("postgres", results[0][2]["text"])
 
 
+# ──────────── no-space scripts (CJK/kana/Hangul bigrams, 5.6.0) ────────────
+class TestNoSpaceScripts(TmpDirTest):
+    def test_tokenizer_bigrams_and_mixed_runs(self):
+        """No-space runs become character bigrams; embedded Latin words
+        inside the same run are kept whole; EN/AR are untouched."""
+        self.assertEqual(M._tokenize("项目数据库是postgres十六版本"),
+                         ["项目", "目数", "数据", "据库", "库是",
+                          "postgres", "十六", "六版", "版本"])
+        self.assertEqual(M._tokenize("the database is postgres"),
+                         ["the", "database", "postgres"])
+        self.assertEqual(M._tokenize("قاعدة البيانات بوستغرس"),
+                         ["قاعدة", "البيانات", "بوستغرس"])
+        self.assertEqual(M._tokenize("中"), ["中"])   # single char survives
+
+    def test_chinese_recall(self):
+        """The exact case that returned NOTHING before 5.6.0."""
+        h = self.hippo()
+        h.remember("项目数据库是postgres十六版本")
+        h.remember("主服务器位于法兰克福机房")
+        results, _, _ = h.recall("我们用什么数据库")
+        self.assertTrue(results)
+        self.assertIn("postgres", results[0][2]["text"])
+
+    def test_japanese_recall(self):
+        h = self.hippo()
+        h.remember("プロジェクトのデータベースはpostgres十六です")
+        h.remember("メインサーバーはフランクフルトにあります")
+        results, _, _ = h.recall("データベースは何ですか")
+        self.assertTrue(results)
+        self.assertIn("postgres", results[0][2]["text"])
+
+    def test_korean_two_char_word_indexed(self):
+        """Korean words are often 2 syllables — the 3-char floor used to
+        drop them entirely."""
+        h = self.hippo()
+        h.remember("메인 서버는 프랑크푸르트에 있다")
+        results, _, _ = h.recall("서버 어디")
+        self.assertTrue(results)
+        self.assertIn("프랑크푸르트", results[0][2]["text"])
+
+
 # ──────────────── mutation-testing kills (bench/mutate.py) ────────────────
 class TestMutationKills(TmpDirTest):
     """Each test kills one or more surviving mutants from bench/mutate.py —

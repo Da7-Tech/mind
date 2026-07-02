@@ -1,5 +1,30 @@
 # Changelog
 
+## 5.6.0 — 2026-07-02
+
+The languages release: mind is engineered for English + Arabic — this
+release makes it *measured* on ten languages.
+
+- **Script-aware tokenizer**: scripts written without spaces (CJK
+  ideographs, hiragana/katakana, Hangul, Thai) are now indexed as
+  character bigrams — the standard search-engine technique — instead of
+  swallowing a whole phrase as one 3+-char "word". Chinese and Japanese
+  recall went from **3/6 (misses returned nothing at all) to 9/9** with
+  Korean included; Korean's common 2-syllable words used to be dropped
+  entirely by the 3-char floor. One shared `_tokenize()` now feeds every
+  indexing path (keys, co-occurrence, embeddings, destructive-op gates).
+  Space-separated scripts are byte-for-byte unaffected (EN/AR suite,
+  benchmark, and soak all unchanged).
+- **New multilingual benchmark** (`bench/multilang.py`, runs in CI):
+  recall@1 measured on 8 languages the tool was never tuned for, each
+  against distractor noise — French, German, Spanish, Russian, Turkish,
+  Chinese, Japanese, Korean: **24/24**. Gates: every language ≥ 2/3,
+  overall ≥ 0.9. Honest scope note in the README: 3 queries per language
+  is a smoke benchmark; no stemming/stopwords outside EN/AR; Thai is
+  tokenized but not yet benchmarked.
+- 122 tests (4 new: bigram tokenizer contract, Chinese/Japanese recall,
+  Korean 2-char word indexing).
+
 ## 5.5.0 — 2026-07-02
 
 The capability + verification release: recall gains a concept layer (the

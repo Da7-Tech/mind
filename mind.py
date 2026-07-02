@@ -6,7 +6,9 @@ Three layers (working / hippocampus / cortex) + spreading-activation recall
 + Ebbinghaus forgetting + dream consolidation between sessions + export to
 common agent rule files (AGENTS.md / CLAUDE.md / GEMINI.md / tool-specific
 dotfiles). One file. Zero dependencies.
-Fully offline. Bilingual (English + Arabic) tokenization built in.
+Fully offline. Engineered for English + Arabic; measured on 10
+languages (script-aware tokenizer: whole words for spaced scripts,
+character bigrams for CJK/kana/Hangul/Thai).
 
 Usage: python3 mind.py <command> [args]
   init                 create .mind/ in the current project
@@ -26,7 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "5.5.0"
+__version__ = "5.6.0"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -119,7 +121,51 @@ def _atomic_write(path, data, boundary=None):
 # ────────────────────────────────────────────────────────────────
 # Bilingual tokenization + light stemming (English + Arabic)
 # ────────────────────────────────────────────────────────────────
-_TOKEN = re.compile(r"[\w؀-ۿ]{3,}", re.UNICODE)
+_WORD_RUN = re.compile(r"[\w؀-ۿ]+", re.UNICODE)
+# Scripts written WITHOUT spaces (CJK ideographs, kana, Hangul, Thai): a
+# "word run" there is a whole phrase, and most words are 1-2 characters —
+# both break whole-word indexing (measured: Chinese/Japanese recall@1 was
+# 3/6 before this). Runs in these ranges are indexed as character BIGRAMS
+# instead — the standard search-engine technique. Space-separated scripts
+# (Latin, Cyrillic, Arabic, Greek, ...) keep whole words >= 3 chars.
+_NOSPACE_RE = re.compile("[%s]" % (
+    "⺀-鿿"      # CJK radicals + unified ideographs
+    "㐀-䶿"      # CJK extension A
+    "豈-﫿"      # CJK compatibility ideographs
+    "぀-ヿ"      # hiragana + katakana
+    "가-힯"      # hangul syllables
+    "฀-๿"))    # thai
+
+
+def _bigrams(chars):
+    if len(chars) < 2:
+        return ["".join(chars)]
+    return ["".join(chars[i:i + 2]) for i in range(len(chars) - 1)]
+
+
+def _tokenize(text):
+    """Script-aware tokenizer shared by every indexing path (keys,
+    co-occurrence, embeddings, destructive-op gates)."""
+    out = []
+    for run in _WORD_RUN.findall(text or ""):
+        alpha, nospace = [], []
+        for ch in run:
+            if _NOSPACE_RE.match(ch):
+                if alpha:
+                    if len(alpha) >= 3:
+                        out.append("".join(alpha))
+                    alpha = []
+                nospace.append(ch)
+            else:
+                if nospace:
+                    out.extend(_bigrams(nospace))
+                    nospace = []
+                alpha.append(ch)
+        if len(alpha) >= 3:
+            out.append("".join(alpha))
+        if nospace:
+            out.extend(_bigrams(nospace))
+    return out
 
 STOPWORDS = frozenset({
     # English
@@ -299,11 +345,14 @@ class RelatedTerms:
 
     def _tokens(self, text):
         seen, out = set(), []
-        for raw in _TOKEN.findall((text or "").lower()):
+        for raw in _tokenize((text or "").lower()):
             if raw in STOPWORDS:
                 continue
             t = stem(raw)
-            if len(t) < 3 or t in STOPWORDS or t in seen:
+            # no-space-script bigrams are 1-2 chars by construction —
+            # only alphabetic tokens carry the 3-char floor
+            if (len(t) < 3 and not _NOSPACE_RE.match(t)) \
+                    or t in STOPWORDS or t in seen:
                 continue
             seen.add(t)
             out.append(t)
@@ -427,7 +476,7 @@ class HashEmbed:
         if text in self._cache:
             return self._cache[text]
         v = [0.0] * self.dim
-        toks = [t for t in _TOKEN.findall((text or "").lower())
+        toks = [t for t in _tokenize((text or "").lower())
                 if t not in STOPWORDS]
         toks = [stem(t) for t in toks]
         feats = []
@@ -720,7 +769,7 @@ class Hippocampus:
         for phrase, rep in _NORMALIZE_PHRASES.items():
             if phrase in cleaned:
                 cleaned = cleaned.replace(phrase, " %s " % rep)
-        words = re.findall(r'[\w؀-ۿ]{3,}', cleaned.lower())
+        words = _tokenize(cleaned.lower())
         # insertion-ordered dict, not a set: the [:24] truncation below must
         # be deterministic. Set iteration order varies with str-hash
         # randomization, so the same text could store a different key subset
@@ -817,7 +866,7 @@ class Hippocampus:
     def _content_tokens(text):
         """Raw stemmed content tokens — no expansion, no identity fallback.
         Used to gate destructive operations on real lexical overlap."""
-        return {stem(w) for w in _TOKEN.findall((text or "").lower())
+        return {stem(w) for w in _tokenize((text or "").lower())
                 if w not in STOPWORDS}
 
     def correct(self, old_hint, new_text):
