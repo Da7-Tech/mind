@@ -13,6 +13,7 @@ Usage: python3 mind.py <command> [args]
   remember "text"      add a memory node to the graph
   link "a" "b" [rel]   connect two memories with a weighted edge
   recall "question"    spreading-activation recall (RRF + IDF fusion)
+  confirm <id> [...]   reinforce memories that actually answered you
   correct "old" "new"  reconsolidate: rewrite a wrong memory, keep history
   dream [--dry-run]    run the sleep cycle (light -> deep -> REM)
   export               regenerate agent rule files
@@ -25,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "5.2.0"
+__version__ = "5.3.0"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -54,6 +55,12 @@ GRACE_DAYS = 45             # no memory dies within 45 days of its last access
 #    memories fade from ACTIVE.md and rankings — they just aren't deleted.
 #    Facts needed less often than ~every 6 weeks are a documented limit.)
 EDGE_PRUNE_THRESHOLD = 0.1  # edges below this are pruned during dreams
+EDGE_DECAY_PER_DREAM = 0.95  # every dream weakens every edge slightly...
+EDGE_BOOST = 0.25            # ...and confirming either endpoint restrengthens
+#   its edges. An edge whose endpoints never earn a confirmed recall decays
+#   below the prune threshold after ~45 nightly dreams — the same horizon as
+#   node grace. (Auditor finding: edge weights previously never changed, so
+#   "synaptic pruning" was unreachable dead code for link edges.)
 CLUSTER_SIM = 0.45          # similarity gate for dream clustering
 SEPARATION_SIM = 0.92       # near-identical results are diversified in top-k
 FUZZY_ACTIVATION = 0.5      # activation given to pattern-completion matches
@@ -64,9 +71,12 @@ def _now():
 
 
 def _atomic_write(path, data):
-    """Atomic, symlink-safe write: O_NOFOLLOW + tmp + os.replace.
+    """Atomic, symlink-safe, durable write: O_NOFOLLOW + fsync + os.replace.
 
-    Prevents TOCTOU symlink attacks and torn files on power loss."""
+    O_NOFOLLOW + the is_symlink check block TOCTOU symlink attacks;
+    os.replace guarantees readers see the old or the new file, never a torn
+    one; fsync before the rename makes the new content survive power loss
+    (without it the rename can land while the data is still in page cache)."""
     path = Path(path)
     if path.is_symlink():
         raise ValueError(f"refusing to write through a symlink: {path}")
@@ -75,6 +85,7 @@ def _atomic_write(path, data):
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | nofollow | os.O_TRUNC, 0o644)
     try:
         os.write(fd, data.encode("utf-8") if isinstance(data, str) else data)
+        os.fsync(fd)
     finally:
         os.close(fd)
     os.replace(tmp, str(path))
@@ -112,6 +123,9 @@ NORMALIZE = {
     "إلكترون": "electron",
     "كودكس": "codex", "جيمناي": "gemini",
 }
+# Multi-word entries must be replaced BEFORE tokenization (the tokenizer
+# splits on spaces, so a dict lookup per token can never match them).
+_NORMALIZE_PHRASES = {k: v for k, v in NORMALIZE.items() if " " in k}
 
 # Arabic identity pronouns: queries like "what is my name" / "من أنا" carry
 # no content keys after stopword removal, so we fall back to identity keys.
@@ -408,6 +422,12 @@ class Hippocampus:
             n["keys"] = [re.sub(r'[،؛؟!."\']', '', k).strip()
                          for k in n.get("keys", [])]
             n["keys"] = [k for k in n["keys"] if k]
+        # drop edges referencing missing nodes: a partially corrupt or
+        # hand-edited graph must degrade gracefully, not crash recall
+        # with KeyError (auditor finding)
+        self.edges = {nid: {nbr: e for nbr, e in nbrs.items()
+                            if nbr in self.nodes}
+                      for nid, nbrs in self.edges.items() if nid in self.nodes}
 
     def _save(self):
         """Locked read-merge-write: concurrent agent processes cannot lose
@@ -415,11 +435,15 @@ class Hippocampus:
         and merge nodes/edges written by other processes since our load
         (our changes win per node; our deletions stay deleted)."""
         lock_path = self.path.with_suffix(".json.lock")
+        # open the lock with O_NOFOLLOW: a symlinked lock file must never
+        # truncate its target (auditor finding — plain open(..., "w") did)
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
         try:
-            lock_path.touch(exist_ok=True)
-        except OSError:
-            pass
-        with open(lock_path, "w") as lockf:
+            lock_fd = os.open(str(lock_path),
+                              os.O_WRONLY | os.O_CREAT | nofollow, 0o644)
+        except OSError as e:
+            raise ValueError("refusing unsafe lock file %s: %s" % (lock_path, e))
+        with os.fdopen(lock_fd, "w") as lockf:
             try:
                 import fcntl
                 fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
@@ -453,6 +477,8 @@ class Hippocampus:
 
     @staticmethod
     def _id(text):
+        # content addressing only — no security property is derived from
+        # the hash; md5[:12] keeps existing graphs' node ids stable
         return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
 
     # -- key extraction ----------------------------------------------
@@ -464,12 +490,18 @@ class Hippocampus:
 
     def _extract_keys(self, text, is_query=False):
         """Three cooperating layers:
-        1. NORMALIZE seed (cross-language term bridging)
+        1. NORMALIZE seed (cross-language term bridging, incl. multi-word
+           phrases handled before tokenization — the tokenizer would split
+           them otherwise and the mapping would never match)
         2. co-occurrence expansion (RelatedTerms, self-building)
-        3. identity fallback — queries only ("what is my name" carries no
-           content keys). Stored memories never get fallback identity keys:
-           a content-free memory must not pollute identity recalls."""
+        3. identity keys — added to queries with no content keys, and to
+           any text (query or memory) that mentions identity pronouns, so
+           "my name is X" and "what is my name" land on the same keys.
+           Content-free stored memories get NO identity fallback."""
         cleaned = re.sub(r'[،؛؟!.,"\']', ' ', text)
+        for phrase, rep in _NORMALIZE_PHRASES.items():
+            if phrase in cleaned:
+                cleaned = cleaned.replace(phrase, " %s " % rep)
         words = re.findall(r'[\w؀-ۿ]{3,}', cleaned.lower())
         keys = set()
         for w in words:
@@ -522,6 +554,9 @@ class Hippocampus:
         return nid
 
     def link(self, text_a, text_b, relation="related"):
+        # relations end up in graph.json and journals — same control-char
+        # hygiene as memory texts (auditor finding), plus a sane length cap
+        relation = re.sub(r"[\x00-\x1f\x7f]", "", relation).strip()[:60] or "related"
         id_a, id_b = self._id(text_a.strip()), self._id(text_b.strip())
         if id_a not in self.nodes:
             self.remember(text_a)
@@ -567,15 +602,38 @@ class Hippocampus:
         node["keys"] = self._extract_keys(new_text)
         node["confidence"] = round(node.get("confidence", 1.0) * 0.7, 3)
         node["last_accessed"] = _now().isoformat()
-        # re-key the node under its new id so remember(new_text) converges
-        self.nodes[new_nid] = node
-        if new_nid != nid:
+        # re-key under the new id. If a node with that exact text already
+        # exists, MERGE into it instead of clobbering it (auditor finding:
+        # the pre-existing node's history/edges/reinforcement were lost).
+        existing = self.nodes.get(new_nid) if new_nid != nid else None
+        if existing is not None:
+            existing.setdefault("history", []).extend(node.get("history", []))
+            existing["access_count"] = max(existing.get("access_count", 0),
+                                           node.get("access_count", 0))
+            existing["confidence"] = min(existing.get("confidence", 1.0),
+                                         node["confidence"])
+            existing["last_accessed"] = node["last_accessed"]
+            merged_edges = dict(self.edges.get(new_nid, {}))
+            for nbr, e in self.edges.get(nid, {}).items():
+                merged_edges.setdefault(nbr, e)
+            merged_edges.pop(new_nid, None)
+            self.edges[new_nid] = merged_edges
             del self.nodes[nid]
             self._deleted.add(nid)
-            self.edges[new_nid] = self.edges.pop(nid, {})
+            self.edges.pop(nid, None)
             for other in self.edges.values():
                 if nid in other:
-                    other[new_nid] = other.pop(nid)
+                    other.setdefault(new_nid, other[nid])
+                    del other[nid]
+        else:
+            self.nodes[new_nid] = node
+            if new_nid != nid:
+                del self.nodes[nid]
+                self._deleted.add(nid)
+                self.edges[new_nid] = self.edges.pop(nid, {})
+                for other in self.edges.values():
+                    if nid in other:
+                        other[new_nid] = other.pop(nid)
         self.related = None
         self._save()
         self._log_signal("correct", "%s => %s" % (old_text, new_text))
@@ -662,7 +720,11 @@ class Hippocampus:
             fused[nid] = (1.0 / (rrf_k + dr.get(nid, dr_default)) +
                           1.0 / (rrf_k + sr.get(nid, sr_default)))
 
-        # lexical-semantic re-rank of the head (offline hash embeddings)
+        # lexical-semantic re-rank of the head (offline hash embeddings).
+        # Defense in depth: activation can only reach ids absent from
+        # self.nodes if the graph was mutated externally mid-flight —
+        # drop them instead of raising.
+        fused = {nid: s for nid, s in fused.items() if nid in self.nodes}
         ranked = sorted(fused.items(), key=lambda x: -x[1])
         if len(ranked) > 1:
             reranked = []
@@ -694,7 +756,10 @@ class Hippocampus:
 
     def bump(self, node_ids):
         """Reinforce nodes after a confirmed recall (kept separate from
-        recall() so reads stay pure). Tracks peak_weight for Ebbinghaus."""
+        recall() so reads stay pure; the `confirm` CLI command is the
+        agent-facing path here). Tracks peak_weight for Ebbinghaus, and
+        restrengthens the confirmed node's edges — connections you actually
+        use stay strong, unused ones decay away dream by dream."""
         now = _now()
         changed = False
         for nid in node_ids:
@@ -704,6 +769,11 @@ class Hippocampus:
                 n["weight"] = min(1.0, n["weight"] + BOOST_PER_ACCESS)
                 n["peak_weight"] = max(n.get("peak_weight", 1.0), n["weight"])
                 n["last_accessed"] = now.isoformat()
+                for nbr, e in self.edges.get(nid, {}).items():
+                    e["weight"] = min(1.0, e.get("weight", 1.0) + EDGE_BOOST)
+                    rev = self.edges.get(nbr, {}).get(nid)
+                    if rev is not None:
+                        rev["weight"] = e["weight"]
                 changed = True
         if changed:
             self._save()
@@ -733,29 +803,44 @@ class Hippocampus:
             if not dry_run:
                 n["weight"] = new_weight
             if new_weight < WEIGHT_THRESHOLD and access < 2 and days > GRACE_DAYS:
-                pruned.append(n["text"])
-                if not dry_run:
+                pruned.append((nid, n["text"]))
+        if dry_run:
+            return [t for _, t in pruned]
+        # archive FIRST, delete only what was durably archived: if the
+        # archive cannot be written (e.g. someone symlinked archive.md),
+        # nothing is pruned — "archived, not destroyed" is a guarantee,
+        # not a best effort (auditor finding).
+        if pruned:
+            if self._archive([t for _, t in pruned], now):
+                for nid, _ in pruned:
                     del self.nodes[nid]
                     self._deleted.add(nid)
                     self.edges.pop(nid, None)
                     for other in self.edges.values():
                         other.pop(nid, None)
-        if not dry_run:
-            if pruned:
-                self._archive(pruned, now)
-            self._save()
-        return pruned
+            else:
+                print("warning: archive.md is not writable (symlink?); "
+                      "keeping %d prunable memories." % len(pruned),
+                      file=sys.stderr)
+                pruned = []
+        self._save()
+        return [t for _, t in pruned]
 
     def _archive(self, texts, now):
-        """Forgotten, not destroyed: pruned memories append to archive.md."""
+        """Forgotten, not destroyed: pruned memories append to archive.md.
+        Returns True only when the archive write actually happened."""
         arch = self.path.parent / "archive.md"
         if arch.is_symlink():
-            return
+            return False
         lines = ["\n## forgotten on %s\n" % now.date()]
         lines += ["- %s" % t for t in texts]
         prev = arch.read_text("utf-8") if arch.exists() else \
             "# mind archive — memories pruned by decay (restore with `remember`)\n"
-        _atomic_write(arch, prev + "\n".join(lines) + "\n")
+        try:
+            _atomic_write(arch, prev + "\n".join(lines) + "\n")
+        except (OSError, ValueError):
+            return False
+        return True
 
     def _log_signal(self, kind, content):
         sig_file = self.path.parent / SIGNALS_FILE
@@ -782,6 +867,14 @@ class Cortex:
         base = re.sub(r'[^\w؀-ۿ]+', '_', topic).strip('_')[:40]
         fname = (base or "topic") + ".md"
         fpath = self.path / fname
+        # two distinct topics can sanitize to the same filename — never
+        # silently overwrite "durable" knowledge about a different topic
+        # (auditor finding): disambiguate with a short content hash.
+        if fpath.exists():
+            first = fpath.read_text("utf-8").splitlines()[:1]
+            if first and first[0] != "# %s" % topic:
+                suffix = hashlib.md5(topic.encode("utf-8")).hexdigest()[:6]
+                fpath = self.path / ("%s-%s.md" % (base or "topic", suffix))
         header = "# %s\n\n> promoted by dream on %s\n\n" % (topic, _now().date())
         _atomic_write(fpath, header + content + "\n")
         return str(fpath.relative_to(self.path.parent))
@@ -823,7 +916,14 @@ class Dreamer:
         if len(pruned) > 5:
             log.append("  - ... and %d more" % (len(pruned) - 5))
 
-        # synaptic pruning: weak edges die, isolated stubs are removed
+        # synaptic homeostasis: every edge weakens a little each dream;
+        # edges of memories that earn confirmed recalls get restrengthened
+        # by bump(), so only genuinely unused connections drift down...
+        if not dry_run:
+            for nbrs in self.hippo.edges.values():
+                for e in nbrs.values():
+                    e["weight"] = round(e.get("weight", 1.0) * EDGE_DECAY_PER_DREAM, 4)
+        # ...and synaptic pruning removes the ones that decayed away
         pruned_edges = 0
         for nid in list(self.hippo.edges.keys()):
             for neighbor in list(self.hippo.edges[nid].keys()):
@@ -979,6 +1079,8 @@ class Active:
 
 ## How the agent uses this memory
 - Need something not listed below? Run `python3 mind.py recall "your question"`.
+- A recalled memory actually answered you? Reinforce it: `python3 mind.py confirm <id>`
+  (ids are printed by recall). Confirmed memories harden; unconfirmed ones fade.
 - Learned something new? Run `python3 mind.py remember "the fact"`.
 - Two facts belong together? `python3 mind.py link "a" "b" "relation"`.
 - A stored fact is wrong? `python3 mind.py correct "old" "corrected fact"`.
@@ -1137,8 +1239,26 @@ between sessions:  python3 mind.py dream""" % self.dir)
         print("recall for \"%s\" — %d results [%.2f ms]\n" % (query, len(results), latency))
         for i, (nid, score, n) in enumerate(results, 1):
             print("  %d. [%.3f] (%s) %s" % (i, score, kinds.get(nid, "trace"), n["text"]))
-            print("     (confidence %.1f, recalled %dx, weight %.2f)"
-                  % (n.get("confidence", 1), n.get("access_count", 0), n["weight"]))
+            print("     (confidence %.1f, recalled %dx, weight %.2f, id %s)"
+                  % (n.get("confidence", 1), n.get("access_count", 0),
+                     n["weight"], nid))
+        print("\n  (if a result actually answered you, reinforce it:"
+              " python3 mind.py confirm <id>)")
+
+    def confirm(self, node_ids):
+        self._ensure()
+        known = [nid for nid in node_ids if nid in self.hippo.nodes]
+        unknown = [nid for nid in node_ids if nid not in self.hippo.nodes]
+        if known:
+            self.hippo.bump(known)
+            print("reinforced %d memor%s — stability +%d days each, edges "
+                  "restrengthened" % (len(known), "y" if len(known) == 1 else "ies",
+                                      int(STABILITY_PER_ACCESS)))
+        for nid in unknown:
+            print("unknown id: %s (get ids from `recall` output)" % nid,
+                  file=sys.stderr)
+        if not known:
+            sys.exit(1)
 
     def correct(self, old_hint, new_text):
         self._ensure()
@@ -1174,7 +1294,9 @@ between sessions:  python3 mind.py dream""" % self.dir)
     def status(self):
         self._ensure()
         n_nodes = len(self.hippo.nodes)
-        n_edges = sum(len(v) for v in self.hippo.edges.values()) // 2
+        n_edges = len({frozenset((a, b))
+                       for a, nbrs in self.hippo.edges.items()
+                       for b in nbrs})
         avg_w = (sum(n["weight"] for n in self.hippo.nodes.values()) / n_nodes) if n_nodes else 0
         cortex_n = len(list(self.cortex.files()))
         active_size = (self.dir / ACTIVE_FILE).stat().st_size if (self.dir / ACTIVE_FILE).exists() else 0
@@ -1202,7 +1324,8 @@ commands:
   init                    create .mind/ memory in this project
   remember "text"         add a memory
   link "a" "b" [rel]      connect two memories
-  recall "question"       spreading-activation recall
+  recall "question"       spreading-activation recall (prints memory ids)
+  confirm <id> [...]      reinforce memories that actually answered you
   correct "old" "new"     fix a wrong memory (reconsolidation)
   dream [--dry-run]       run the sleep cycle
   export                  regenerate agent files
@@ -1225,8 +1348,8 @@ def main(argv=None):
         return 0
     import difflib
     cmd = argv[0]
-    COMMANDS = {"init", "remember", "link", "recall", "correct", "dream",
-                "export", "status"}
+    COMMANDS = {"init", "remember", "link", "recall", "confirm", "correct",
+                "dream", "export", "status"}
     if cmd not in COMMANDS:
         sug = difflib.get_close_matches(cmd, COMMANDS, n=1, cutoff=0.6)
         hint = " did you mean `%s`?" % sug[0] if sug else ""
@@ -1258,6 +1381,10 @@ def main(argv=None):
             if not q:
                 _die('usage: python3 mind.py recall "question"')
             m.recall(q)
+        elif cmd == "confirm":
+            if len(argv) < 2:
+                _die('usage: python3 mind.py confirm <id> [<id>...] (ids come from recall output)')
+            m.confirm(argv[1:])
         elif cmd == "correct":
             if len(argv) < 3:
                 _die('usage: python3 mind.py correct "old text hint" "corrected fact"')

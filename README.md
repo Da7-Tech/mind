@@ -38,13 +38,14 @@ no configuration file.
 ## Measured, not vibes
 
 Every number below comes from `python3 bench/bench.py` — rerun it yourself
-(Python 3.14, Apple M-series; 20 bilingual queries with known answers
-against distractor-filled graphs):
+(Python 3.14 on Apple M-series — latencies are environment-dependent, rerun
+for your hardware; 20 bilingual queries with known answers against
+distractor-filled graphs):
 
 | graph size | recall@1 | recall@5 | median latency | p95 |
 |---|---|---|---|---|
-| 100 nodes | **0.95** | 0.95 | **0.46 ms** | 2.2 ms |
-| 1,000 nodes | **0.95** | 0.95 | 2.2 ms | 12.4 ms |
+| 100 nodes | **0.95** | 0.95 | **~0.5–0.7 ms** | ~2–4 ms |
+| 1,000 nodes | **0.95** | 0.95 | ~2–3 ms | ~11–16 ms |
 
 Dream determinism: **PASS** — identical memory state always produces the
 identical consolidation plan.
@@ -59,7 +60,7 @@ first monthly recall; decayed weight vetoing exact matches) — both fixed
 with regression tests. The one benchmark miss (`"what css framework"`
 → tailwind) is an honest limitation documented below, not hidden.
 
-Test suite: **61 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **77 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, and corrupt-graph recovery.
 
@@ -120,20 +121,28 @@ reproducible benchmark instead of claims.
 | `init` | create `.mind/` + export agent files |
 | `remember "text"` | add a memory node |
 | `link "a" "b" [rel]` | connect two memories (weighted edge) |
-| `recall "question"` | spreading-activation recall |
+| `recall "question"` | spreading-activation recall (prints memory ids) |
+| `confirm <id> [...]` | reinforce memories that actually answered you |
 | `correct "old" "new"` | reconsolidate a wrong memory (history kept) |
 | `dream [--dry-run]` | run the sleep cycle; journal in `.mind/dreams/` |
 | `export` | regenerate agent rule files |
 | `status` | health report |
 
-Reinforcement is explicit: `recall` is pure read (repeated queries can't
-skew weights); agents confirm useful hits via the `bump()` API.
+Reinforcement is explicit: `recall` is a pure read (repeated queries can't
+skew weights); when a recalled memory actually answers the question, the
+agent runs `confirm <id>` — that hardens the memory (+2 weeks stability)
+and restrengthens its edges. The exported agent instructions teach this
+loop, and every dream weakens all edges slightly (synaptic homeostasis),
+so connections that never earn a confirmation decay and prune away.
 
 ## Safety properties
 
-- **Atomic, symlink-refusing writes** everywhere (no torn files, no symlink attacks)
+- **Atomic, durable, symlink-refusing writes** everywhere — O_NOFOLLOW +
+  fsync-before-rename (survives power loss), and the lock file itself is
+  opened symlink-safe
 - **Never silently destroys data**: corrupt graphs are quarantined, not erased;
-  memories pruned by decay are archived to `.mind/archive.md`, not destroyed;
+  memories pruned by decay are archived to `.mind/archive.md` — and if the
+  archive cannot be written, nothing is pruned at all;
   user content in `AGENTS.md`/`CLAUDE.md` is preserved outside guard markers
 - **`dream --dry-run`** previews the full plan without touching disk
 - **File-locked saves** — safe under concurrent agent processes
@@ -149,6 +158,9 @@ skew weights); agents confirm useful hits via the `bump()` API.
   morphological analyzer.
 - Optimized for personal/project agent memory (10²–10³ nodes), not
   enterprise RAG over millions of documents — use a real graph DB for that.
+- Tokens shorter than 3 characters (`db`, `ai`, `os`) are not indexed —
+  write them out once ("database", "openai") and the co-occurrence index
+  bridges the rest.
 - A fact recalled fewer than twice and untouched for longer than the 45-day
   grace window decays out of the graph (into the archive). Facts you need
   less often than ~every six weeks should live in cortex notes, not the
@@ -168,7 +180,7 @@ nothing else to configure. A ready-made Hermes skill lives in
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 61 tests
+python3 -m unittest discover -s tests   # 77 tests
 python3 bench/bench.py                  # reproduce the numbers above
 ```
 

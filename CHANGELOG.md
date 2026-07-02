@@ -1,5 +1,42 @@
 # Changelog
 
+## 5.3.0 — 2026-07-02
+
+Audit-hardening release. Three independent code audits (two external
+models + a line-by-line review) were verified claim by claim; every
+confirmed finding is fixed here with a regression test:
+
+- **Reinforcement is now agent-reachable**: `recall` prints memory ids and
+  the new `confirm <id>` command performs the bump — previously `bump()`
+  existed only as a library call no agent could invoke, so "recalled often
+  → hardens" could not happen through the CLI. Exported agent
+  instructions teach the confirm loop.
+- **Edge weights are now dynamic**: every dream weakens all edges
+  (synaptic homeostasis, ×0.95), `confirm` restrengthens the confirmed
+  node's edges; unconfirmed connections prune after ~45 dreams —
+  synaptic pruning was previously dead code for `link` edges (always 1.0).
+- **Durability**: fsync before rename in all atomic writes (power-loss
+  safety was previously overstated); the lock file is opened O_NOFOLLOW
+  (a symlinked `graph.json.lock` could truncate its target).
+- **Archive guarantee**: pruning now archives first and skips deletion
+  entirely if the archive is unwritable (a symlinked `archive.md`
+  previously caused silent data loss).
+- **Graph robustness**: edges referencing missing nodes are dropped on
+  load and filtered in recall (orphan edges could crash recall with
+  KeyError after partial corruption).
+- **`correct` merge semantics**: correcting a memory into the text of an
+  existing memory now merges histories/edges/reinforcement instead of
+  clobbering the existing node.
+- **Cortex collision safety**: two topics sanitizing to the same filename
+  no longer overwrite each other (content-hash suffix).
+- **Multi-word normalization fixed** ("تايب سكريبت" → typescript now
+  matches — phrases are replaced before tokenization); `link` relations
+  are sanitized like memory texts.
+- CI: actions pinned by commit SHA, least-privilege permissions,
+  Windows added to the test matrix.
+- 77 tests. Independent-audit claims that did **not** reproduce are
+  documented in the repo discussions rather than silently ignored.
+
 ## 5.2.0 — 2026-07-02
 
 - **New export targets** (first community contribution — thanks

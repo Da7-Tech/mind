@@ -156,9 +156,9 @@ class TestRememberRecall(TmpDirTest):
     def test_bump_reinforces(self):
         h = self.hippo()
         nid = h.remember("important fact about deployment")
-        w0 = h.nodes[nid]["weight"]
+        h.nodes[nid]["weight"] = 0.5          # below cap so the boost is visible
         h.bump([nid])
-        self.assertGreater(h.nodes[nid]["weight"], w0 - 1e-9)
+        self.assertGreaterEqual(h.nodes[nid]["weight"], 0.5 + M.BOOST_PER_ACCESS - 1e-9)
         self.assertEqual(h.nodes[nid]["access_count"], 1)
 
     def test_pattern_completion_fuzzy_recall(self):
@@ -577,6 +577,128 @@ class TestActiveExport(TmpDirTest):
         self.assertLess(size, 6000, "working memory must stay small")
 
 
+# ───────────────────── auditor-finding regressions ─────────────────────
+class TestAuditFindings(TmpDirTest):
+    def test_lock_symlink_does_not_truncate_target(self):
+        """A symlinked graph.json.lock must never truncate its target."""
+        if os.name == "nt":
+            self.skipTest("symlinks need privileges on Windows")
+        victim = self.tmp / "victim.txt"
+        victim.write_text("precious", encoding="utf-8")
+        h = self.hippo()
+        h.remember("seed")                      # creates the real lock
+        (self.mind_dir / "graph.json.lock").unlink()
+        (self.mind_dir / "graph.json.lock").symlink_to(victim)
+        with self.assertRaises(ValueError):
+            h.remember("attacker-triggered write")
+        self.assertEqual(victim.read_text("utf-8"), "precious")
+
+    def test_archive_symlink_blocks_pruning(self):
+        """'archived, not destroyed' is a guarantee: if the archive cannot
+        be written, nothing is pruned."""
+        if os.name == "nt":
+            self.skipTest("symlinks need privileges on Windows")
+        h = self.hippo()
+        nid = h.remember("stale but must not vanish")
+        h.nodes[nid]["last_accessed"] = (
+            datetime.now() - timedelta(days=50)).isoformat()
+        h.nodes[nid]["created"] = h.nodes[nid]["last_accessed"]
+        (self.mind_dir / "archive.md").symlink_to(self.tmp / "elsewhere.md")
+        pruned = h.decay()
+        self.assertEqual(pruned, [])
+        self.assertIn(nid, h.nodes, "unarchivable memories must be kept")
+
+    def test_orphan_edges_cleaned_and_recall_safe(self):
+        gpath = self.mind_dir / "graph.json"
+        h = self.hippo()
+        nid = h.remember("real node about postgres")
+        data = json.loads(gpath.read_text("utf-8"))
+        data["edges"][nid] = {"deadbeef0000": {"relation": "ghost", "weight": 1.0}}
+        gpath.write_text(json.dumps(data), encoding="utf-8")
+        h2 = Hippocampus(gpath)
+        self.assertNotIn("deadbeef0000", h2.edges.get(nid, {}))
+        results, _, _ = h2.recall("postgres")   # must not raise KeyError
+        self.assertTrue(results)
+
+    def test_correct_to_existing_text_merges_not_clobbers(self):
+        h = self.hippo()
+        h.remember("the database is mysql")
+        h.remember("the database is postgres")
+        h.remember("backend is flask")
+        h.link("the database is postgres", "backend is flask")
+        h.correct("database mysql", "the database is postgres")
+        self.assertEqual(
+            sum(1 for n in h.nodes.values() if "postgres" in n["text"]), 1)
+        surviving = h._id("the database is postgres")
+        self.assertTrue(h.edges.get(surviving),
+                        "existing node's edges must survive the merge")
+        node = h.nodes[surviving]
+        self.assertTrue(any("mysql" in hh["text"] for hh in node.get("history", [])))
+
+    def test_promote_filename_collision_uniquified(self):
+        c = Cortex(self.mind_dir / "cortex")
+        c.promote("deploy pipeline!", "- a")
+        c.promote("deploy pipeline?", "- b")
+        files = list(c.files())
+        self.assertEqual(len(files), 2,
+                         "distinct topics must never overwrite each other")
+
+    def test_multiword_normalization_bridges_languages(self):
+        h = self.hippo()
+        h.remember("المشروع يستخدم تايب سكريبت للواجهة")
+        results, _, _ = h.recall("typescript")
+        self.assertTrue(results)
+
+    def test_link_relation_sanitized(self):
+        h = self.hippo()
+        h.link("node one alpha", "node two beta", "own\x1b[31ms" + "x" * 100)
+        ida = h._id("node one alpha")
+        rel = list(h.edges[ida].values())[0]["relation"]
+        self.assertNotIn("\x1b", rel)
+        self.assertLessEqual(len(rel), 60)
+
+    def test_edges_decay_across_dreams_and_prune(self):
+        """Auditor finding: edge weights never changed, making synaptic
+        pruning dead code. Now every dream weakens edges; unconfirmed
+        connections eventually prune."""
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        d = Dreamer(self.mind_dir, h, c)
+        h.remember("alpha component talks to beta")
+        h.remember("beta stores results in gamma")
+        h.link("alpha component talks to beta", "beta stores results in gamma")
+        ida = h._id("alpha component talks to beta")
+        d.dream()
+        w1 = list(h.edges[ida].values())[0]["weight"]
+        self.assertLess(w1, 1.0, "edges must weaken after a dream")
+        for _ in range(50):
+            d.dream()
+        self.assertFalse(h.edges.get(ida),
+                         "an unconfirmed edge must eventually prune")
+
+    def test_confirm_restrengthens_edges(self):
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        d = Dreamer(self.mind_dir, h, c)
+        h.remember("alpha component talks to beta")
+        h.remember("beta stores results in gamma")
+        h.link("alpha component talks to beta", "beta stores results in gamma")
+        ida = h._id("alpha component talks to beta")
+        for _ in range(5):
+            d.dream()
+        w_before = list(h.edges[ida].values())[0]["weight"]
+        h.bump([ida])
+        w_after = list(h.edges[ida].values())[0]["weight"]
+        self.assertGreater(w_after, w_before)
+
+    def test_no_direct_datetime_now_in_source(self):
+        """The injectable clock is the only time source — a stray
+        datetime.now() would silently break the soak test."""
+        src = (Path(__file__).resolve().parent.parent / "mind.py").read_text("utf-8")
+        self.assertEqual(src.count("datetime.now()"), 1,
+                         "only _now() may call datetime.now()")
+
+
 # ─────────────────────────────── CLI ───────────────────────────────
 class TestCLI(TmpDirTest):
     def run_cli(self, *args):
@@ -634,6 +756,20 @@ class TestCLI(TmpDirTest):
         code, out, _ = self.run_cli("--help")
         self.assertEqual(code, 0)
         self.assertIn("recall", out)
+        self.assertIn("confirm", out)
+
+    def test_confirm_cli_reinforces(self):
+        self.run_cli("init")
+        self.run_cli("remember", "the answer is 42")
+        code, out, _ = self.run_cli("recall", "answer")
+        self.assertIn("id ", out, "recall must print memory ids")
+        import re as _re
+        nid = _re.search(r"id ([0-9a-f]{12})", out).group(1)
+        code, out, _ = self.run_cli("confirm", nid)
+        self.assertEqual(code, 0)
+        self.assertIn("reinforced", out)
+        code, _, err = self.run_cli("confirm", "ffffffffffff")
+        self.assertNotEqual(code, 0)
 
 
 if __name__ == "__main__":

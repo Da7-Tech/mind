@@ -108,6 +108,7 @@ def main():
                     results, _, _ = hippo.recall(q)
                     hit = [nid for nid, _, n in results if marker in n["text"]]
                     if hit:
+                        # same call the agent-facing `confirm` CLI performs
                         hippo.bump(hit[:1])
                     next_recall[fact] = random.randint(*RECALL_GAP[tier])
 
@@ -146,9 +147,7 @@ def main():
         all_ok = False
 
     active.generate(tmp)
-    act = (tmp / M.MIND_DIR).parent  # ACTIVE lives in tmp/.mind? no: mind_dir=tmp
-    act_text = (tmp / "ACTIVE.md").read_text("utf-8") if (tmp / "ACTIVE.md").exists() else \
-        (tmp / M.ACTIVE_FILE).read_text("utf-8")
+    act_text = (tmp / M.ACTIVE_FILE).read_text("utf-8")
     core_markers = [m for facts in CORE.values() for _, _, m in facts]
     hot_lines = [ln for ln in act_text.splitlines() if ln.startswith("- ")]
     hot_core = sum(1 for ln in hot_lines if any(m in ln for m in core_markers))

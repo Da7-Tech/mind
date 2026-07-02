@@ -45,7 +45,11 @@ Plus **pattern completion**: when no direct key matches, fuzzy similarity
 over node texts reactivates memories from partial or misspelled cues.
 
 `recall` is a **pure read**: it never writes to disk, so health checks and
-repeated queries cannot skew weights. Reinforcement is explicit (`bump`).
+repeated queries cannot skew weights. Reinforcement is explicit — recall
+prints memory ids and the agent runs `confirm <id>` for hits that actually
+answered the question; that hardens the node (Ebbinghaus stability) and
+restrengthens its edges, while every dream weakens all edges slightly
+(synaptic homeostasis), so unconfirmed connections decay and prune.
 
 ## The dream cycle
 
