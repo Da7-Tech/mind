@@ -1,123 +1,112 @@
 ---
 name: mind
-description: >-
-  Brain-like project memory for agents: spreading-activation recall,
-  Ebbinghaus forgetting, deterministic dream consolidation, and export to
-  AGENTS.md/CLAUDE.md/GEMINI.md. One Python file, zero dependencies, zero
-  API keys, fully offline, bilingual (EN/AR).
-version: 5.2.0
+description: Per-project memory graph with recall, decay, and dreams.
+version: 5.3.0
 author: Da7-Tech
 license: MIT
-platforms: [linux, macos]
+platforms: [linux, macos, windows]
 prerequisites:
   commands: [python3, curl]
+related_skills: [hermes-agent]
 metadata:
   hermes:
     tags: [Memory, Knowledge-Graph, Consolidation, Offline, Local-First]
-    requires_toolsets: [terminal]
     category: autonomous-ai-agents
     homepage: https://github.com/Da7-Tech/mind
 ---
 
-# mind — Brain-Like Project Memory
+# mind Skill
 
-`mind` gives any project a persistent, self-organizing memory that lives in
-`.mind/` and is exported into `AGENTS.md`/`CLAUDE.md`/`GEMINI.md`. It
-complements Hermes' built-in memory: the built-in memory stores durable
-*global* facts about the user (small, curated, always in context), while
-`mind` stores *per-project* knowledge as a weighted concept graph with
-recall, forgetting, and consolidation.
-
-This skill wraps the standalone open-source tool
-(https://github.com/Da7-Tech/mind — one stdlib-only Python file). No servers,
-no API keys, no configuration. All commands below are real and verified.
+Gives a project a persistent, self-organizing memory: a weighted concept
+graph in `.mind/` with spreading-activation recall, Ebbinghaus forgetting,
+and a deterministic dream cycle — exported into `AGENTS.md`/`CLAUDE.md`/
+`GEMINI.md` behind guard markers. It complements Hermes' built-in memory
+(small, curated, *global* user facts) with *per-project* knowledge. It does
+NOT store durable personal facts about the user — those belong in the
+built-in `memory` tool — and it is not a RAG system for large corpora.
 
 ## When to Use
 
-- The user asks you to remember project facts, decisions, or context across sessions
-- You need to look up a project fact you do not have in context ("what database do we use?")
-- The user says a stored fact is wrong and gives the correction
-- Housekeeping between sessions ("clean up / consolidate the project memory")
-- Do NOT use it for durable personal facts about the user — those belong in
-  Hermes' built-in memory tool
+- The user asks to remember project facts, decisions, or context across sessions
+- A project fact is needed that is not in context ("what database do we use?")
+- The user corrects a stored fact
+- Between-session housekeeping ("clean up / consolidate the project memory")
 
-## Setup (once per project)
+## Prerequisites
+
+- `python3` (3.9+) and `curl` on PATH — nothing else: no API keys, no
+  server, no packages. The tool is one stdlib-only file, MIT-licensed,
+  from https://github.com/Da7-Tech/mind (77 tests + benchmark + 180-day
+  soak test run in its CI on Linux/macOS/Windows).
+
+## How to Run
+
+Install once per project through the `terminal` tool, pinned to a release
+tag and integrity-checked:
 
 ```bash
 cd <project>
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/main/mind.py
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v5.3.0/mind.py
+echo "497a155d92236fd53b05acde2740e6fac5ca14693e1e23284692352c6ac2c85c  mind.py" | shasum -a 256 -c
 python3 mind.py init
 ```
 
 `init` creates `.mind/` and writes guard-marked memory blocks into
-`AGENTS.md`, `CLAUDE.md`, `GEMINI.md` — existing user content in those files
-is preserved outside the markers. Projects already using Cursor, Windsurf,
-Cline or Roo get their rule files (`.cursorrules`, `.windsurfrules`,
-`.clinerules`, `.roo/rules/mind.md`) kept in sync automatically.
+`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`; existing user content is preserved
+outside the markers. Projects already using Cursor/Windsurf/Cline/Roo get
+their rule files synced too (adopted only when present).
 
 ## Quick Reference
 
-| User intent | Action |
+| User intent | Command (through `terminal`) |
 |---|---|
 | "Remember that X" (project fact) | `python3 mind.py remember "X"` |
-| "What/which/where ...?" (project fact not in context) | `python3 mind.py recall "the question"` |
+| Project fact not in context | `python3 mind.py recall "the question"` |
+| A recalled memory actually answered | `python3 mind.py confirm <id>` (ids in recall output) |
 | "X and Y are related" | `python3 mind.py link "X" "Y" "relation"` |
 | "That's wrong, it's actually Z" | `python3 mind.py correct "old fact hint" "Z"` |
-| "Clean up / consolidate memory" | `python3 mind.py dream --dry-run`, show the plan, then `python3 mind.py dream` if approved |
-| "How is the memory doing?" | `python3 mind.py status` |
+| "Clean up memory" | `python3 mind.py dream --dry-run`, show plan, then `dream` |
+| Health report | `python3 mind.py status` |
 
-## How recall output looks
+## Procedure
 
-```
-recall for "which database do we use" — 2 results [0.44 ms]
-
-  1. [0.145] (direct) the project database is postgres 16
-     (confidence 1.0, recalled 3x, weight 1.00)
-  2. [0.043] (trace)  souq app uses prisma orm
-```
-
-`direct` = keyword/IDF match; `trace` = found through spreading activation
-over linked memories. If recall returns nothing relevant, say so — do not
-invent an answer.
-
-## The dream cycle (between sessions)
-
-`python3 mind.py dream` runs a deterministic sleep cycle: Ebbinghaus decay
-prunes unused weak memories, weak edges are removed, clusters of related
-memories are promoted to `.mind/cortex/`, contradictions are flagged (never
-auto-deleted). Every action is explained in `.mind/dreams/<date>.md`.
-Always offer `--dry-run` first when the user wants to see the plan.
-It uses no LLM and costs zero tokens, so it is safe in Hermes' no-agent
-cron mode (the script IS the job — no model call ever happens):
+1. On a recall request, run `recall` and quote the memory text with its
+   confidence. If nothing relevant returns, say so — never invent.
+2. When a recalled memory actually answered the question, run
+   `confirm <id>` — confirmed memories harden (+2 weeks stability) and
+   their edges restrengthen; unconfirmed ones decay and get pruned
+   (into `.mind/archive.md`, never destroyed).
+3. For corrections use `correct` (old text is kept in node history).
+4. For housekeeping, always run `dream --dry-run` first and show the plan;
+   apply only on approval. Every dream action is explained in
+   `.mind/dreams/<date>.md`.
+5. Nightly automation costs zero tokens via the `cronjob` tool in no-agent
+   mode (the script IS the job — no model call):
 
 ```bash
 cat > ~/.hermes/scripts/mind_dream.sh <<'EOF'
 #!/bin/bash
 cd /path/to/project && python3 mind.py dream
 EOF
-hermes cron create "0 4 * * *" --name mind-dream \
-  --script mind_dream.sh --no-agent
+hermes cron create "0 4 * * *" --name mind-dream --script mind_dream.sh --no-agent
 ```
 
-## Response style
+## Pitfalls
 
-- Confirm what was remembered/corrected in one short sentence.
-- When recalling, quote the memory text and its confidence; never guess beyond it.
-- After a dream, summarize the journal (pruned / promoted / flagged counts).
+- Recall is lexical + graph-structural (offline): cross-domain synonymy
+  with no corpus evidence can miss; benchmark and limits are published in
+  the repo README.
+- Facts recalled fewer than twice and untouched past the 45-day grace
+  window decay into `.mind/archive.md` by design (restorable with
+  `remember`).
+- Corrupt `graph.json` is quarantined as `graph.json.corrupt-*` and memory
+  restarts empty — tell the user where the quarantined file is.
+- The tool refuses to write through symlinked agent/lock/archive files.
 
-## Troubleshooting
+## Verification
 
-- `no mind memory here` → run `python3 mind.py init` in the project root.
-- Corrupt `graph.json` is quarantined automatically as `graph.json.corrupt-*`
-  and memory restarts empty — tell the user where the quarantined file is.
-- The tool refuses to write through symlinked agent files by design.
+```bash
+cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v5.3.0/mind.py && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
+```
 
-## Honest limits
-
-- Lexical + graph recall (offline): cross-domain synonymy without corpus
-  evidence can miss; benchmark and limitations are published in the README.
-- Memory lifecycle is validated by a 180-day simulated-usage soak test in
-  CI (core-fact survival 15/15 across daily/weekly/monthly cadences, stale
-  junk eliminated 0/256); facts needed less often than ~every 6 weeks with
-  fewer than 2 recalls decay into the archive by design.
-- Per-project memory (hundreds to thousands of nodes), not enterprise RAG.
+Expected: one result containing `7413` with a printed memory id.
