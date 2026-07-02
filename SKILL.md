@@ -5,7 +5,7 @@ description: >-
   Ebbinghaus forgetting, deterministic dream consolidation, and export to
   AGENTS.md/CLAUDE.md/GEMINI.md. One Python file, zero dependencies, zero
   API keys, fully offline, bilingual (EN/AR).
-version: 5.0.0
+version: 5.2.0
 author: Da7-Tech
 license: MIT
 platforms: [linux, macos]
@@ -51,7 +51,9 @@ python3 mind.py init
 
 `init` creates `.mind/` and writes guard-marked memory blocks into
 `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` — existing user content in those files
-is preserved outside the markers.
+is preserved outside the markers. Projects already using Cursor, Windsurf,
+Cline or Roo get their rule files (`.cursorrules`, `.windsurfrules`,
+`.clinerules`, `.roo/rules/mind.md`) kept in sync automatically.
 
 ## Quick Reference
 
@@ -114,4 +116,8 @@ hermes cron create "0 4 * * *" --name mind-dream \
 
 - Lexical + graph recall (offline): cross-domain synonymy without corpus
   evidence can miss; benchmark and limitations are published in the README.
+- Memory lifecycle is validated by a 180-day simulated-usage soak test in
+  CI (core-fact survival 15/15 across daily/weekly/monthly cadences, stale
+  junk eliminated 0/256); facts needed less often than ~every 6 weeks with
+  fewer than 2 recalls decay into the archive by design.
 - Per-project memory (hundreds to thousands of nodes), not enterprise RAG.

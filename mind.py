@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "5.1.0"
+__version__ = "5.2.0"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -946,15 +946,13 @@ class Dreamer:
 class Active:
     BEGIN = "<!-- mind:memory begin (auto-generated, do not edit) -->"
     END = "<!-- mind:memory end -->"
-    TARGETS = (
-        "AGENTS.md",
-        "CLAUDE.md",
-        "GEMINI.md",
-        ".cursorrules",
-        ".windsurfrules",
-        ".clinerules",
-        ".roo/rules/mind.md",
-    )
+    # Always written: the three canonical cross-agent files.
+    CANONICAL = ("AGENTS.md", "CLAUDE.md", "GEMINI.md")
+    # Written only when the project already uses that tool (the rule file —
+    # or for Roo, the .roo/ directory — exists). Keeps fresh projects clean.
+    DOT_TARGETS = (".cursorrules", ".windsurfrules", ".clinerules",
+                   ".roo/rules/mind.md")
+    TARGETS = CANONICAL + DOT_TARGETS
 
     def __init__(self, mind_dir, hippo, cortex):
         self.dir = mind_dir
@@ -1010,11 +1008,19 @@ class Active:
         for target in self.TARGETS:
             target_path = Path(target)
             tpath = project_root / target_path
+            # opt-in dot targets: written only for projects already using
+            # that tool (the rule file — or .roo/ for Roo — is present)
+            if target in self.DOT_TARGETS:
+                anchor = project_root / target_path.parts[0]
+                if not (anchor.exists() or anchor.is_symlink()):
+                    continue
             parent = project_root
             skip = False
             for part in target_path.parent.parts:
                 parent = parent / part
-                if parent.exists() and parent.is_symlink():
+                # is_symlink() alone: exists() follows links, so a dangling
+                # symlink parent would slip past an exists()-guarded check
+                if parent.is_symlink():
                     written.append("%s (skipped: symlink parent)" % target)
                     skip = True
                     break
@@ -1093,7 +1099,8 @@ agent files exported:
   AGENTS.md   (Codex, Cursor, Zed, ...)
   CLAUDE.md   (Claude Code)
   GEMINI.md   (Gemini CLI)
-  .cursorrules / .windsurfrules / .clinerules / .roo/rules/mind.md
+  (.cursorrules / .windsurfrules / .clinerules / .roo/rules/mind.md
+   are adopted automatically when the project already uses them)
 
 start with:  python3 mind.py remember "first thing to remember"
 then:        python3 mind.py recall "your question"

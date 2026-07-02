@@ -18,8 +18,9 @@ you sleep through a **deterministic dream cycle** — no LLM calls, no token
 bill, every decision explained in a journal you can read.
 
 It plugs into **every agent at once**: one memory, exported to `AGENTS.md`
-(Codex, Cursor, Zed, ...), `CLAUDE.md` (Claude Code), `GEMINI.md`,
-`.cursorrules`, `.windsurfrules`, `.clinerules`, and `.roo/rules/mind.md`.
+(Codex, Cursor, Zed, ...), `CLAUDE.md` (Claude Code) and `GEMINI.md` — and
+adopted automatically by `.cursorrules`, `.windsurfrules`, `.clinerules`
+and `.roo/rules/mind.md` in projects that already use those tools.
 
 ```bash
 curl -O https://raw.githubusercontent.com/Da7-Tech/mind/main/mind.py
@@ -155,9 +156,11 @@ skew weights); agents confirm useful hits via the `bump()` API.
 
 ## Using with Hermes, Claude Code, Codex, Gemini CLI...
 
-`mind init` writes the working memory into `AGENTS.md`, `CLAUDE.md`,
-`GEMINI.md`, `.cursorrules`, `.windsurfrules`, `.clinerules`, and
-`.roo/rules/mind.md` with guard markers, preserving your existing content.
+`mind init` writes the working memory into `AGENTS.md`, `CLAUDE.md` and
+`GEMINI.md` with guard markers, preserving your existing content. If the
+project already has `.cursorrules`, `.windsurfrules`, `.clinerules` or a
+`.roo/` directory, those rule files are kept in sync too — adopted, never
+imposed on projects that don't use them.
 Any agent that reads those files gets the memory and the instructions to use it —
 nothing else to configure. A ready-made Hermes skill lives in
 [`SKILL.md`](SKILL.md).

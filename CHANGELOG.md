@@ -1,5 +1,18 @@
 # Changelog
 
+## 5.2.0 — 2026-07-02
+
+- **New export targets** (first community contribution — thanks
+  [@Abhinav-0311](https://github.com/Abhinav-0311), #6): `.cursorrules`,
+  `.windsurfrules`, `.clinerules` and `.roo/rules/mind.md` (Cursor,
+  Windsurf, Cline, Roo), with symlink-parent protection for nested paths
+  and Windows-portable atomic writes.
+- Follow-up hardening on top of #6: tool dotfiles are **adopted, not
+  imposed** — written only when the project already has the rule file (or
+  a `.roo/` directory), so fresh projects stay clean with the three
+  canonical files; dangling-symlink parents are now skipped too
+  (`exists()` follows links and missed them).
+
 ## 5.1.0 — 2026-07-02
 
 Soak-hardened forgetting. A new 180-day simulated-usage soak test

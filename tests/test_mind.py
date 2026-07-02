@@ -472,13 +472,25 @@ class TestActiveExport(TmpDirTest):
         h.remember("exported fact")
         a.generate(self.tmp)
         a.export_to_agents(self.tmp)
-        for f in Active.TARGETS:
+        for f in Active.CANONICAL:
             content = (self.tmp / f).read_text("utf-8")
             self.assertIn("exported fact", content)
             self.assertIn(Active.BEGIN, content)
 
+    def test_dot_targets_only_when_present(self):
+        """A fresh project must get only the three canonical files —
+        tool dotfiles are adopted, never imposed."""
+        h, c, a = self.parts()
+        h.remember("a fact")
+        a.generate(self.tmp)
+        a.export_to_agents(self.tmp)
+        for f in (".cursorrules", ".windsurfrules", ".clinerules"):
+            self.assertFalse((self.tmp / f).exists(), f)
+        self.assertFalse((self.tmp / ".roo").exists())
+
     def test_export_creates_nested_rule_targets(self):
         h, c, a = self.parts()
+        (self.tmp / ".roo").mkdir()          # project already uses Roo
         h.remember("roo export fact")
         a.generate(self.tmp)
         a.export_to_agents(self.tmp)
@@ -544,6 +556,17 @@ class TestActiveExport(TmpDirTest):
         written = a.export_to_agents(self.tmp)
         self.assertTrue(any("symlink parent" in w for w in written))
         self.assertFalse((outside / "rules" / "mind.md").exists())
+
+    @unittest.skipIf(os.name == "nt", "Windows symlinks require extra privileges")
+    def test_dangling_symlink_parent_skipped(self):
+        """Review regression: a DANGLING .roo symlink must be skipped too —
+        exists() follows links, so an exists()-guarded check misses it."""
+        h, c, a = self.parts()
+        (self.tmp / ".roo").symlink_to(self.tmp / "nowhere")
+        h.remember("a fact")
+        a.generate(self.tmp)
+        written = a.export_to_agents(self.tmp)   # must not raise
+        self.assertTrue(any("symlink parent" in w for w in written))
 
     def test_working_memory_respects_budget(self):
         h, c, a = self.parts()
