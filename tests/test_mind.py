@@ -578,7 +578,134 @@ class TestActiveExport(TmpDirTest):
 
 
 # ───────────────────── auditor-finding regressions ─────────────────────
-class TestAuditFindings(TmpDirTest):
+class TestAuditFindings2(TmpDirTest):
+    """Second-round adversarial audit (Opus fleet, verified receipts)."""
+
+    def test_future_timestamp_does_not_inflate_weight(self):
+        h = self.hippo()
+        nid = h.remember("critical fact about the deploy pipeline")
+        h.nodes[nid]["last_accessed"] = (
+            datetime.now() + timedelta(days=100)).isoformat()
+        h.decay()
+        self.assertLessEqual(h.nodes[nid]["weight"], 1.0,
+                             "future timestamp must not inflate weight past 1.0")
+        h.decay()  # second cycle must stay clamped
+        self.assertLessEqual(h.nodes[nid]["weight"], 1.0)
+
+    def test_non_numeric_weight_does_not_brick_commands(self):
+        gpath = self.mind_dir / "graph.json"
+        gpath.write_text('{"nodes":{"aaa":{"text":"hi there world",'
+                         '"weight":"heavy"}},"edges":{}}', encoding="utf-8")
+        h = Hippocampus(gpath)
+        self.assertIsInstance(h.nodes["aaa"]["weight"], float)
+        results, _, _ = h.recall("hi there world")   # must not raise
+        self.assertTrue(results)
+
+    def test_keys_as_bare_string_or_nonstring_element(self):
+        gpath = self.mind_dir / "graph.json"
+        gpath.write_text('{"nodes":{"aaa":{"text":"alpha beta gamma",'
+                         '"keys":[123,"real"]},"bbb":{"text":"delta epsilon",'
+                         '"keys":"betacharlie"}},"edges":{}}', encoding="utf-8")
+        h = Hippocampus(gpath)                       # must not raise
+        self.assertEqual(h.nodes["aaa"]["keys"], ["real"])
+        self.assertEqual(h.nodes["bbb"]["keys"], [])  # bare string → dropped
+        h.recall("alpha")                            # must not raise
+
+    def test_symlinked_dreams_dir_cannot_escape(self):
+        if os.name == "nt":
+            self.skipTest("symlinks need privileges on Windows")
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        victim = outside / ("%s.md" % datetime.now().date())
+        victim.write_text("PRECIOUS", encoding="utf-8")
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        d = Dreamer(self.mind_dir, h, c)
+        shutil.rmtree(self.mind_dir / "dreams")      # setUp created it; replace with symlink
+        (self.mind_dir / "dreams").symlink_to(outside, target_is_directory=True)
+        h.remember("something to dream about here")
+        d.dream()                                    # must not escape
+        self.assertEqual(victim.read_text("utf-8"), "PRECIOUS",
+                         "a symlinked dreams/ dir must not let dream escape")
+
+    def test_symlinked_cortex_dir_cannot_escape(self):
+        if os.name == "nt":
+            self.skipTest("symlinks need privileges on Windows")
+        outside = self.tmp / "escape_cortex"
+        outside.mkdir()
+        h = self.hippo()
+        shutil.rmtree(self.mind_dir / "cortex")      # setUp created it; replace with symlink
+        (self.mind_dir / "cortex").symlink_to(outside, target_is_directory=True)
+        c = Cortex(self.mind_dir / "cortex")
+        d = Dreamer(self.mind_dir, h, c)
+        for i in range(4):
+            h.remember("hetzner deploy server ssh key rotation step %d" % i)
+        d.dream()                                    # must not crash, must not escape
+        self.assertEqual(list(outside.glob("*.md")), [],
+                         "a symlinked cortex/ dir must not receive promoted files")
+
+    def test_edge_decay_persists_across_reload(self):
+        """The headline claim: edges weaken every dream. Must survive a
+        disk reload (the CLI reloads graph.json on every invocation)."""
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        d = Dreamer(self.mind_dir, h, c)
+        h.remember("alpha service calls beta service")
+        h.remember("beta service writes to gamma store")
+        h.link("alpha service calls beta service", "beta service writes to gamma store")
+        ida = h._id("alpha service calls beta service")
+        d.dream()
+        reloaded = Hippocampus(self.mind_dir / "graph.json")
+        w = list(reloaded.edges[ida].values())[0]["weight"]
+        self.assertLess(w, 1.0, "edge decay must be persisted to disk, not just in memory")
+
+    def test_pruned_edge_not_revived_by_merge(self):
+        """Regression for the merge-revival bug: a decayed-to-empty edge
+        removed this session must not resurrect from the disk copy."""
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        d = Dreamer(self.mind_dir, h, c)
+        # deliberately dissimilar texts so the conflict scan never creates a
+        # fresh edge between them (that would confound the revival check)
+        h.remember("the office wifi password rotates each quarter")
+        h.remember("postgres sixteen is the primary datastore")
+        h.link("the office wifi password rotates each quarter",
+               "postgres sixteen is the primary datastore")
+        ida = h._id("the office wifi password rotates each quarter")
+        idb = h._id("postgres sixteen is the primary datastore")
+        for _ in range(60):
+            d.dream()
+        reloaded = Hippocampus(self.mind_dir / "graph.json")
+        self.assertNotIn(idb, reloaded.edges.get(ida, {}),
+                         "pruned edge must stay pruned on disk, not revive")
+
+    def test_export_preserves_user_file_that_mentions_mind(self):
+        """CRITIC HIGH: a real user rule file mentioning the tool must not
+        be silently destroyed by the stale-block heuristic."""
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        a = Active(self.mind_dir, h, c)
+        user = "# Project rules\nThis project uses mind working memory; run mind.py recall.\n"
+        (self.tmp / "CLAUDE.md").write_text(user, encoding="utf-8")
+        h.remember("a durable fact")
+        a.generate(self.tmp)
+        a.export_to_agents(self.tmp)
+        content = (self.tmp / "CLAUDE.md").read_text("utf-8")
+        self.assertIn("Project rules", content, "user content must survive export")
+        self.assertIn("run mind.py recall", content)
+        self.assertIn("a durable fact", content)
+
+    def test_link_with_control_chars_creates_real_edge(self):
+        """CRITIC: link must hash the cleaned text so the edge lands on the
+        stored node id, not a phantom id that gets dropped on reload."""
+        h = self.hippo()
+        h.link("alpha\x1b[31m node one", "beta node two")
+        reloaded = Hippocampus(self.mind_dir / "graph.json")
+        ida = reloaded._id(reloaded._clean_text("alpha\x1b[31m node one"))
+        self.assertIn(ida, reloaded.nodes)
+        self.assertTrue(reloaded.edges.get(ida),
+                        "the edge must exist under the real (cleaned) node id")
+
     def test_lock_symlink_does_not_truncate_target(self):
         """A symlinked graph.json.lock must never truncate its target."""
         if os.name == "nt":

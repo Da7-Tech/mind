@@ -1,7 +1,7 @@
 ---
 name: mind
 description: Per-project memory graph with recall, decay, and dreams.
-version: 5.3.0
+version: 5.4.0
 author: Da7-Tech
 license: MIT
 platforms: [linux, macos, windows]
@@ -36,7 +36,7 @@ built-in `memory` tool — and it is not a RAG system for large corpora.
 
 - `python3` (3.9+) and `curl` on PATH — nothing else: no API keys, no
   server, no packages. The tool is one stdlib-only file, MIT-licensed,
-  from https://github.com/Da7-Tech/mind (77 tests + benchmark + 180-day
+  from https://github.com/Da7-Tech/mind (86 tests + benchmark + 180-day
   soak test run in its CI on Linux/macOS/Windows).
 
 ## How to Run
@@ -46,8 +46,8 @@ tag and integrity-checked:
 
 ```bash
 cd <project>
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v5.3.0/mind.py
-echo "497a155d92236fd53b05acde2740e6fac5ca14693e1e23284692352c6ac2c85c  mind.py" | shasum -a 256 -c
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v5.4.0/mind.py
+echo "50becf1e0f93e79c1fb411ce2aedc663d18bf77931c90cff6cfd3b9c72ce8ee4  mind.py" | shasum -a 256 -c
 python3 mind.py init
 ```
 
@@ -106,7 +106,7 @@ hermes cron create "0 4 * * *" --name mind-dream --script mind_dream.sh --no-age
 ## Verification
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v5.3.0/mind.py && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
+cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v5.4.0/mind.py && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
 ```
 
 Expected: one result containing `7413` with a printed memory id.

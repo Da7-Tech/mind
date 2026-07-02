@@ -60,7 +60,7 @@ first monthly recall; decayed weight vetoing exact matches) — both fixed
 with regression tests. The one benchmark miss (`"what css framework"`
 → tailwind) is an honest limitation documented below, not hidden.
 
-Test suite: **77 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **86 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, and corrupt-graph recovery.
 
@@ -81,7 +81,7 @@ Layer 3  CORTEX           .mind/cortex/*.md → consolidated durable knowledge
          fed by the dreamer when a cluster of related memories recurs
 
 DREAMER  between sessions  python3 mind.py dream [--dry-run]
-         light sleep  ingest session signals
+         light sleep  count + clear session signals (telemetry, reported in the journal)
          deep sleep   Ebbinghaus decay  R = e^(−t/S)  — stability S grows
                       with each confirmed recall; weak unused nodes pruned;
                       weak edges pruned (synaptic pruning)
@@ -138,8 +138,9 @@ so connections that never earn a confirmation decay and prune away.
 ## Safety properties
 
 - **Atomic, durable, symlink-refusing writes** everywhere — O_NOFOLLOW +
-  fsync-before-rename (survives power loss), and the lock file itself is
-  opened symlink-safe
+  fsync-before-rename (survives power loss), the lock file itself is opened
+  symlink-safe, and every internal write also rejects a symlinked *parent*
+  directory so nothing can escape the `.mind/` boundary
 - **Never silently destroys data**: corrupt graphs are quarantined, not erased;
   memories pruned by decay are archived to `.mind/archive.md` — and if the
   archive cannot be written, nothing is pruned at all;
@@ -180,7 +181,7 @@ nothing else to configure. A ready-made Hermes skill lives in
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 77 tests
+python3 -m unittest discover -s tests   # 86 tests
 python3 bench/bench.py                  # reproduce the numbers above
 ```
 

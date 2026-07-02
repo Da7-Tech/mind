@@ -55,7 +55,7 @@ restrengthens its edges, while every dream weakens all edges slightly
 
 | phase | biological analogue | what it does |
 |---|---|---|
-| light sleep | signal replay | ingest session signals (what was written/asked) |
+| light sleep | session telemetry | count and clear the session's write signals (remember/link/correct) — currently telemetry the journal reports, not a replay that feeds consolidation; the consolidation inputs are the node/edge weights themselves |
 | deep sleep | slow-wave consolidation + synaptic homeostasis | Ebbinghaus decay; prune weak nodes and weak edges |
 | REM | recombination | deterministic clustering of related memories → promote recurring clusters to cortex; scan for contradictions and *flag* them |
 

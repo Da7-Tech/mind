@@ -1,5 +1,45 @@
 # Changelog
 
+## 5.4.0 — 2026-07-02
+
+Second adversarial audit (an Opus-4.8 fleet: 17 reviewers with distinct
+methodologies, each finding independently reproduced-or-refuted, plus a
+completeness critic). Every confirmed defect fixed with a regression test
+(86 tests total):
+
+- **Data-loss (critical): `export_to_agents` could destroy a user's whole
+  CLAUDE.md/AGENTS.md/GEMINI.md** if it merely contained the substring
+  "mind working memory" or began with "# ACTIVE.md" — no markers, no
+  backup, no warning. The stale-block heuristic is now a strict structural
+  match on our exact generated header, so real user files that mention the
+  tool are preserved.
+- **Security: parent-symlink escape.** `_atomic_write` guarded only the
+  final path; a symlinked `.mind/dreams` or `.mind/cortex` let dream/promote
+  overwrite arbitrary files outside the project. A parent-directory symlink
+  walk (`boundary=`) now protects every internal write, and dream/promote
+  degrade gracefully instead of crashing on an unsafe dir.
+- **Weight inflation: a future `last_accessed`** (clock skew / cross-machine
+  sync — this is synced memory, `_now()` is naive local time) made decay's
+  retention exceed 1.0 and inflated a node's weight unboundedly and
+  permanently. Decay now clamps to `[0,1]` and treats future timestamps as
+  fresh.
+- **Edge decay was never persisted.** The "every dream weakens all edges"
+  claim held in-process but the CLI reloads from disk each run, so edges
+  never actually decayed; dream now saves after the edge pass. Fixing this
+  surfaced a latent **merge-revival bug** (a pruned edge resurrected from
+  the disk copy because edge deletions weren't tracked) — now tracked and
+  stripped in the read-merge-write.
+- **Corrupt-graph robustness.** A non-numeric `weight`, or a `keys` field
+  that's a bare string or contains a non-string element, no longer bricks
+  every command — numeric fields are coerced and keys are validated on load.
+- **Phantom edges: `link` hashed raw text** while `remember` hashed the
+  control-char-cleaned text, so an edge on text with control chars landed on
+  a non-existent id and was dropped on reload. Both now share one
+  sanitizer.
+- **Honest docs:** the soak now also shells out to the real CLI (argv +
+  disk-reload path); the "light sleep — signal replay" phase is documented
+  as the telemetry it actually is, not a replay.
+
 ## 5.3.0 — 2026-07-02
 
 Audit-hardening release. Three independent code audits (two external

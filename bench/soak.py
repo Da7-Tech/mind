@@ -2,10 +2,13 @@
 """mind soak test — 180 simulated days of realistic agent usage.
 
 Answers the question unit tests cannot: does memory stay signal or decay
-into noise over months? The simulation drives the REAL code (remember /
-recall / bump / dream) through mind's injectable clock (`mind._now`) — no
-simplified model, no mocked logic. Deterministic (seeded): rerun it and
-you get the same numbers.
+into noise over months? The simulation drives the REAL consolidation code
+(remember / recall / bump / dream) through mind's injectable clock
+(`mind._now`) — no simplified model, no mocked logic. It exercises the
+in-process object API rather than the argv CLI dispatcher, so a final
+smoke leg (see cli_smoke() below) shells out to `python3 mind.py ...` to
+also cover the disk-reload + argv path that users actually reach.
+Deterministic (seeded): rerun it and you get the same numbers.
 
 Workload per simulated day:
   - 1-3 trivia notes remembered (90% never mentioned again — the noise)
@@ -165,9 +168,52 @@ def main():
              "yes" if sizes[180] < sizes[30] * 3 else "NO"))
     print("recall latency on aged graph: median %.2f ms" % statistics.median(lat))
     print("wall time: %.1f s" % (time.time() - t_start))
-    print("verdict: %s" % ("PASS" if all_ok else "FAIL"))
     shutil.rmtree(tmp, ignore_errors=True)
-    return 0 if all_ok else 1
+
+    cli_ok = cli_smoke()
+    print("cli smoke (argv + disk-reload path): %s" % ("PASS" if cli_ok else "FAIL"))
+
+    ok = all_ok and cli_ok
+    print("verdict: %s" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
+def cli_smoke():
+    """Cover the path the object-API soak skips: the argv dispatcher and the
+    disk reload that every real `python3 mind.py <cmd>` invocation performs
+    (a separate process, reloading graph.json each time). Exercises
+    init/remember/recall/confirm/correct/link/dream/export/status end to end.
+    """
+    import subprocess
+    here = Path(__file__).resolve().parent.parent / "mind.py"
+    proj = Path(tempfile.mkdtemp(prefix="mind-cli-smoke-"))
+    def run(*args):
+        return subprocess.run([sys.executable, str(here), *args], cwd=str(proj),
+                              capture_output=True, text=True)
+    try:
+        assert run("init").returncode == 0
+        assert run("remember", "the deploy target is hetzner via docker").returncode == 0
+        assert run("remember", "the database is postgres 16").returncode == 0
+        r = run("recall", "where do we deploy")
+        assert r.returncode == 0 and "hetzner" in r.stdout
+        import re as _re
+        m = _re.search(r"id ([0-9a-f]{12})", r.stdout)
+        assert m and run("confirm", m.group(1)).returncode == 0
+        assert run("link", "the database is postgres 16",
+                   "the deploy target is hetzner via docker", "used-by").returncode == 0
+        assert run("correct", "database postgres", "the database is postgres 17").returncode == 0
+        assert run("dream").returncode == 0
+        assert run("export").returncode == 0
+        s = run("status")
+        assert s.returncode == 0 and "nodes:" in s.stdout
+        # the corrected fact must survive a fresh process (disk reload)
+        r2 = run("recall", "which database")
+        assert r2.returncode == 0 and "postgres 17" in r2.stdout
+        return True
+    except AssertionError:
+        return False
+    finally:
+        shutil.rmtree(proj, ignore_errors=True)
 
 
 if __name__ == "__main__":

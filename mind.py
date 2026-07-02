@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "5.3.0"
+__version__ = "5.4.0"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -70,16 +70,41 @@ def _now():
     return datetime.now()
 
 
-def _atomic_write(path, data):
+def _reject_symlinked_parents(path, boundary):
+    """Raise if any directory from `path`'s parent up to (and including)
+    `boundary` is a symlink. Walked on the RAW (unresolved) paths so the
+    symlink itself is caught. Without this, os.replace() follows a symlinked
+    parent dir and a write escapes the trust boundary (auditor finding: a
+    symlinked .mind/dreams or .mind/cortex let dream/promote overwrite files
+    outside the project)."""
+    boundary = os.path.abspath(str(boundary))
+    p = os.path.abspath(str(Path(path).parent))
+    while True:
+        if os.path.islink(p):
+            raise ValueError("refusing to write through a symlinked parent: %s" % p)
+        if p == boundary:
+            break
+        parent = os.path.dirname(p)
+        if parent == p:            # reached filesystem root without hitting boundary
+            break
+        p = parent
+
+
+def _atomic_write(path, data, boundary=None):
     """Atomic, symlink-safe, durable write: O_NOFOLLOW + fsync + os.replace.
 
-    O_NOFOLLOW + the is_symlink check block TOCTOU symlink attacks;
-    os.replace guarantees readers see the old or the new file, never a torn
-    one; fsync before the rename makes the new content survive power loss
-    (without it the rename can land while the data is still in page cache)."""
+    O_NOFOLLOW + the is_symlink check block TOCTOU symlink attacks on the
+    target itself; when `boundary` is given, parent directories up to it are
+    also checked so a symlinked parent dir cannot redirect the write outside
+    the trust boundary. os.replace guarantees readers see the old or the new
+    file, never a torn one; fsync before the rename makes the new content
+    survive power loss (without it the rename can land while the data is
+    still in page cache)."""
     path = Path(path)
     if path.is_symlink():
         raise ValueError(f"refusing to write through a symlink: {path}")
+    if boundary is not None:
+        _reject_symlinked_parents(path, boundary)
     tmp = str(path) + ".tmp"
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | nofollow | os.O_TRUNC, 0o644)
@@ -376,6 +401,10 @@ class Hippocampus:
         self.related = None
         self.embedder = HashEmbed()
         self._deleted = set()   # node ids deleted this session (see _save merge)
+        self._pruned_edges = set()  # (a, b) edge pairs pruned this session:
+        #   without this, an edge decayed to empty and removed from
+        #   self.edges is silently REVIVED from disk by the read-merge-write
+        #   (edge deletions, unlike node deletions, weren't tracked)
         self._load()
 
     # -- persistence -------------------------------------------------
@@ -419,8 +448,23 @@ class Hippocampus:
             n.setdefault("keys", [])
             n.setdefault("last_accessed", _now().isoformat())
             n.setdefault("created", _now().isoformat())
+            # coerce numeric fields: a hand-edit or bad restore that leaves a
+            # non-numeric weight must repair to a default, not brick every
+            # command on the first arithmetic use (auditor finding)
+            for f, d in (("weight", 1.0), ("peak_weight", 1.0),
+                         ("confidence", 1.0), ("access_count", 0)):
+                try:
+                    n[f] = float(n.get(f, d))
+                except (TypeError, ValueError):
+                    n[f] = d
+            # keys must be a list of strings; a bare string would iterate
+            # character-by-character and a non-string element would crash
+            # the re.sub below (auditor finding)
+            raw_keys = n.get("keys", [])
+            if not isinstance(raw_keys, list):
+                raw_keys = []
             n["keys"] = [re.sub(r'[،؛؟!."\']', '', k).strip()
-                         for k in n.get("keys", [])]
+                         for k in raw_keys if isinstance(k, str)]
             n["keys"] = [k for k in n["keys"] if k]
         # drop edges referencing missing nodes: a partially corrupt or
         # hand-edited graph must degrade gracefully, not crash recall
@@ -467,10 +511,18 @@ class Hippocampus:
                         for nbrs in merged_e.values():
                             for d in self._deleted:
                                 nbrs.pop(d, None)
+                        # honor edges this process pruned: the disk copy of a
+                        # decayed-to-empty edge must not resurrect it
+                        for a, b in self._pruned_edges:
+                            if a in merged_e:
+                                merged_e[a].pop(b, None)
+                                if not merged_e[a]:
+                                    del merged_e[a]
                         self.nodes, self.edges = merged_n, merged_e
                 _atomic_write(self.path, json.dumps(
                     {"nodes": self.nodes, "edges": self.edges},
-                    ensure_ascii=False, indent=2))
+                    ensure_ascii=False, indent=2),
+                    boundary=self.path.parent)
             finally:
                 if fcntl is not None:
                     fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
@@ -519,13 +571,20 @@ class Hippocampus:
                         keys.add(term)
         return list(keys)[:24]
 
+    @staticmethod
+    def _clean_text(text):
+        """Strip terminal control chars (keep newlines/tabs) so stored text
+        can never carry ANSI escapes back to a terminal on recall. Shared by
+        remember and link so their node ids agree (auditor finding: link
+        hashed the raw text while remember hashed the cleaned text, creating
+        a phantom edge that the dangling-edge filter then silently dropped)."""
+        return re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text or "").strip()
+
     # -- write path ---------------------------------------------------
     def remember(self, text, confidence=1.0):
         if not text or not text.strip():
             raise ValueError("cannot remember empty text")
-        # strip terminal control characters (keep newlines/tabs) so stored
-        # text can never carry ANSI escapes back to a terminal on recall
-        text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text).strip()
+        text = self._clean_text(text)
         if not text:
             raise ValueError("cannot remember control-characters-only text")
         nid = self._id(text)
@@ -557,7 +616,11 @@ class Hippocampus:
         # relations end up in graph.json and journals — same control-char
         # hygiene as memory texts (auditor finding), plus a sane length cap
         relation = re.sub(r"[\x00-\x1f\x7f]", "", relation).strip()[:60] or "related"
-        id_a, id_b = self._id(text_a.strip()), self._id(text_b.strip())
+        # hash the CLEANED text, exactly as remember() does, so the edge is
+        # stored under the same id the node gets — otherwise the edge points
+        # at a phantom id and is dropped on next load (auditor finding)
+        text_a, text_b = self._clean_text(text_a), self._clean_text(text_b)
+        id_a, id_b = self._id(text_a), self._id(text_b)
         if id_a not in self.nodes:
             self.remember(text_a)
         if id_b not in self.nodes:
@@ -796,10 +859,17 @@ class Hippocampus:
                 days = (now - datetime.fromisoformat(n["last_accessed"])).days
             except ValueError:
                 days = 0
+            # a future last_accessed (clock skew / cross-machine sync — this
+            # IS synced agent memory, and _now() is naive local time) makes
+            # `days` negative and retention explode past 1.0, inflating the
+            # weight unboundedly and permanently. Treat future as fresh.
+            days = max(0, days)
             access = n.get("access_count", 0)
             stability = STABILITY_BASE_DAYS + access * STABILITY_PER_ACCESS
             retention = math.exp(-days / stability)
-            new_weight = max(0.0, n.get("peak_weight", 1.0) * retention)
+            # clamp to [0,1] like every other weight-mutating path (auditor
+            # finding: decay was the only one without an upper clamp)
+            new_weight = max(0.0, min(1.0, n.get("peak_weight", 1.0) * retention))
             if not dry_run:
                 n["weight"] = new_weight
             if new_weight < WEIGHT_THRESHOLD and access < 2 and days > GRACE_DAYS:
@@ -837,7 +907,8 @@ class Hippocampus:
         prev = arch.read_text("utf-8") if arch.exists() else \
             "# mind archive — memories pruned by decay (restore with `remember`)\n"
         try:
-            _atomic_write(arch, prev + "\n".join(lines) + "\n")
+            _atomic_write(arch, prev + "\n".join(lines) + "\n",
+                          boundary=self.path.parent)
         except (OSError, ValueError):
             return False
         return True
@@ -876,7 +947,9 @@ class Cortex:
                 suffix = hashlib.md5(topic.encode("utf-8")).hexdigest()[:6]
                 fpath = self.path / ("%s-%s.md" % (base or "topic", suffix))
         header = "# %s\n\n> promoted by dream on %s\n\n" % (topic, _now().date())
-        _atomic_write(fpath, header + content + "\n")
+        # boundary = .mind/ so a symlinked cortex/ dir can't redirect the
+        # write outside the project (auditor finding)
+        _atomic_write(fpath, header + content + "\n", boundary=self.path.parent)
         return str(fpath.relative_to(self.path.parent))
 
 
@@ -902,9 +975,13 @@ class Dreamer:
         log = ["# Dream journal — %s%s" % (_now().date(), mode), ""]
         log.append("_cycle started %s_" % _now().strftime("%H:%M"))
 
-        # 1. light sleep: ingest session signals
+        # 1. light sleep: count the session's write signals (telemetry). The
+        # consolidation inputs are the node/edge weights themselves, not the
+        # signal log — so this is reported, then cleared, not replayed.
         signals = self._read_signals()
-        log.append("\n## Light sleep\nIngested %d session signals." % len(signals))
+        log.append("\n## Light sleep\nSaw %d session signals "
+                   "(telemetry; consolidation runs on the graph weights)."
+                   % len(signals))
 
         # 2. deep sleep: Ebbinghaus decay + node pruning
         pruned = self.hippo.decay(dry_run=dry_run)
@@ -930,12 +1007,21 @@ class Dreamer:
                 if self.hippo.edges[nid][neighbor].get("weight", 1.0) < EDGE_PRUNE_THRESHOLD:
                     if not dry_run:
                         del self.hippo.edges[nid][neighbor]
+                        self.hippo._pruned_edges.add((nid, neighbor))
                     pruned_edges += 1
             if not dry_run and nid in self.hippo.edges and not self.hippo.edges[nid]:
                 del self.hippo.edges[nid]
         if pruned_edges:
             log.append("- synaptic pruning: %s %d weak edges."
                        % ("would remove" if dry_run else "removed", pruned_edges))
+        # persist the edge-weight changes: decay() only saves when a node is
+        # pruned, so on a steady-state night (no node/conflict change) the
+        # in-memory edge decay would be discarded and each fresh `dream`
+        # process would reload weight 1.0 and re-decay to no effect — edges
+        # would never actually weaken or prune across real runs (auditor
+        # finding: the claim was true in-process, false on disk).
+        if not dry_run:
+            self.hippo._save()
 
         # 3. REM: cluster related memories and promote recurring themes.
         # Clustering uses offline hash embeddings — deterministic, no network.
@@ -954,8 +1040,17 @@ class Dreamer:
         if dry_run:
             return None, memo_text
         memo = self.dir / ("%s.md" % _now().date())
-        _atomic_write(memo, memo_text)
-        if self.signals_file.exists():
+        # boundary = .mind/ so a symlinked dreams/ dir can't redirect the
+        # journal write outside the project (auditor finding). If the dir is
+        # unsafe, the consolidation already happened — just skip the journal
+        # rather than crash with a traceback.
+        try:
+            _atomic_write(memo, memo_text, boundary=self.hippo.path.parent)
+        except ValueError:
+            print("warning: .mind/dreams is unsafe (symlink?); "
+                  "skipping dream journal for this run.", file=sys.stderr)
+            return None, memo_text
+        if self.signals_file.exists() and not self.signals_file.is_symlink():
             self.signals_file.unlink()
         return str(memo.relative_to(self.hippo.path.parent)), memo_text
 
@@ -978,7 +1073,13 @@ class Dreamer:
                 texts = [self.hippo.nodes[m]["text"] for m in c["members"][:5]]
                 topic = c["centroid"][:50]
                 if not dry_run:
-                    self.cortex.promote(topic, "\n".join("- %s" % t for t in texts))
+                    try:
+                        self.cortex.promote(topic, "\n".join("- %s" % t for t in texts))
+                    except ValueError:
+                        # symlinked cortex/ dir: skip promotion rather than
+                        # crash the whole dream (auditor finding)
+                        log.append("  - (skipped promotion: cortex dir unsafe)")
+                        continue
                 promoted.append(topic)
                 log.append("- %s cluster (%d memories) -> cortex: %s"
                            % ("would promote" if dry_run else "promoted",
@@ -1099,7 +1200,8 @@ class Active:
 """ % (_now().strftime("%Y-%m-%d %H:%M"),
             "\n".join(hot) if hot else "- (memory is empty — start with `remember`)",
             "\n".join(cortex_files) if cortex_files else "- (no cortex yet)")
-        _atomic_write(self.path, content)
+        # boundary = .mind/ so a symlinked parent can't redirect the write
+        _atomic_write(self.path, content, boundary=self.path.parent)
         return str(self.path.relative_to(project_root))
 
     def export_to_agents(self, project_root):
@@ -1145,8 +1247,14 @@ class Active:
                         user_content).strip()
                 else:
                     stripped = content.strip()
-                    # Do not re-ingest our own stale block as "user content"
-                    if stripped.startswith("# ACTIVE.md") or "mind working memory" in stripped:
+                    # Do not re-ingest our own stale block as "user content".
+                    # This MUST be a structural match on our exact generated
+                    # header — a bare substring test ("mind working memory")
+                    # would classify any user file that merely mentions the
+                    # tool as our output and silently discard the whole file
+                    # (auditor finding: HIGH — a real CLAUDE.md saying "run
+                    # mind.py" was destroyed with no backup or warning).
+                    if stripped.startswith("# ACTIVE.md — mind working memory"):
                         user_content = ""
                     else:
                         user_content = stripped
