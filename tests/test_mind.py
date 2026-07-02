@@ -706,6 +706,47 @@ class TestAuditFindings2(TmpDirTest):
         self.assertTrue(reloaded.edges.get(ida),
                         "the edge must exist under the real (cleaned) node id")
 
+    def test_pruned_edges_do_not_clobber_a_fresh_conflict_link(self):
+        """Auditor finding (my own fix's regression): a conflict edge that
+        _rem_conflicts creates must survive even when that same pair had an
+        edge pruned earlier the same night. Also: _pruned_edges must not
+        poison a later _save in the same process."""
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        d = Dreamer(self.mind_dir, h, c)
+        na = "the api uses jwt tokens for auth sessions here"
+        nb = "the api uses oauth tokens for auth sessions here"
+        h.remember(na)
+        h.remember(nb)
+        a, b = h._id(na), h._id(nb)
+        # give them a nearly-dead edge so this night's dream prunes it
+        h.edges.setdefault(a, {})[b] = {"relation": "related", "weight": 0.05}
+        h.edges.setdefault(b, {})[a] = {"relation": "related", "weight": 0.05}
+        h._save()
+        _, text = d.dream()
+        reloaded = Hippocampus(self.mind_dir / "graph.json")
+        if "conflicts flagged: 1" in text or "possible conflict" in text:
+            self.assertTrue(reloaded.edges.get(a, {}).get(b),
+                            "a flagged conflict must actually be linked on disk")
+
+    def test_prune_then_recreate_same_op_keeps_the_edge(self):
+        """Directly exercise the merge: an edge pruned then re-created before
+        the next save must persist, not be stripped by _pruned_edges."""
+        h = self.hippo()
+        h.remember("alpha widget one")
+        h.remember("beta gadget two")
+        a, b = h._id("alpha widget one"), h._id("beta gadget two")
+        h.edges.setdefault(a, {})[b] = {"relation": "related", "weight": 0.05}
+        h._save()
+        # simulate a prune (record it) then a legitimate re-link in the same op
+        h._pruned_edges.add((a, b))
+        h.link("alpha widget one", "beta gadget two", "reconnected")
+        reloaded = Hippocampus(self.mind_dir / "graph.json")
+        self.assertTrue(reloaded.edges.get(a, {}).get(b),
+                        "a re-created edge must survive a same-session prune record")
+        self.assertEqual(h._pruned_edges, set(),
+                         "_pruned_edges must be cleared after a save")
+
     def test_lock_symlink_does_not_truncate_target(self):
         """A symlinked graph.json.lock must never truncate its target."""
         if os.name == "nt":

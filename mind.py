@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "5.4.0"
+__version__ = "5.4.1"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -505,24 +505,34 @@ class Hippocampus:
                         merged_n = {k: v for k, v in dn.items()
                                     if k not in self._deleted and isinstance(v, dict)}
                         merged_n.update(self.nodes)
-                        merged_e = {k: v for k, v in de.items()
-                                    if k not in self._deleted and isinstance(v, dict)}
-                        merged_e.update(self.edges)
-                        for nbrs in merged_e.values():
-                            for d in self._deleted:
-                                nbrs.pop(d, None)
-                        # honor edges this process pruned: the disk copy of a
-                        # decayed-to-empty edge must not resurrect it
-                        for a, b in self._pruned_edges:
-                            if a in merged_e:
-                                merged_e[a].pop(b, None)
-                                if not merged_e[a]:
-                                    del merged_e[a]
+                        # Build the merged edges from the DISK copy, stripping
+                        # both deleted nodes and edges this process pruned,
+                        # THEN apply our live edges. Order matters: pruned
+                        # pairs must be removed from the disk copy *before*
+                        # update, so a live edge we legitimately (re)created
+                        # this session still wins — filtering after update
+                        # would wrongly clobber it (auditor finding).
+                        merged_e = {}
+                        for k, v in de.items():
+                            if k in self._deleted or not isinstance(v, dict):
+                                continue
+                            merged_e[k] = {nbr: e for nbr, e in v.items()
+                                           if nbr not in self._deleted
+                                           and (k, nbr) not in self._pruned_edges}
+                        merged_e.update({k: v for k, v in self.edges.items()})
+                        # drop node-keys the disk left empty after stripping
+                        merged_e = {k: v for k, v in merged_e.items() if v}
                         self.nodes, self.edges = merged_n, merged_e
                 _atomic_write(self.path, json.dumps(
                     {"nodes": self.nodes, "edges": self.edges},
                     ensure_ascii=False, indent=2),
                     boundary=self.path.parent)
+                # deletions/prunes are now persisted to disk; clear them so
+                # they can't poison a later _save in the same process (auditor
+                # finding: a stale _pruned_edges entry deleted a live edge a
+                # subsequent op had recreated)
+                self._deleted.clear()
+                self._pruned_edges.clear()
             finally:
                 if fcntl is not None:
                     fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)

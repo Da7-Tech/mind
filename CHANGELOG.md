@@ -1,5 +1,17 @@
 # Changelog
 
+## 5.4.1 — 2026-07-02
+
+Follow-up to the 5.4.0 edge-merge fix (caught by a third adversarial pass):
+
+- The `_pruned_edges` stripping ran *after* live edges were merged, so it
+  could clobber an edge legitimately (re)created the same session — most
+  visibly the `possible-conflict` link `dream` creates when a conflicting
+  pair's old edge decayed the same night. Stripping now happens on the disk
+  copy *before* the live merge, and `_deleted`/`_pruned_edges` are cleared
+  after each successful save so a stale prune record can't poison a later
+  write. Two regression tests added (88 total).
+
 ## 5.4.0 — 2026-07-02
 
 Second adversarial audit (an Opus-4.8 fleet: 17 reviewers with distinct
