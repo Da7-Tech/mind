@@ -5,7 +5,8 @@
 [![deps](https://img.shields.io/badge/dependencies-0-brightgreen)](https://github.com/Da7-Tech/mind/blob/main/mind.py)
 [![recall@1](https://img.shields.io/badge/recall%401-0.95_measured-success)](https://github.com/Da7-Tech/mind/blob/main/bench/bench.py)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![العربية](https://img.shields.io/badge/README-العربية-8A2BE2)](README.ar.md)
+[![English](https://img.shields.io/badge/README-English-2ea44f)](README.md)
+[![العربية](https://img.shields.io/badge/README-%EF%BA%8D%EF%BB%9F%EF%BB%8C%EF%BA%AE%EF%BA%91%EF%BB%B4%EF%BA%94-8A2BE2)](README.ar.md)
 
 **One Python file. Zero dependencies. Zero API keys. Fully offline. Bilingual (EN + AR).**
 

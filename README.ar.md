@@ -1,5 +1,9 @@
 # mind — ذاكرة تحاكي الدماغ لأي وكيل برمجي
 
+[![English](https://img.shields.io/badge/README-English-2ea44f)](README.md)
+[![العربية](https://img.shields.io/badge/README-%EF%BA%8D%EF%BB%9F%EF%BB%8C%EF%BA%AE%EF%BA%91%EF%BB%B4%EF%BA%94-8A2BE2)](README.ar.md)
+[![tests](https://github.com/Da7-Tech/mind/actions/workflows/ci.yml/badge.svg)](https://github.com/Da7-Tech/mind/actions/workflows/ci.yml)
+
 **ملف بايثون واحد. صفر تبعيات. صفر مفاتيح. يعمل دون اتصال. ثنائي اللغة (عربي + إنجليزي).**
 
 وكيلك البرمجي ينسى كل شيء بين الجلسات. أداة `mind` تمنحه ذاكرة تعمل كذاكرتك:
