@@ -13,9 +13,13 @@ dreams between sessions, and portable to any agent through one standard file.
 2. **Local trace recall** (radius ≤ 3 hops) + caching — never a full
    PageRank over the whole graph. Cheap by construction.
 3. **Forgetting by decay** — every node weakens over time
-   (Ebbinghaus: `R = e^(−t/S)`), pruned below a threshold.
-   Stability `S` grows with confirmed recalls, so important memories
-   harden and trivia fades. This prevents garbage accumulation.
+   (Ebbinghaus: `R = e^(−t/S)`), pruned below a threshold — but never
+   within a 45-day grace window of its last access (soak-test finding:
+   monthly-cadence facts must survive to their first recall), and pruned
+   texts are archived, not destroyed. Stability `S` grows by ~two weeks
+   per confirmed recall, so important memories harden and trivia fades.
+   This prevents garbage accumulation: in the 180-day soak, junk older
+   than the grace window survived 0/256 while core facts survived 15/15.
 4. **Timestamps + confidence + conflict flags** — newer/more-trusted wins,
    but conflicts are *flagged*, never auto-deleted; `correct` performs
    explicit reconsolidation with history.

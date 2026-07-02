@@ -264,23 +264,47 @@ class TestCorrect(TmpDirTest):
 
 
 class TestDecay(TmpDirTest):
-    def _age(self, h, nid, days):
+    def _age(self, h, nid, days, created_days=None):
         h.nodes[nid]["last_accessed"] = (
             datetime.now() - timedelta(days=days)).isoformat()
+        h.nodes[nid]["created"] = (
+            datetime.now() - timedelta(days=created_days or days)).isoformat()
 
     def test_unused_memory_decays_and_prunes(self):
         h = self.hippo()
         nid = h.remember("trivial one-off note")
-        self._age(h, nid, 30)
+        self._age(h, nid, 50)
         pruned = h.decay()
         self.assertIn("trivial one-off note", pruned)
         self.assertNotIn(nid, h.nodes)
+
+    def test_newborn_grace_protects_unrecalled_memory(self):
+        """Soak-test regression: a fact noted today and needed next month
+        must survive its first weeks even with zero recalls."""
+        h = self.hippo()
+        nid = h.remember("backup restore drill is in runbooks/restore")
+        self._age(h, nid, 35)                 # weight far below threshold, inside grace
+        pruned = h.decay()
+        self.assertEqual(pruned, [])
+        self.assertIn(nid, h.nodes)
+        self.assertLess(h.nodes[nid]["weight"], 0.1,
+                        "weight must still decay during grace")
+
+    def test_one_confirmed_recall_buys_weeks(self):
+        """Soak-test regression: a memory recalled once must survive a
+        month-long gap to its next recall."""
+        h = self.hippo()
+        nid = h.remember("dns registrar is cloudflare")
+        h.bump([nid])
+        self._age(h, nid, 34, created_days=64)   # past grace, 34d since recall
+        pruned = h.decay()
+        self.assertIn(nid, h.nodes)
 
     def test_reinforced_memory_survives(self):
         h = self.hippo()
         nid = h.remember("critical architecture decision")
         h.bump([nid]); h.bump([nid]); h.bump([nid])
-        self._age(h, nid, 30)
+        self._age(h, nid, 50)
         pruned = h.decay()
         self.assertNotIn("critical architecture decision", pruned)
         self.assertIn(nid, h.nodes)
@@ -295,10 +319,19 @@ class TestDecay(TmpDirTest):
     def test_decay_dry_run_does_not_delete(self):
         h = self.hippo()
         nid = h.remember("trivial one-off note")
-        self._age(h, nid, 30)
+        self._age(h, nid, 50)
         pruned = h.decay(dry_run=True)
         self.assertTrue(pruned)
         self.assertIn(nid, h.nodes, "dry run must not delete")
+
+    def test_pruned_memory_archived_not_destroyed(self):
+        h = self.hippo()
+        nid = h.remember("old forgotten meeting note")
+        self._age(h, nid, 50)
+        h.decay()
+        self.assertNotIn(nid, h.nodes)
+        arch = (self.mind_dir / "archive.md").read_text("utf-8")
+        self.assertIn("old forgotten meeting note", arch)
 
 
 class TestPersistence(TmpDirTest):
@@ -394,10 +427,11 @@ class TestDreamer(TmpDirTest):
         stale = h.remember("stale note nobody used")
         keep = h.remember("core decision recalled daily")
         h.bump([keep]); h.bump([keep])
-        h.nodes[stale]["last_accessed"] = (
-            datetime.now() - timedelta(days=40)).isoformat()
-        h.nodes[keep]["last_accessed"] = (
-            datetime.now() - timedelta(days=40)).isoformat()
+        for nid in (stale, keep):
+            h.nodes[nid]["last_accessed"] = (
+                datetime.now() - timedelta(days=50)).isoformat()
+            h.nodes[nid]["created"] = (
+                datetime.now() - timedelta(days=50)).isoformat()
         d.dream()
         self.assertNotIn(stale, h.nodes)
         self.assertIn(keep, h.nodes)

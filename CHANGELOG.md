@@ -1,5 +1,25 @@
 # Changelog
 
+## 5.1.0 — 2026-07-02
+
+Soak-hardened forgetting. A new 180-day simulated-usage soak test
+(`bench/soak.py` — the real code driven through an injected clock) caught
+two calibration bugs that unit tests could not:
+
+- **Facts needed monthly died before their first recall** (pruned by the
+  nightly dream one day before the scheduled recall). Fix: a 45-day grace
+  window — no memory is pruned within 45 days of its last access. Weight
+  still decays during grace, so unproven memories fade from rankings.
+- **Decayed weight vetoed exact matches**: a strongly-matching but aged
+  memory ranked below fresh noise, so it could never earn its first
+  reinforcement. Fix: weight now biases ranking (floor 0.35) instead of
+  multiplying it to zero.
+- Stability per confirmed recall raised to ~two weeks (was 5 days).
+- Pruned memories are now archived to `.mind/archive.md`, never destroyed.
+- Soak results at day 180: core-fact survival 15/15 across daily/weekly/
+  monthly tiers, stale junk surviving 0/256, graph bounded, recall 0.37 ms.
+  The soak now runs in CI.
+
 ## 5.0.0 — 2026-07-02
 
 First public release. The tool was developed and battle-tested privately

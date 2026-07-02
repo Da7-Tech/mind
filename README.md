@@ -45,10 +45,19 @@ against distractor-filled graphs):
 | 1,000 nodes | **0.95** | 0.95 | 2.2 ms | 12.4 ms |
 
 Dream determinism: **PASS** — identical memory state always produces the
-identical consolidation plan. The one benchmark miss (`"what css framework"`
+identical consolidation plan.
+
+**180-day soak** (`bench/soak.py` — the real code driven through an injected
+clock with a realistic workload: daily/weekly/monthly facts + 357 junk notes
++ a dream every night): core-fact survival **15/15** across all cadence
+tiers, junk older than the grace window surviving: **0/256**, graph size
+bounded (~106 nodes), recall on the aged graph 0.37 ms. The soak caught two
+real calibration bugs before release (facts pruned one day before their
+first monthly recall; decayed weight vetoing exact matches) — both fixed
+with regression tests. The one benchmark miss (`"what css framework"`
 → tailwind) is an honest limitation documented below, not hidden.
 
-Test suite: **58 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **61 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, and corrupt-graph recovery.
 
@@ -122,6 +131,7 @@ skew weights); agents confirm useful hits via the `bump()` API.
 
 - **Atomic, symlink-refusing writes** everywhere (no torn files, no symlink attacks)
 - **Never silently destroys data**: corrupt graphs are quarantined, not erased;
+  memories pruned by decay are archived to `.mind/archive.md`, not destroyed;
   user content in `AGENTS.md`/`CLAUDE.md` is preserved outside guard markers
 - **`dream --dry-run`** previews the full plan without touching disk
 - **File-locked saves** — safe under concurrent agent processes
@@ -137,6 +147,10 @@ skew weights); agents confirm useful hits via the `bump()` API.
   morphological analyzer.
 - Optimized for personal/project agent memory (10²–10³ nodes), not
   enterprise RAG over millions of documents — use a real graph DB for that.
+- A fact recalled fewer than twice and untouched for longer than the 45-day
+  grace window decays out of the graph (into the archive). Facts you need
+  less often than ~every six weeks should live in cortex notes, not the
+  hippocampus — that's the brain deal: use it or archive it.
 
 ## Using with Hermes, Claude Code, Codex, Gemini CLI...
 
@@ -149,7 +163,7 @@ nothing else to configure. A ready-made Hermes skill lives in
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 58 tests
+python3 -m unittest discover -s tests   # 61 tests
 python3 bench/bench.py                  # reproduce the numbers above
 ```
 

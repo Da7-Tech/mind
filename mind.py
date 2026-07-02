@@ -24,7 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "5.0.0"
+__version__ = "5.1.0"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -45,7 +45,13 @@ SPREADING_THRESHOLD = 0.05  # do not propagate activation below this
 PROMOTION_THRESHOLD = 3     # cluster of >= 3 related nodes -> cortex
 ACTIVE_TOKEN_BUDGET = 800   # working-memory budget in characters (~200 tokens)
 STABILITY_BASE_DAYS = 3.0   # Ebbinghaus: base memory stability
-STABILITY_PER_ACCESS = 5.0  # each confirmed recall adds this many days
+STABILITY_PER_ACCESS = 14.0  # one confirmed recall buys ~two weeks of stability
+GRACE_DAYS = 45             # no memory dies within 45 days of its last access
+#   (soak-test finding: monthly-cadence facts have recall gaps up to ~34
+#    days; a 30-day grace lost them to the nightly dream one day before
+#    their first recall. Weight still decays during grace, so unproven
+#    memories fade from ACTIVE.md and rankings — they just aren't deleted.
+#    Facts needed less often than ~every 6 weeks are a documented limit.)
 EDGE_PRUNE_THRESHOLD = 0.1  # edges below this are pruned during dreams
 CLUSTER_SIM = 0.45          # similarity gate for dream clustering
 SEPARATION_SIM = 0.92       # near-identical results are diversified in top-k
@@ -599,19 +605,24 @@ class Hippocampus:
                 df[k] += 1
         idf = {k: math.log(1 + N / (1 + df.get(k, 0))) for k in keys}
 
-        # direct channel: IDF-weighted key overlap + substring containment
+        # direct channel: IDF-weighted key overlap + substring containment.
+        # Weight biases the ranking but never vetoes it (floor at 0.35):
+        # a decayed-but-exactly-matching memory must still beat fresh noise,
+        # otherwise facts needed monthly can never earn their first
+        # reinforcement (soak-test finding).
         direct = defaultdict(float)
         q_lower = query.lower()
         for nid, node in self.nodes.items():
+            w_bias = 0.35 + 0.65 * node.get("weight", 1.0)
             n_keys = set(node.get("keys", []))
             shared = keys & n_keys
             if shared:
-                direct[nid] += sum(idf[k] for k in shared) * node.get("weight", 1.0)
+                direct[nid] += sum(idf[k] for k in shared) * w_bias
             n_text = node["text"].lower()
             substr = sum(1 for w in keys if len(w) >= 4 and w in n_text)
             reverse = sum(1 for k in n_keys if len(k) >= 4 and k in q_lower)
             if substr + reverse:
-                direct[nid] += (substr + reverse) * 0.6 * node.get("weight", 1.0)
+                direct[nid] += (substr + reverse) * 0.6 * w_bias
 
         # pattern completion: no direct hits -> fuzzy-match node texts so a
         # partial or misspelled cue can still reactivate the memory.
@@ -701,7 +712,10 @@ class Hippocampus:
 
         Stability S grows with each confirmed recall, so frequently used
         memories decay slowly while one-off trivia fades fast. Nodes that
-        fall below WEIGHT_THRESHOLD with < 2 recalls are pruned."""
+        fall below WEIGHT_THRESHOLD with < 2 recalls are pruned — but never
+        within GRACE_DAYS of their last access (a fact noted today and
+        needed next month must survive to its first recall), and never
+        destroyed: pruned texts are archived to .mind/archive.md."""
         now = _now()
         pruned = []
         for nid in list(self.nodes.keys()):
@@ -716,7 +730,7 @@ class Hippocampus:
             new_weight = max(0.0, n.get("peak_weight", 1.0) * retention)
             if not dry_run:
                 n["weight"] = new_weight
-            if new_weight < WEIGHT_THRESHOLD and access < 2:
+            if new_weight < WEIGHT_THRESHOLD and access < 2 and days > GRACE_DAYS:
                 pruned.append(n["text"])
                 if not dry_run:
                     del self.nodes[nid]
@@ -725,8 +739,21 @@ class Hippocampus:
                     for other in self.edges.values():
                         other.pop(nid, None)
         if not dry_run:
+            if pruned:
+                self._archive(pruned, now)
             self._save()
         return pruned
+
+    def _archive(self, texts, now):
+        """Forgotten, not destroyed: pruned memories append to archive.md."""
+        arch = self.path.parent / "archive.md"
+        if arch.is_symlink():
+            return
+        lines = ["\n## forgotten on %s\n" % now.date()]
+        lines += ["- %s" % t for t in texts]
+        prev = arch.read_text("utf-8") if arch.exists() else \
+            "# mind archive — memories pruned by decay (restore with `remember`)\n"
+        _atomic_write(arch, prev + "\n".join(lines) + "\n")
 
     def _log_signal(self, kind, content):
         sig_file = self.path.parent / SIGNALS_FILE
