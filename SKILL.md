@@ -81,15 +81,20 @@ their rule files synced too (adopted only when present).
    apply only on approval. Every dream action is explained in
    `.mind/dreams/<date>.md`.
 5. Nightly automation costs zero tokens via the `cronjob` tool in no-agent
-   mode (the script IS the job — no model call):
+   mode (the script IS the job — no model call). Use the `write_file` tool
+   to create `~/.hermes/scripts/mind_dream.sh` with this body:
 
-```bash
-cat > ~/.hermes/scripts/mind_dream.sh <<'EOF'
-#!/bin/bash
-cd /path/to/project && python3 mind.py dream
-EOF
-hermes cron create "0 4 * * *" --name mind-dream --script mind_dream.sh --no-agent
-```
+   ```
+   #!/bin/sh
+   cd /path/to/project && python3 mind.py dream
+   ```
+
+   then register it (POSIX cron; on Windows use Task Scheduler to run the
+   same `python3 mind.py dream` daily):
+
+   ```
+   hermes cron create "0 4 * * *" --name mind-dream --script mind_dream.sh --no-agent
+   ```
 
 ## Pitfalls
 
