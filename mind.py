@@ -494,11 +494,19 @@ class Hippocampus:
         except OSError as e:
             raise ValueError("refusing unsafe lock file %s: %s" % (lock_path, e))
         with os.fdopen(lock_fd, "w") as lockf:
+            lock_backend = None
             try:
                 import fcntl
                 fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
-            except ImportError:            # Windows: fall back to atomic write only
-                fcntl = None
+                lock_backend = ("fcntl", fcntl)
+            except ImportError:
+                try:
+                    import msvcrt
+                    lockf.seek(0)
+                    msvcrt.locking(lockf.fileno(), msvcrt.LK_LOCK, 1)
+                    lock_backend = ("msvcrt", msvcrt)
+                except ImportError:
+                    lock_backend = None
             try:
                 if self.path.exists():
                     try:
@@ -540,8 +548,13 @@ class Hippocampus:
                 self._deleted.clear()
                 self._pruned_edges.clear()
             finally:
-                if fcntl is not None:
-                    fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+                if lock_backend is not None:
+                    name, module = lock_backend
+                    if name == "fcntl":
+                        module.flock(lockf.fileno(), module.LOCK_UN)
+                    elif name == "msvcrt":
+                        lockf.seek(0)
+                        module.locking(lockf.fileno(), module.LK_UNLCK, 1)
 
     @staticmethod
     def _id(text):
