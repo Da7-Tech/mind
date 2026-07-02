@@ -494,11 +494,30 @@ class Hippocampus:
         except OSError as e:
             raise ValueError("refusing unsafe lock file %s: %s" % (lock_path, e))
         with os.fdopen(lock_fd, "w") as lockf:
+            lock_backend = None
             try:
                 import fcntl
                 fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
-            except ImportError:            # Windows: fall back to atomic write only
-                fcntl = None
+                lock_backend = ("fcntl", fcntl)
+            except ImportError:
+                try:
+                    import msvcrt
+                except ImportError:            # neither fcntl nor msvcrt:
+                    lock_backend = None        # degrade to atomic-write-only
+                else:
+                    lockf.seek(0)
+                    # LK_LOCK is not an indefinite blocking lock like flock:
+                    # the CRT retries once per second, 10 times, then raises
+                    # OSError — so a save contended for >10s would crash the
+                    # very scenario the lock exists for. Keep waiting instead,
+                    # exactly like the POSIX path.
+                    while True:
+                        try:
+                            msvcrt.locking(lockf.fileno(), msvcrt.LK_LOCK, 1)
+                            break
+                        except OSError:
+                            continue
+                    lock_backend = ("msvcrt", msvcrt)
             try:
                 if self.path.exists():
                     try:
@@ -540,8 +559,13 @@ class Hippocampus:
                 self._deleted.clear()
                 self._pruned_edges.clear()
             finally:
-                if fcntl is not None:
-                    fcntl.flock(lockf.fileno(), fcntl.LOCK_UN)
+                if lock_backend is not None:
+                    name, module = lock_backend
+                    if name == "fcntl":
+                        module.flock(lockf.fileno(), module.LOCK_UN)
+                    elif name == "msvcrt":
+                        lockf.seek(0)
+                        module.locking(lockf.fileno(), module.LK_UNLCK, 1)
 
     @staticmethod
     def _id(text):

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Windows saves now use `msvcrt.locking` when `fcntl` is unavailable, so the
+  locked read-merge-write path is preserved instead of degrading to
+  atomic-write-only saves. The lock blocks indefinitely under contention,
+  matching `flock` semantics (`LK_LOCK` alone gives up after ~10s with
+  `OSError`).
+
 ## 5.4.2 — 2026-07-02
 
 Full-repository precision review (every file, line by line). Six defects

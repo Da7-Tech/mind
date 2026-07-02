@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+import builtins
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -760,6 +761,78 @@ class TestAuditFindings2(TmpDirTest):
         with self.assertRaises(ValueError):
             h.remember("attacker-triggered write")
         self.assertEqual(victim.read_text("utf-8"), "precious")
+
+    def test_save_uses_msvcrt_lock_when_fcntl_is_unavailable(self):
+        """Windows must get a real file lock, not atomic-write-only saves."""
+        h = self.hippo()
+        calls = []
+
+        class FakeMsvcrt:
+            LK_LOCK = 1
+            LK_UNLCK = 2
+
+            @staticmethod
+            def locking(fd, mode, nbytes):
+                calls.append((mode, nbytes))
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "fcntl":
+                raise ImportError("fcntl is not available")
+            if name == "msvcrt":
+                return FakeMsvcrt
+            return real_import(name, *args, **kwargs)
+
+        builtins.__import__ = fake_import
+        try:
+            h.remember("portable windows lock")
+        finally:
+            builtins.__import__ = real_import
+
+        self.assertEqual(calls, [(FakeMsvcrt.LK_LOCK, 1),
+                                 (FakeMsvcrt.LK_UNLCK, 1)])
+
+    def test_msvcrt_lock_blocks_through_contention(self):
+        """LK_LOCK gives up with OSError after ~10s of contention; the save
+        must keep waiting like flock does, not crash — and must not lose
+        the write."""
+        h = self.hippo()
+        calls = []
+
+        class ContendedMsvcrt:
+            LK_LOCK = 1
+            LK_UNLCK = 2
+            _denials = [2]                     # first two acquires collide
+
+            @classmethod
+            def locking(cls, fd, mode, nbytes):
+                calls.append((mode, nbytes))
+                if mode == cls.LK_LOCK and cls._denials[0] > 0:
+                    cls._denials[0] -= 1
+                    raise OSError(36, "resource deadlock avoided")
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "fcntl":
+                raise ImportError("fcntl is not available")
+            if name == "msvcrt":
+                return ContendedMsvcrt
+            return real_import(name, *args, **kwargs)
+
+        builtins.__import__ = fake_import
+        try:
+            h.remember("survives lock contention")   # must not raise
+        finally:
+            builtins.__import__ = real_import
+
+        self.assertEqual(calls, [(ContendedMsvcrt.LK_LOCK, 1)] * 3 +
+                                [(ContendedMsvcrt.LK_UNLCK, 1)])
+        reloaded = Hippocampus(self.mind_dir / "graph.json")
+        self.assertTrue(any("contention" in n["text"]
+                            for n in reloaded.nodes.values()),
+                        "the contended save must still land on disk")
 
     def test_archive_symlink_blocks_pruning(self):
         """'archived, not destroyed' is a guarantee: if the archive cannot
