@@ -18,7 +18,8 @@ you sleep through a **deterministic dream cycle** — no LLM calls, no token
 bill, every decision explained in a journal you can read.
 
 It plugs into **every agent at once**: one memory, exported to `AGENTS.md`
-(Codex, Cursor, Zed, ...), `CLAUDE.md` (Claude Code), and `GEMINI.md`.
+(Codex, Cursor, Zed, ...), `CLAUDE.md` (Claude Code), `GEMINI.md`,
+`.cursorrules`, `.windsurfrules`, `.clinerules`, and `.roo/rules/mind.md`.
 
 ```bash
 curl -O https://raw.githubusercontent.com/Da7-Tech/mind/main/mind.py
@@ -55,7 +56,7 @@ each other's memories), destructive-op gating, and corrupt-graph recovery.
 ## How it works — three layers, like a brain
 
 ```
-Layer 1  WORKING MEMORY   .mind/ACTIVE.md  → injected into AGENTS.md/CLAUDE.md/GEMINI.md
+Layer 1  WORKING MEMORY   .mind/ACTIVE.md  → injected into agent rule files
          the ~200 tokens the agent always sees: hottest memories + cortex index
 
 Layer 2  HIPPOCAMPUS      .mind/graph.json → weighted concept graph
@@ -112,7 +113,7 @@ reproducible benchmark instead of claims.
 | `recall "question"` | spreading-activation recall |
 | `correct "old" "new"` | reconsolidate a wrong memory (history kept) |
 | `dream [--dry-run]` | run the sleep cycle; journal in `.mind/dreams/` |
-| `export` | regenerate `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` |
+| `export` | regenerate agent rule files |
 | `status` | health report |
 
 Reinforcement is explicit: `recall` is pure read (repeated queries can't
@@ -140,9 +141,10 @@ skew weights); agents confirm useful hits via the `bump()` API.
 
 ## Using with Hermes, Claude Code, Codex, Gemini CLI...
 
-`mind init` writes the working memory into `AGENTS.md`, `CLAUDE.md` and
-`GEMINI.md` with guard markers, preserving your existing content. Any agent
-that reads those files gets the memory and the instructions to use it —
+`mind init` writes the working memory into `AGENTS.md`, `CLAUDE.md`,
+`GEMINI.md`, `.cursorrules`, `.windsurfrules`, `.clinerules`, and
+`.roo/rules/mind.md` with guard markers, preserving your existing content.
+Any agent that reads those files gets the memory and the instructions to use it —
 nothing else to configure. A ready-made Hermes skill lives in
 [`SKILL.md`](SKILL.md).
 

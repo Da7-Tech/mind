@@ -335,6 +335,7 @@ class TestPersistence(TmpDirTest):
         self.assertEqual(len(h.nodes), 1)
         h.recall("good")                        # must not raise
 
+    @unittest.skipIf(os.name == "nt", "Windows symlinks require extra privileges")
     def test_atomic_write_refuses_symlink(self):
         target = self.tmp / "real.md"
         target.write_text("x", encoding="utf-8")
@@ -437,10 +438,19 @@ class TestActiveExport(TmpDirTest):
         h.remember("exported fact")
         a.generate(self.tmp)
         a.export_to_agents(self.tmp)
-        for f in ("AGENTS.md", "CLAUDE.md", "GEMINI.md"):
+        for f in Active.TARGETS:
             content = (self.tmp / f).read_text("utf-8")
             self.assertIn("exported fact", content)
             self.assertIn(Active.BEGIN, content)
+
+    def test_export_creates_nested_rule_targets(self):
+        h, c, a = self.parts()
+        h.remember("roo export fact")
+        a.generate(self.tmp)
+        a.export_to_agents(self.tmp)
+        content = (self.tmp / ".roo" / "rules" / "mind.md").read_text("utf-8")
+        self.assertIn("roo export fact", content)
+        self.assertIn(Active.BEGIN, content)
 
     def test_export_preserves_user_content(self):
         h, c, a = self.parts()
@@ -452,6 +462,17 @@ class TestActiveExport(TmpDirTest):
         content = (self.tmp / "AGENTS.md").read_text("utf-8")
         self.assertIn("My own rules", content)
         self.assertIn("a fact", content)
+
+    def test_export_preserves_user_content_in_dot_rules(self):
+        h, c, a = self.parts()
+        (self.tmp / ".cursorrules").write_text("Prefer concise answers.\n",
+                                               encoding="utf-8")
+        h.remember("cursor fact")
+        a.generate(self.tmp)
+        a.export_to_agents(self.tmp)
+        content = (self.tmp / ".cursorrules").read_text("utf-8")
+        self.assertIn("Prefer concise answers", content)
+        self.assertIn("cursor fact", content)
 
     def test_reexport_is_idempotent(self):
         h, c, a = self.parts()
@@ -466,6 +487,7 @@ class TestActiveExport(TmpDirTest):
         self.assertEqual(second.count("My own rules"), 1,
                          "user content must not duplicate on re-export")
 
+    @unittest.skipIf(os.name == "nt", "Windows symlinks require extra privileges")
     def test_export_skips_symlink_targets(self):
         h, c, a = self.parts()
         real = self.tmp / "real-agents.md"
@@ -476,6 +498,18 @@ class TestActiveExport(TmpDirTest):
         written = a.export_to_agents(self.tmp)
         self.assertTrue(any("skipped" in w for w in written))
         self.assertEqual(real.read_text("utf-8"), "x")
+
+    @unittest.skipIf(os.name == "nt", "Windows symlinks require extra privileges")
+    def test_export_skips_symlink_parent_targets(self):
+        h, c, a = self.parts()
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (self.tmp / ".roo").symlink_to(outside, target_is_directory=True)
+        h.remember("a fact")
+        a.generate(self.tmp)
+        written = a.export_to_agents(self.tmp)
+        self.assertTrue(any("symlink parent" in w for w in written))
+        self.assertFalse((outside / "rules" / "mind.md").exists())
 
     def test_working_memory_respects_budget(self):
         h, c, a = self.parts()
