@@ -1038,6 +1038,273 @@ class TestAuditFindings2(TmpDirTest):
                              M.ACTIVE_TOKEN_BUDGET)
 
 
+# ────────────────── v5.5.0: journal + concept seed ──────────────────
+class TestV550(TmpDirTest):
+    def test_same_day_dreams_accumulate_in_journal(self):
+        """A second dream on the same date must append its cycle to the
+        day's journal, not silently replace the first one."""
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        d = Dreamer(self.mind_dir, h, c)
+        h.remember("fact one about the alpha subsystem")
+        d.dream()
+        d.dream()
+        journal = (self.mind_dir / "dreams" /
+                   ("%s.md" % M._now().date())).read_text("utf-8")
+        self.assertEqual(journal.count("cycle started"), 2,
+                         "both same-day cycles must survive in the journal")
+
+    def test_concept_seed_bridges_category_to_tool(self):
+        """The benchmark's one failing query: a memory naming only the
+        TOOL must be found by a question asking for the CATEGORY."""
+        h = self.hippo()
+        h.remember("the design system uses tailwind with a custom palette")
+        h.remember("the frontend is react with typescript")
+        results, _, _ = h.recall("what css framework do we use")
+        self.assertTrue(results)
+        self.assertIn("tailwind", results[0][2]["text"])
+
+    def test_concept_seed_bridges_tool_to_category(self):
+        """Reverse direction: query names the tool, memory names only the
+        category — both sides meet on the shared category key."""
+        h = self.hippo()
+        h.remember("deploy target is hetzner with docker compose")
+        h.remember("release cadence is every second tuesday")
+        results, _, _ = h.recall("which cloud provider do we deploy on")
+        self.assertTrue(results)
+        self.assertIn("hetzner", results[0][2]["text"])
+
+    def test_save_merge_repairs_corrupt_disk(self):
+        """Distilled fuzzer finding: the read-merge-write must repair the
+        disk copy before merging — a corrupt file left behind by a
+        hand-edit or another process must not poison a healthy session."""
+        h = self.hippo()
+        h.remember("healthy fact about the pipeline")
+        # hostile disk state written behind the live session's back
+        (self.mind_dir / "graph.json").write_text(
+            '{"nodes":{"bad1":42,"bad2":{"text":"ok fact","weight":"NaN",'
+            '"history":"scalar","created":false},"bad3":{"text":123}},'
+            '"edges":{"bad2":{"bad2x":7,"ghost":{"weight":null}},'
+            '"":[1,2]}}', encoding="utf-8")
+        h.remember("second healthy fact")          # triggers the merge
+        reloaded = Hippocampus(self.mind_dir / "graph.json")
+        texts = [n["text"] for n in reloaded.nodes.values()]
+        self.assertIn("second healthy fact", texts)
+        self.assertIn("ok fact", texts)            # repaired, not dropped
+        for n in reloaded.nodes.values():
+            self.assertIsInstance(n["weight"], float)
+            self.assertTrue(0.0 <= n["weight"] <= 1.0)
+            self.assertIsInstance(n["created"], str)
+        reloaded.decay()                            # must not raise
+        d = Dreamer(self.mind_dir, reloaded, Cortex(self.mind_dir / "cortex"))
+        d.dream()                                   # must not raise
+
+    def test_nan_and_infinite_numbers_repaired_on_load(self):
+        """Distilled fuzzer finding: float() accepts NaN/Infinity, so the
+        numeric coercion alone let them poison rankings and decay math."""
+        (self.mind_dir / "graph.json").write_text(
+            '{"nodes":{"aaa":{"text":"alpha fact","weight":NaN,'
+            '"peak_weight":Infinity,"access_count":-Infinity}},'
+            '"edges":{"aaa":{}}}', encoding="utf-8")
+        h = self.hippo()
+        self.assertEqual(h.nodes["aaa"]["weight"], 1.0)
+        self.assertEqual(h.nodes["aaa"]["peak_weight"], 1.0)
+        self.assertEqual(h.nodes["aaa"]["access_count"], 0)
+        results, _, _ = h.recall("alpha fact")
+        self.assertTrue(results)
+
+    def test_concept_seed_does_not_outrank_exact_match(self):
+        """IDF must keep category keys from beating an exact term match:
+        asking for postgres by name must rank the postgres memory first,
+        not another database-category memory."""
+        h = self.hippo()
+        h.remember("the analytics store is a mongodb replica set")
+        h.remember("the main database is postgres 16 with prisma")
+        results, _, _ = h.recall("what is our postgres setup")
+        self.assertTrue(results)
+        self.assertIn("postgres", results[0][2]["text"])
+
+
+# ──────────────── mutation-testing kills (bench/mutate.py) ────────────────
+class TestMutationKills(TmpDirTest):
+    """Each test kills one or more surviving mutants from bench/mutate.py —
+    i.e. each pins a behavior the suite previously did not bite on."""
+
+    def _age(self, h, nid, days, created_days=None):
+        h.nodes[nid]["last_accessed"] = (
+            datetime.now() - timedelta(days=days)).isoformat()
+        h.nodes[nid]["created"] = (
+            datetime.now() - timedelta(days=created_days or days)).isoformat()
+
+    def test_edge_weight_influences_spreading_rank(self):
+        """A strong edge must outrank a weak edge in spreading activation
+        (kills act*decay*weight -> act*decay/weight)."""
+        h = self.hippo()
+        hub = h.remember("zulu hub fact")
+        strong = h.remember("strong neighbour payload xray")
+        weak = h.remember("weak neighbour payload yankee")
+        h.edges.setdefault(hub, {})[strong] = {"relation": "r", "weight": 0.9}
+        h.edges.setdefault(strong, {})[hub] = {"relation": "r", "weight": 0.9}
+        h.edges.setdefault(hub, {})[weak] = {"relation": "r", "weight": 0.1}
+        h.edges.setdefault(weak, {})[hub] = {"relation": "r", "weight": 0.1}
+        results, _, _ = h.recall("zulu hub")
+        order = [nid for nid, _, _ in results]
+        self.assertIn(strong, order)
+        self.assertIn(weak, order)
+        self.assertLess(order.index(strong), order.index(weak),
+                        "the stronger edge must rank its neighbour higher")
+
+    def test_unparseable_timestamp_treated_as_fresh_not_aged(self):
+        """days must repair to 0 (fully fresh), not any other value."""
+        h = self.hippo()
+        nid = h.remember("fact with broken clock")
+        h.nodes[nid]["last_accessed"] = "not-a-date"
+        h.decay()
+        self.assertAlmostEqual(h.nodes[nid]["weight"],
+                               h.nodes[nid]["peak_weight"], places=6)
+
+    def test_one_confirm_keeps_real_weight_after_a_month(self):
+        """Stability must be BASE + access*14 — a collapsed stability
+        (access/14) would leave near-zero weight at day 34."""
+        h = self.hippo()
+        nid = h.remember("dns registrar is cloudflare with 2fa")
+        h.bump([nid])
+        self._age(h, nid, 34, created_days=64)
+        h.decay()
+        # stability 3+14=17 -> e^(-34/17) ≈ 0.135; collapsed ≈ e^(-11) ≈ 0
+        self.assertGreater(h.nodes[nid]["weight"], 0.1)
+
+    def test_twice_confirmed_memory_never_pruned(self):
+        """The prune gate is access_count < 2: two confirmations must
+        protect a memory no matter how low its weight decays."""
+        h = self.hippo()
+        nid = h.remember("twice confirmed ancient fact")
+        h.bump([nid])
+        h.bump([nid])
+        self._age(h, nid, 400, created_days=500)
+        pruned = h.decay()
+        self.assertIn(nid, h.nodes)
+        self.assertEqual(pruned, [])
+
+    def test_hot_list_capped_at_eight(self):
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        a = Active(self.mind_dir, h, c)
+        for i in range(12):
+            h.remember("compact fact %d" % i)
+        a.generate(self.tmp)
+        active = (self.mind_dir / "ACTIVE.md").read_text("utf-8")
+        hot_section = active.split("## Hot memories")[1].split("##")[0]
+        hot = [ln for ln in hot_section.splitlines() if ln.startswith("- ")]
+        self.assertLessEqual(len(hot), 8)
+
+    def test_recall_returns_at_most_top_k(self):
+        h = self.hippo()
+        for i in range(10):
+            h.remember("shared keyword falcon variant number %d" % i)
+        results, _, _ = h.recall("falcon")
+        self.assertLessEqual(len(results), M.RECALL_TOP_K)
+        self.assertEqual(M.RECALL_TOP_K, 5)
+
+    def test_duplicate_remember_never_weakens(self):
+        """Re-remembering must reinforce toward the cap, never subtract."""
+        h = self.hippo()
+        nid = h.remember("idempotent fact")
+        h.remember("idempotent fact")
+        self.assertEqual(h.nodes[nid]["weight"], 1.0)
+
+    def test_link_stores_exact_relation_and_unit_weight(self):
+        h = self.hippo()
+        a = h.remember("service alpha exists")
+        b = h.remember("service beta exists")
+        h.link("service alpha exists", "service beta exists", "depends-on")
+        self.assertEqual(h.edges[a][b]["relation"], "depends-on")
+        self.assertEqual(h.edges[a][b]["weight"], 1.0)
+        self.assertEqual(h.edges[b][a]["weight"], 1.0)
+
+    def test_identity_keys_only_for_identity_or_empty_queries(self):
+        """A content query must NOT be polluted with identity keys."""
+        h = self.hippo()
+        h.remember("anchor fact so the extractor has a corpus")
+        keys = h._extract_keys("zebra", is_query=True)
+        self.assertNotIn("user", keys)
+        self.assertNotIn("project", keys)
+        # and a truly empty query still gets the fallback
+        keys_empty = h._extract_keys("؟؟", is_query=True)
+        self.assertIn("user", keys_empty)
+
+    def test_symlinked_mind_root_refused_entirely(self):
+        """A symlinked .mind/ root must be refused at the very first write
+        — nothing at all may be created through it."""
+        if os.name == "nt":
+            self.skipTest("symlinks need privileges on Windows")
+        attacker = Path(tempfile.mkdtemp(prefix="mind-attacker-"))
+        proj = Path(tempfile.mkdtemp(prefix="mind-proj-"))
+        try:
+            fake = attacker / "payload"
+            (fake / "dreams").mkdir(parents=True)
+            (fake / "cortex").mkdir()
+            (proj / ".mind").symlink_to(fake)
+            h = Hippocampus(proj / ".mind" / "graph.json")
+            with self.assertRaises(ValueError):
+                h.remember("bait fact")
+            leaked = [p for p in fake.rglob("*") if p.is_file()]
+            self.assertEqual(leaked, [],
+                             "no file may be written through a symlinked "
+                             ".mind root")
+        finally:
+            shutil.rmtree(attacker, ignore_errors=True)
+            shutil.rmtree(proj, ignore_errors=True)
+
+    def test_correct_gate_boundaries(self):
+        """Exactly 2 shared content tokens (or exactly half of the hint)
+        must be ENOUGH — the gate is >=, not >."""
+        h = self.hippo()
+        h.remember("gateway timeout is ninety seconds")
+        # hint shares exactly two content tokens: gateway, timeout
+        old = h.correct("gateway timeout wrong", "gateway timeout is thirty seconds")
+        self.assertIsNotNone(old)
+
+    def test_decayed_exact_match_beats_fresh_noise(self):
+        """The 0.35 weight-bias floor (soak finding): an aged
+        exactly-matching memory must outrank fresh unrelated notes."""
+        h = self.hippo()
+        target = h.remember("quasar telescope catalogue number is 7788")
+        for i in range(5):
+            h.remember("fresh unrelated note number %d about lunch" % i)
+        h.nodes[target]["weight"] = 0.15          # deeply decayed
+        results, _, _ = h.recall("quasar telescope catalogue")
+        self.assertEqual(results[0][0], target)
+
+    def test_activation_spreads_full_radius(self):
+        """A node RECALL_RADIUS hops away must still receive activation —
+        an off-by-one in the hop loop would silently shrink the radius."""
+        h = self.hippo()
+        # lexically DISJOINT texts: the only path from the query to the
+        # last node is the edge chain, so this pins the spreading radius
+        texts = ["quokka origin",
+                 "wombat relay",
+                 "numbat waypoint",
+                 "bilby terminus"]
+        for t in texts:
+            h.remember(t)
+        for a, b in zip(texts, texts[1:]):
+            h.link(a, b, "next")
+        results, _, _ = h.recall("quokka origin")
+        found = {nid for nid, _, _ in results}
+        self.assertIn(h._id(texts[3]), found,
+                      "a 3-hop neighbour must surface within radius 3")
+
+    def test_access_count_zero_survives_reload(self):
+        """The load repair must not invent reinforcement: a never-confirmed
+        node's access_count stays exactly 0 across save/reload."""
+        h = self.hippo()
+        h.remember("never confirmed fact")
+        reloaded = Hippocampus(self.mind_dir / "graph.json")
+        node = next(iter(reloaded.nodes.values()))
+        self.assertEqual(node["access_count"], 0)
+
+
 # ─────────────────────────────── CLI ───────────────────────────────
 class TestCLI(TmpDirTest):
     def run_cli(self, *args):
@@ -1070,7 +1337,7 @@ class TestCLI(TmpDirTest):
 
     def test_unknown_command_suggests(self):
         code, _, err = self.run_cli("remembr", "x")
-        self.assertNotEqual(code, 0)
+        self.assertEqual(code, 2, "usage errors exit 2 (documented contract)")
         self.assertIn("remember", err)
 
     def test_typoed_dry_run_flag_refused(self):
@@ -1078,8 +1345,34 @@ class TestCLI(TmpDirTest):
         real (destructive) dream."""
         self.run_cli("init")
         code, _, err = self.run_cli("dream", "--dryrun")
-        self.assertNotEqual(code, 0)
+        self.assertEqual(code, 2, "usage errors exit 2 (documented contract)")
         self.assertIn("--dry-run", err)
+
+    def test_cli_link_links_the_two_given_texts(self):
+        """The CLI must link argv[1] to argv[2] — and library errors
+        (like a self-link) must exit 1, not 2 and not a traceback."""
+        self.run_cli("init")
+        self.run_cli("remember", "alpha service fact")
+        self.run_cli("remember", "beta service fact")
+        code, out, _ = self.run_cli("link", "alpha service fact",
+                                    "beta service fact", "peer-of")
+        self.assertEqual(code, 0)
+        h = Hippocampus(self.tmp / ".mind" / "graph.json")
+        a, b = h._id("alpha service fact"), h._id("beta service fact")
+        self.assertEqual(h.edges[a][b]["relation"], "peer-of")
+        code, _, err = self.run_cli("link", "alpha service fact",
+                                    "alpha service fact")
+        self.assertEqual(code, 1, "library errors exit 1")
+        self.assertNotIn("Traceback", err)
+
+    def test_cli_exit_code_contract(self):
+        """0 = success, 1 = runtime/library failure, 2 = usage error —
+        pinned exactly, they are part of the scripting contract."""
+        self.run_cli("init")
+        code, _, _ = self.run_cli("confirm", "ffffffffffff")
+        self.assertEqual(code, 1, "unknown memory id exits 1")
+        code, _, _ = self.run_cli("correct", "some hint", "   ")
+        self.assertEqual(code, 2, "empty argument is a usage error: exit 2")
 
     def test_oversized_memory_does_not_blank_working_memory(self):
         """Regression: one huge memory must not evict everything else

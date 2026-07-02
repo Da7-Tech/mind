@@ -44,8 +44,13 @@ distractor-filled graphs):
 
 | graph size | recall@1 | recall@5 | median latency | p95 |
 |---|---|---|---|---|
-| 100 nodes | **0.95** | 0.95 | **~0.5–0.7 ms** | ~2–4 ms |
-| 1,000 nodes | **0.95** | 0.95 | ~2–3 ms | ~11–16 ms |
+| 100 nodes | **1.00** | 1.00 | **~0.5–0.7 ms** | ~2–4 ms |
+| 1,000 nodes | **1.00** | 1.00 | ~2–3 ms | ~11–16 ms |
+
+(The long-standing 0.95 miss — a category question, "what css framework",
+against a memory that only said "tailwind" — is closed by the curated
+concept seed in 5.5.0. Synonymy *outside* the seed and the corpus still
+misses; see limitations.)
 
 Dream determinism: **PASS** — identical memory state always produces the
 identical consolidation plan.
@@ -53,16 +58,33 @@ identical consolidation plan.
 **180-day soak** (`bench/soak.py` — the real code driven through an injected
 clock with a realistic workload: daily/weekly/monthly facts + 357 junk notes
 + a dream every night): core-fact survival **15/15** across all cadence
-tiers, junk older than the grace window surviving: **0/256**, graph size
-bounded (~106 nodes), recall on the aged graph 0.37 ms. The soak caught two
+tiers, junk older than the grace window surviving: **0/256**, working
+memory **8/8** hot slots held by core facts, graph size bounded
+(~106 nodes), recall on the aged graph ~0.4 ms. The soak caught two
 real calibration bugs before release (facts pruned one day before their
 first monthly recall; decayed weight vetoing exact matches) — both fixed
-with regression tests. The one benchmark miss (`"what css framework"`
-→ tailwind) is an honest limitation documented below, not hidden.
+with regression tests.
 
-Test suite: **94 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+**Fuzzed** (`bench/fuzz.py`, seeded + deterministic, runs in CI): 420
+adversarial cases — hostile graph files (NaN/Infinity, wrong-typed fields,
+control characters, truncated JSON, dangling edges) and hostile CLI input.
+Contract: never a traceback, never data loss, the graph always loads clean
+afterwards. Its first run caught a real defect that six earlier audit
+rounds had missed (see CHANGELOG 5.5.0).
+
+**Mutation-tested** (`bench/mutate.py`): first-order defects are injected
+(flipped comparisons, broken arithmetic, nudged constants) and the suite
+must catch them. Its first run exposed 17 behaviors the tests didn't
+actually pin down — each is now locked by a dedicated regression test.
+Surviving mutants are triaged in the tool's output: unreachable `get()`
+defaults, display-only constants, and ranking-calibration values guarded
+by the CI benchmark gate (recall@1 ≥ 0.9) rather than unit assertions.
+
+Test suite: **118 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
-each other's memories), destructive-op gating, and corrupt-graph recovery.
+each other's memories), destructive-op gating, corrupt-graph recovery, and
+a mutation-kill class where every test pins a behavior the suite
+previously didn't bite on.
 
 ## How it works — three layers, like a brain
 
@@ -151,10 +173,14 @@ so connections that never earn a confirmation decay and prune away.
 
 ## Honest limitations
 
-- Recall is lexical + graph-structural. Cross-domain synonymy with no corpus
-  evidence (e.g. "css" → a memory that only says "tailwind") is missed —
-  that's the benchmark's one failing query. True embeddings would fix it at
-  the cost of the zero-dependency promise; a pluggable backend is on the roadmap.
+- Recall is lexical + graph-structural + a curated **concept seed** (~90
+  unambiguous tool→category mappings: tailwind→css, hetzner→cloud,
+  sentry→errors...). Cross-domain synonymy *outside* that seed and the
+  corpus still misses; polysemous words (black, express, spring...) are
+  deliberately excluded from the seed because a false category on an
+  everyday sentence is worse than a missed synonym. True embeddings would
+  close the remainder at the cost of the zero-dependency promise; a
+  pluggable backend is on the roadmap.
 - Arabic stemming is light (prefix/suffix + broken-plural seed), not a full
   morphological analyzer.
 - Optimized for personal/project agent memory (10²–10³ nodes), not
@@ -181,8 +207,11 @@ nothing else to configure. A ready-made Hermes skill lives in
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 94 tests
+python3 -m unittest discover -s tests   # 118 tests
 python3 bench/bench.py                  # reproduce the numbers above
+python3 bench/soak.py                   # 180 simulated days
+python3 bench/fuzz.py                   # 420 adversarial cases
+python3 bench/mutate.py                 # does the suite actually bite?
 ```
 
 Design rationale: [docs/DESIGN.md](docs/DESIGN.md) ·

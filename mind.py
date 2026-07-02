@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "5.4.2"
+__version__ = "5.5.0"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -151,6 +151,77 @@ NORMALIZE = {
 # Multi-word entries must be replaced BEFORE tokenization (the tokenizer
 # splits on spaces, so a dict lookup per token can never match them).
 _NORMALIZE_PHRASES = {k: v for k, v in NORMALIZE.items() if " " in k}
+
+# High-precision concept seed: tool → category, so a question asked by
+# CATEGORY ("what css framework?") finds a memory that only names the TOOL
+# ("tailwind"). Applied to memories AND queries, so either side naming the
+# tool matches the other side naming the category. One-directional on
+# purpose (specific → general): the reverse would explode a general query
+# into every tool name. Category keys land on many nodes, so IDF keeps
+# them from ever outranking an exact term match. Only unambiguous tech
+# terms belong here — polysemous words (black, express, spring, phoenix,
+# prettier, oracle) are deliberately excluded: a false category on an
+# everyday sentence is worse than a missed synonym.
+CONCEPT_SEED = {
+    # css / styling
+    "tailwind": ("css", "styling"), "bootstrap": ("css", "styling"),
+    "bulma": ("css", "styling"), "sass": ("css", "styling"),
+    "scss": ("css", "styling"),
+    # frontend
+    "react": ("frontend", "javascript"), "vue": ("frontend", "javascript"),
+    "svelte": ("frontend", "javascript"),
+    "angular": ("frontend", "javascript"),
+    "nextjs": ("frontend", "javascript"), "nuxt": ("frontend", "javascript"),
+    # backend
+    "django": ("backend", "python"), "flask": ("backend", "python"),
+    "fastapi": ("backend", "python"), "rails": ("backend", "ruby"),
+    "laravel": ("backend", "php"),
+    # databases / storage
+    "postgres": ("database",), "postgresql": ("database",),
+    "mysql": ("database",), "sqlite": ("database",),
+    "mariadb": ("database",), "mongodb": ("database",),
+    "redis": ("database", "cache"), "memcached": ("cache",),
+    "dynamodb": ("database",), "cassandra": ("database",),
+    "elasticsearch": ("database", "search"),
+    # orm
+    "prisma": ("orm", "database"), "sqlalchemy": ("orm", "database"),
+    "sequelize": ("orm", "database"),
+    # cloud / hosting / cdn
+    "aws": ("cloud", "hosting"), "azure": ("cloud", "hosting"),
+    "gcp": ("cloud", "hosting"), "hetzner": ("cloud", "hosting"),
+    "digitalocean": ("cloud", "hosting"), "linode": ("cloud", "hosting"),
+    "vercel": ("hosting", "deployment"), "netlify": ("hosting", "deployment"),
+    "heroku": ("hosting", "deployment"), "cloudflare": ("cdn", "dns"),
+    # containers / devops / ci
+    "docker": ("container", "devops"), "kubernetes": ("container", "devops"),
+    "terraform": ("devops", "infrastructure"), "ansible": ("devops",),
+    "jenkins": ("devops", "ci"), "circleci": ("ci",),
+    # testing
+    "pytest": ("testing",), "jest": ("testing",), "mocha": ("testing",),
+    "cypress": ("testing",), "playwright": ("testing",),
+    "selenium": ("testing",),
+    # payments
+    "stripe": ("payment", "billing"), "paypal": ("payment", "billing"),
+    # monitoring / logs / errors
+    "sentry": ("errors", "monitoring"), "datadog": ("monitoring",),
+    "grafana": ("monitoring", "dashboard"),
+    "prometheus": ("monitoring", "metrics"),
+    "loki": ("logs", "monitoring"), "kibana": ("logs", "dashboard"),
+    # queues / messaging
+    "kafka": ("queue", "messaging"), "rabbitmq": ("queue", "messaging"),
+    "celery": ("queue", "tasks"), "sqs": ("queue", "messaging"),
+    # auth
+    "oauth": ("auth", "authentication"), "jwt": ("auth", "authentication"),
+    "sso": ("auth", "authentication"), "bearer": ("auth", "authentication"),
+    # mobile
+    "flutter": ("mobile",), "android": ("mobile",), "ios": ("mobile",),
+    # lint / support / analytics / cms / vcs
+    "eslint": ("lint",), "ruff": ("lint",), "flake8": ("lint",),
+    "intercom": ("support",), "zendesk": ("support",),
+    "mixpanel": ("analytics",), "amplitude": ("analytics",),
+    "wordpress": ("cms",), "drupal": ("cms",),
+    "github": ("git",), "gitlab": ("git",), "bitbucket": ("git",),
+}
 
 # Arabic identity pronouns: queries like "what is my name" / "من أنا" carry
 # no content keys after stopword removal, so we fall back to identity keys.
@@ -421,24 +492,33 @@ class Hippocampus:
             pass
         return {}
 
-    def _load(self):
-        if not self.path.exists():
-            return
+    @staticmethod
+    def _finite(value, default, lo=None, hi=None):
+        """float() with repair: non-numeric AND non-finite (NaN/Infinity)
+        values become the default, optionally clamped (fuzzer finding: a
+        NaN weight poisons every comparison and ranking downstream, and
+        float() alone happily accepts it)."""
         try:
-            data = json.loads(self.path.read_text("utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("graph.json is not a JSON object")
-            if not isinstance(data.get("nodes", {}), dict) or \
-                    not isinstance(data.get("edges", {}), dict):
-                raise ValueError("nodes/edges have the wrong structure")
-        except (json.JSONDecodeError, ValueError) as e:
-            data = self._quarantine(e)
-        self.nodes = data.get("nodes", {})
-        self.edges = {k: v for k, v in data.get("edges", {}).items()
-                      if isinstance(v, dict)}
-        for nid, n in list(self.nodes.items()):
+            f = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(f):
+            return default
+        if lo is not None:
+            f = max(lo, f)
+        if hi is not None:
+            f = min(hi, f)
+        return f
+
+    def _repair_nodes(self, raw):
+        """Repair a nodes dict fresh off the disk — shared by _load AND the
+        _save read-merge-write. The merge used to import raw disk nodes
+        past all of _load's repair, so a corrupt file left by a hand-edit
+        or another (buggier) process re-poisoned a healthy session's graph
+        on its next save (fuzzer finding)."""
+        out = {}
+        for nid, n in raw.items():
             if not isinstance(n, dict) or not isinstance(n.get("text", ""), str):
-                del self.nodes[nid]
                 continue
             n.setdefault("text", "")
             n.setdefault("weight", 1.0)
@@ -454,15 +534,17 @@ class Hippocampus:
             for f in ("last_accessed", "created"):
                 if not isinstance(n.get(f), str):
                     n[f] = _now().isoformat()
-            # coerce numeric fields: a hand-edit or bad restore that leaves a
-            # non-numeric weight must repair to a default, not brick every
-            # command on the first arithmetic use (auditor finding)
-            for f, d in (("weight", 1.0), ("peak_weight", 1.0),
-                         ("confidence", 1.0), ("access_count", 0)):
-                try:
-                    n[f] = float(n.get(f, d))
-                except (TypeError, ValueError):
-                    n[f] = d
+            # numeric fields: repair non-numeric AND non-finite values, and
+            # clamp to the range every write path maintains (auditor +
+            # fuzzer findings)
+            n["weight"] = self._finite(n["weight"], 1.0, 0.0, 1.0)
+            n["peak_weight"] = self._finite(n["peak_weight"], 1.0, 0.0, 1.0)
+            n["confidence"] = self._finite(n["confidence"], 1.0, 0.0, 1.0)
+            n["access_count"] = self._finite(n["access_count"], 0, 0)
+            # history must be a list — correct() appends to it (fuzzer
+            # finding: a scalar history crashed reconsolidation)
+            if not isinstance(n.get("history", []), list):
+                n["history"] = []
             # keys must be a list of strings; a bare string would iterate
             # character-by-character and a non-string element would crash
             # the re.sub below (auditor finding)
@@ -472,12 +554,44 @@ class Hippocampus:
             n["keys"] = [re.sub(r'[،؛؟!."\']', '', k).strip()
                          for k in raw_keys if isinstance(k, str)]
             n["keys"] = [k for k in n["keys"] if k]
-        # drop edges referencing missing nodes: a partially corrupt or
-        # hand-edited graph must degrade gracefully, not crash recall
-        # with KeyError (auditor finding)
-        self.edges = {nid: {nbr: e for nbr, e in nbrs.items()
-                            if nbr in self.nodes}
-                      for nid, nbrs in self.edges.items() if nid in self.nodes}
+            out[nid] = n
+        return out
+
+    def _repair_edges(self, raw, nodes):
+        """Same contract for edges: only dict entries between existing
+        nodes survive, with a finite clamped weight and a string relation
+        (fuzzer finding: a null/list edge weight crashed the dream's edge
+        decay; orphan edges crashed recall with KeyError)."""
+        out = {}
+        for nid, nbrs in raw.items():
+            if nid not in nodes or not isinstance(nbrs, dict):
+                continue
+            clean = {}
+            for nbr, e in nbrs.items():
+                if nbr not in nodes or not isinstance(e, dict):
+                    continue
+                e["weight"] = self._finite(e.get("weight", 1.0), 1.0, 0.0, 1.0)
+                if not isinstance(e.get("relation", "related"), str):
+                    e["relation"] = "related"
+                clean[nbr] = e
+            if clean:
+                out[nid] = clean
+        return out
+
+    def _load(self):
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text("utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("graph.json is not a JSON object")
+            if not isinstance(data.get("nodes", {}), dict) or \
+                    not isinstance(data.get("edges", {}), dict):
+                raise ValueError("nodes/edges have the wrong structure")
+        except (json.JSONDecodeError, ValueError) as e:
+            data = self._quarantine(e)
+        self.nodes = self._repair_nodes(data.get("nodes", {}))
+        self.edges = self._repair_edges(data.get("edges", {}), self.nodes)
 
     def _save(self):
         """Locked read-merge-write: concurrent agent processes cannot lose
@@ -486,8 +600,12 @@ class Hippocampus:
         (our changes win per node; our deletions stay deleted)."""
         lock_path = self.path.with_suffix(".json.lock")
         # open the lock with O_NOFOLLOW: a symlinked lock file must never
-        # truncate its target (auditor finding — plain open(..., "w") did)
+        # truncate its target (auditor finding — plain open(..., "w") did).
+        # And check the PARENT chain before creating it: through a symlinked
+        # .mind root the lock file itself used to be created outside the
+        # trust boundary — the one write that escaped (test-suite finding)
         nofollow = getattr(os, "O_NOFOLLOW", 0)
+        _reject_symlinked_parents(lock_path, self.path.parent)
         try:
             lock_fd = os.open(str(lock_path),
                               os.O_WRONLY | os.O_CREAT | nofollow, 0o644)
@@ -527,8 +645,13 @@ class Hippocampus:
                     dn = disk.get("nodes", {}) if isinstance(disk, dict) else {}
                     de = disk.get("edges", {}) if isinstance(disk, dict) else {}
                     if isinstance(dn, dict) and isinstance(de, dict):
-                        merged_n = {k: v for k, v in dn.items()
-                                    if k not in self._deleted and isinstance(v, dict)}
+                        # repair the disk copy BEFORE merging: without this
+                        # the merge imported raw disk content past all of
+                        # _load's validation, so one corrupt file poisoned
+                        # a healthy session's next save (fuzzer finding)
+                        merged_n = {k: v
+                                    for k, v in self._repair_nodes(dn).items()
+                                    if k not in self._deleted}
                         merged_n.update(self.nodes)
                         # Build the merged edges from the DISK copy, stripping
                         # both deleted nodes and edges this process pruned,
@@ -538,8 +661,8 @@ class Hippocampus:
                         # this session still wins — filtering after update
                         # would wrongly clobber it (auditor finding).
                         merged_e = {}
-                        for k, v in de.items():
-                            if k in self._deleted or not isinstance(v, dict):
+                        for k, v in self._repair_edges(de, merged_n).items():
+                            if k in self._deleted:
                                 continue
                             merged_e[k] = {nbr: e for nbr, e in v.items()
                                            if nbr not in self._deleted
@@ -581,12 +704,15 @@ class Hippocampus:
                 self.related = RelatedTerms(corpus, min_df=1)
 
     def _extract_keys(self, text, is_query=False):
-        """Three cooperating layers:
+        """Four cooperating layers:
         1. NORMALIZE seed (cross-language term bridging, incl. multi-word
            phrases handled before tokenization — the tokenizer would split
            them otherwise and the mapping would never match)
-        2. co-occurrence expansion (RelatedTerms, self-building)
-        3. identity keys — added to queries with no content keys, and to
+        2. CONCEPT_SEED (tool → category, both directions meet on the
+           category key — closes the cross-domain synonymy gap for the
+           curated tech vocabulary)
+        3. co-occurrence expansion (RelatedTerms, self-building)
+        4. identity keys — added to queries with no content keys, and to
            any text (query or memory) that mentions identity pronouns, so
            "my name is X" and "what is my name" land on the same keys.
            Content-free stored memories get NO identity fallback."""
@@ -604,7 +730,13 @@ class Hippocampus:
         for w in words:
             if w in STOPWORDS:
                 continue
-            keys.setdefault(NORMALIZE.get(w, w))
+            t = NORMALIZE.get(w, w)
+            keys.setdefault(t)
+            # concept seed: a memory naming the tool also earns the
+            # category keys, and vice versa on the query side, so
+            # "what css framework" reaches the tailwind memory
+            for cat in CONCEPT_SEED.get(t, ()):
+                keys.setdefault(cat)
         text_tokens = set(re.findall(r'[\w؀-ۿ]+', cleaned.lower()))
         if text_tokens & PRONOUN_FALLBACK or (is_query and len(keys) == 0):
             for k in sorted(IDENTITY_KEYS):
@@ -1105,6 +1237,12 @@ class Dreamer:
         # unsafe, the consolidation already happened — just skip the journal
         # rather than crash with a traceback.
         try:
+            # a second dream on the same date APPENDS its cycle to the day's
+            # journal instead of silently replacing it (auditor finding:
+            # only the last cycle of the day used to survive)
+            if memo.exists() and not memo.is_symlink():
+                memo_text = (memo.read_text("utf-8").rstrip()
+                             + "\n\n---\n\n" + memo_text)
             _atomic_write(memo, memo_text, boundary=self.hippo.path.parent)
         except ValueError:
             print("warning: .mind/dreams is unsafe (symlink?); "

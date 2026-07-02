@@ -152,7 +152,10 @@ def main():
     active.generate(tmp)
     act_text = (tmp / M.ACTIVE_FILE).read_text("utf-8")
     core_markers = [m for facts in CORE.values() for _, _, m in facts]
-    hot_lines = [ln for ln in act_text.splitlines() if ln.startswith("- ")]
+    # count only the "Hot memories" section — instruction bullets also
+    # start with "- " and would understate the core-fact share
+    hot_section = act_text.split("## Hot memories")[1].split("##")[0]
+    hot_lines = [ln for ln in hot_section.splitlines() if ln.startswith("- ")]
     hot_core = sum(1 for ln in hot_lines if any(m in ln for m in core_markers))
     print("working memory: %d/%d hot slots are core facts"
           % (hot_core, len(hot_lines)))

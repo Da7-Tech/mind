@@ -16,7 +16,15 @@ hardening suggestions. You can expect an initial response within a few days.
 - Atomic, durable writes: O_NOFOLLOW + fsync-before-rename everywhere,
   including the lock file (`tests/test_mind.py::TestAuditFindings`).
 - Symlinked agent files, lock files, archive files and export parents are
-  refused or skipped — never written through.
-- Memory text is stripped of terminal control characters on write.
+  refused or skipped — never written through. The lock file's parent chain
+  is checked before creation, so even a symlinked `.mind/` root cannot
+  cause a single file to be created outside the project (regression test:
+  `test_symlinked_mind_root_refused_entirely`).
+- Memory text is stripped of terminal control characters on every write
+  path, including `correct`.
+- Hostile on-disk state is repaired, not trusted: a seeded fuzzer
+  (`bench/fuzz.py`, 420 adversarial cases, runs in CI) holds the contract
+  "no traceback, no data loss, graph always loads clean" against corrupt
+  graph files and hostile CLI input.
 - No network access, no subprocess execution, no eval — the file can be
-  fully audited in one sitting (~1,500 lines).
+  fully audited in one sitting (~1,700 lines).

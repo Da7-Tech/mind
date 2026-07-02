@@ -28,7 +28,11 @@ dreams between sessions, and portable to any agent through one standard file.
 6. **Writes during the session, dreams between sessions** — the agent
    itself is the live half of the loop; the dreamer is the offline half.
 7. **Measure before claiming** — accuracy/latency/size are benchmarked
-   (`bench/bench.py`) and published; misses are documented.
+   (`bench/bench.py`) and published; misses are documented. The same
+   principle applies to the tests themselves: a seeded fuzzer
+   (`bench/fuzz.py`, in CI) attacks the file formats and the CLI, and a
+   mutation tester (`bench/mutate.py`) checks that the suite actually
+   catches injected defects — both found real bugs on their first run.
 
 ## Recall algorithm (the heart)
 
@@ -37,9 +41,10 @@ Four cooperating stages, each added to fix a defect found by live testing:
 | stage | technique | fixes |
 |---|---|---|
 | 1. normalization | bilingual stemming + AR↔EN seed map | "بايثون" ↔ "python" |
-| 2. auto-expansion | co-occurrence index + constrained 2-hop PageRank | unknown-unknowns ("database" finds the sqlite node) |
-| 3. fusion | **RRF + IDF** over direct & spreading channels | rank ties in multi-hop recall |
-| 4. head shaping | hash-embedding re-rank + pattern separation | near-duplicate results crowding top-k |
+| 2. concept seed | ~90 curated tool→category mappings, applied to memories AND queries | category questions ("what css framework") reaching tool-only memories ("tailwind") — the benchmark's one standing miss before 5.5.0. Polysemous words excluded by design |
+| 3. auto-expansion | co-occurrence index + constrained 2-hop PageRank | unknown-unknowns ("database" finds the sqlite node) |
+| 4. fusion | **RRF + IDF** over direct & spreading channels | rank ties in multi-hop recall |
+| 5. head shaping | hash-embedding re-rank + pattern separation | near-duplicate results crowding top-k |
 
 Plus **pattern completion**: when no direct key matches, fuzzy similarity
 over node texts reactivates memories from partial or misspelled cues.

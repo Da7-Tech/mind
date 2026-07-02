@@ -1,12 +1,56 @@
 # Changelog
 
-## Unreleased
+## 5.5.0 — 2026-07-02
 
-- Windows saves now use `msvcrt.locking` when `fcntl` is unavailable, so the
+The capability + verification release: recall gains a concept layer (the
+benchmark is now 20/20), Windows gets real file locking, and two new
+harnesses — a fuzzer and a mutation tester — each caught real defects on
+their first run that six earlier audit rounds had missed.
+
+- **Concept seed (recall capability): ~90 curated tool→category mappings**
+  (tailwind→css, hetzner→cloud, sentry→errors, jwt→auth...), applied to
+  memories and queries alike, so a question asked by category finds a
+  memory that only names the tool — the benchmark's one standing miss.
+  recall@1 is now **1.00** at 100 and 1,000 nodes (was 0.95). Polysemous
+  words (black, express, spring, phoenix, prettier, oracle) are excluded
+  by design: a false category on an everyday sentence is worse than a
+  missed synonym. IDF keeps category keys from outranking exact matches
+  (regression-tested).
+- **Real file locking on Windows** (#9 — thanks @therealclvn):
+  `msvcrt.locking` fallback when `fcntl` is unavailable, wrapped in a
+  retry loop so it blocks indefinitely under contention exactly like
+  `flock` (`LK_LOCK` alone gives up after ~10s with `OSError`); the
   locked read-merge-write path is preserved instead of degrading to
-  atomic-write-only saves. The lock blocks indefinitely under contention,
-  matching `flock` semantics (`LK_LOCK` alone gives up after ~10s with
-  `OSError`).
+  atomic-write-only saves. Simulated-backend + contention regression
+  tests; exercised for real on the `windows-latest` CI matrix.
+- **Fuzzer** (`bench/fuzz.py`, seeded, deterministic, runs in CI): 420
+  adversarial cases against the graph file and the CLI. Its first run
+  caught a real defect: **the read-merge-write imported raw disk content
+  past all of `_load`'s validation**, so one corrupt `graph.json` (a
+  hand-edit, a buggier tool) poisoned a healthy session's next save.
+  Node/edge repair is now a single shared path used by both load and
+  merge; NaN/Infinity are repaired too (`float()` accepts them), history
+  must be a list, edge weights are clamped finite.
+- **Mutation tester** (`bench/mutate.py`): AST-level first-order defects
+  (flipped comparisons/boolean ops/arithmetic, nudged constants), full
+  suite run per mutant. First run: raw kill rate 33% on a 120-mutant
+  sample — exposing **17 behaviors the suite never actually pinned**, each
+  now locked by a dedicated test (edge weight must influence ranking, two
+  confirmations protect a memory forever, stability math, full spreading
+  radius, exact CLI exit codes, exact relation storage, TOP_K, hot-list
+  cap...). Raw kill rate after: 46%; surviving mutants are triaged in the
+  tool's output — unreachable `get()` defaults, display-only constants,
+  and ranking-calibration values guarded by the CI benchmark gate
+  (recall@1 ≥ 0.9) rather than by unit assertions.
+- **Boundary fix (found by the new kill tests): through a symlinked
+  `.mind/` root, the lock file was created outside the project** — the
+  one write that escaped. The lock file's parent chain is now checked
+  before creation; nothing is written through a symlinked root.
+- **Dream journal accumulates**: a second dream on the same date appends
+  its cycle to the day's journal instead of silently replacing it.
+- Honest soak display: "hot slots" now counts only the Hot-memories
+  section — 8/8 core facts, not 8/23 against instruction bullets.
+- 118 tests (was 94).
 
 ## 5.4.2 — 2026-07-02
 
