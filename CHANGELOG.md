@@ -1,5 +1,15 @@
 # Changelog
 
+## 6.0.2 — 2026-07-03
+
+- **Windows: atomic writes retry `os.replace` on `PermissionError`** —
+  a reader that momentarily holds the destination open (Python's
+  `open()` doesn't grant FILE_SHARE_DELETE) made 1/12 parallel writers
+  fail on the windows-latest CI matrix. POSIX never enters the retry
+  loop. This was caught by the new parallel-writers regression test
+  from 6.0.1 doing its job on real Windows.
+
+
 ## 6.0.1 — 2026-07-03
 
 Third-audit hardening: two independent external reviews (Codex, GLM) of

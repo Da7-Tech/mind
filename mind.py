@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.0.1"
+__version__ = "6.0.2"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -123,7 +123,19 @@ def _atomic_write(path, data, boundary=None):
         os.fsync(fd)
     finally:
         os.close(fd)
-    os.replace(tmp, str(path))
+    # Windows: os.replace raises PermissionError while another process
+    # momentarily holds the destination open (Python's open() does not
+    # grant FILE_SHARE_DELETE). Readers are short-lived — retry briefly
+    # (CI finding: 1/12 parallel writers lost this race on
+    # windows-latest; POSIX never enters the loop).
+    for attempt in range(40):
+        try:
+            os.replace(tmp, str(path))
+            break
+        except PermissionError:
+            if os.name != "nt" or attempt == 39:
+                raise
+            time.sleep(0.025)
 
 
 # ────────────────────────────────────────────────────────────────

@@ -23,8 +23,8 @@ adopted automatically by `.cursorrules`, `.windsurfrules`, `.clinerules`
 and `.roo/rules/mind.md` in projects that already use those tools.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.0.1/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='57cb707ca3d803d1a81d20f94b14bcd6498fef38b3b46d547325498edc4f32ed',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.0.2/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='0fc0983bd67e0c6bf036ff3e0030897d931627466761baaca79873fc65f6cff4',h;print('mind.py: OK')"
 python3 mind.py init
 python3 mind.py remember "the project database is postgres 16"
 python3 mind.py recall "which database do we use"
