@@ -34,7 +34,7 @@ FACTS = [
     ("staging environment lives at staging.example.com", "what is the staging url", "staging"),
     ("error tracking goes to sentry project souq-prod", "where do errors go", "sentry"),
     ("the mobile app is flutter targeting ios and android", "what framework for mobile", "flutter"),
-    ("اسم المستخدم رائف وهو مطور من الرياض", "ما اسم المستخدم", "رائف"),
+    ("اسم المستخدم خالد وهو مطور من الرياض", "ما اسم المستخدم", "خالد"),
     ("المشروع يستخدم قاعدة بيانات سيكلايت للتخزين المحلي", "ما قاعدة البيانات المحلية", "سيكلايت"),
     ("الخادم الرئيسي في فرانكفورت والنسخ الاحتياطي في هلسنكي", "أين الخادم الرئيسي", "فرانكفورت"),
     ("لغة الواجهة العربية أولًا مع دعم الإنجليزية", "ما لغة الواجهة", "العربية"),

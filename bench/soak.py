@@ -48,7 +48,7 @@ CORE = {
         ("the project database is postgres 16 with prisma", "which database", "postgres"),
         ("api auth uses bearer tokens with 24h expiry", "how does api auth work", "bearer"),
         ("deploy target is hetzner via docker compose", "where do we deploy", "hetzner"),
-        ("اسم المستخدم رائف وهو مطور من الرياض", "ما اسم المستخدم", "رائف"),
+        ("اسم المستخدم خالد وهو مطور من الرياض", "ما اسم المستخدم", "خالد"),
         ("the main branch policy is squash merge only", "what is the merge policy", "squash"),
     ],
     "weekly": [
