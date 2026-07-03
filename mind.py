@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.0.0"
+__version__ = "6.0.1"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -71,6 +71,9 @@ EDGE_BOOST = 0.25            # ...and confirming either endpoint restrengthens
 CLUSTER_SIM = 0.45          # similarity gate for dream clustering
 SEPARATION_SIM = 0.92       # near-identical results are diversified in top-k
 FUZZY_ACTIVATION = 0.5      # activation given to pattern-completion matches
+MAX_TEXT_CHARS = 10000      # one memory is a fact, not a document: a cap
+#   keeps graph.json / journal / ACTIVE processing sane (auditor finding:
+#   nothing protected the tool from a single multi-megabyte "memory")
 
 
 def _now():
@@ -112,7 +115,7 @@ def _atomic_write(path, data, boundary=None):
         raise ValueError(f"refusing to write through a symlink: {path}")
     if boundary is not None:
         _reject_symlinked_parents(path, boundary)
-    tmp = str(path) + ".tmp"
+    tmp = "%s.%d.tmp" % (path, os.getpid())
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | nofollow | os.O_TRUNC, 0o644)
     try:
@@ -608,6 +611,15 @@ class Hippocampus:
                 n["valid_from"] = n["created"]
             if not isinstance(n.get("valid_to"), str):
                 n["valid_to"] = None
+            # lexicographic comparison assumes ISO format — repair any
+            # hand-edited non-ISO value instead of comparing garbage
+            for f, d in (("valid_from", n["created"]), ("valid_to", None)):
+                v = n.get(f)
+                if isinstance(v, str):
+                    try:
+                        datetime.fromisoformat(v)
+                    except ValueError:
+                        n[f] = d
             if not (n.get("superseded_by") is None or
                     isinstance(n.get("superseded_by"), str)):
                 n.pop("superseded_by", None)
@@ -706,7 +718,12 @@ class Hippocampus:
                 if self.path.exists():
                     try:
                         disk = json.loads(self.path.read_text("utf-8"))
-                    except (json.JSONDecodeError, ValueError):
+                    except (json.JSONDecodeError, ValueError) as e:
+                        # never silently overwrite a corrupt graph during a
+                        # live save: quarantine it exactly like _load does
+                        # (auditor finding — the README promise held only
+                        # on the load path)
+                        self._quarantine(e)
                         disk = {}
                     dn = disk.get("nodes", {}) if isinstance(disk, dict) else {}
                     de = disk.get("edges", {}) if isinstance(disk, dict) else {}
@@ -831,6 +848,10 @@ class Hippocampus:
         text = self._clean_text(text)
         if not text:
             raise ValueError("cannot remember control-characters-only text")
+        if len(text) > MAX_TEXT_CHARS:
+            raise ValueError("memory text exceeds %d chars — store the "
+                             "document in a file and remember its path"
+                             % MAX_TEXT_CHARS)
         nid = self._id(text)
         now = _now().isoformat()
         is_new = nid not in self.nodes
@@ -842,10 +863,14 @@ class Hippocampus:
             n["last_accessed"] = now
             n["confidence"] = max(n.get("confidence", 1.0), confidence)
             # a re-remembered superseded fact is an explicit re-assertion:
-            # the user says it IS true again — reopen its validity
+            # the user says it IS true again — reopen a NEW validity
+            # segment starting now (the closed segment stays queryable in
+            # the journal; without this, `recall --at` would claim the
+            # fact was true during the closed interval — auditor finding)
             if n.get("valid_to"):
                 n["valid_to"] = None
                 n.pop("superseded_by", None)
+                n["valid_from"] = now
         else:
             by, session = self._actor()
             self.nodes[nid] = {
@@ -915,8 +940,10 @@ class Hippocampus:
         superseded_by = new id) and create the corrected fact as a new
         node carrying the old text in its history, joined by an explicit
         `supersedes` edge. The state transition ("we were on MySQL, we
-        moved to Postgres") stays in the graph and in the provenance
-        journal — recall simply stops returning the closed fact.
+        moved to Postgres") stays in the graph through the grace window;
+        after the closed fact archives, the lineage lives on in the
+        successor's history entries and the permanent journal — recall
+        simply stops returning the closed fact either way.
 
         Destructive-op gate: the match must share at least two content
         tokens with the hint (or cover half of a short hint) — a one-word
@@ -928,6 +955,8 @@ class Hippocampus:
         new_text = self._clean_text(new_text)
         if not new_text:
             raise ValueError("corrected text must not be empty")
+        if len(new_text) > MAX_TEXT_CHARS:
+            raise ValueError("corrected text exceeds %d chars" % MAX_TEXT_CHARS)
         if not self.nodes:
             return None
         results, _, _ = self.recall(old_hint, top_k=1)
@@ -953,9 +982,10 @@ class Hippocampus:
             existing["confidence"] = min(existing.get("confidence", 1.0),
                                          lowered)
             existing["last_accessed"] = now
-            if existing.get("valid_to"):   # re-asserted → open again
+            if existing.get("valid_to"):   # re-asserted → new segment
                 existing["valid_to"] = None
                 existing.pop("superseded_by", None)
+                existing["valid_from"] = now
         else:
             by, session = self._actor()
             self.nodes[new_nid] = {
@@ -1286,8 +1316,16 @@ class Hippocampus:
             entry["session"] = session
         entry.update(fields)
         try:
-            with jf.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            # single O_APPEND os.write: concurrent writers cannot
+            # interleave a line on a local filesystem (auditor finding:
+            # the provenance log was the one unlocked write path)
+            fd = os.open(str(jf), os.O_WRONLY | os.O_CREAT | os.O_APPEND |
+                         getattr(os, "O_NOFOLLOW", 0), 0o644)
+            try:
+                os.write(fd, (json.dumps(entry, ensure_ascii=False)
+                              + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
         except OSError as e:
             print("warning: journal.jsonl not writable (%s); provenance "
                   "entry lost." % e, file=sys.stderr)
@@ -1524,10 +1562,13 @@ class Dreamer:
                 if 0.35 <= sim < 0.9:
                     conflicts.append((ida, idb))
                     if not dry_run:
+                        now_iso = _now().isoformat()
                         self.hippo.edges.setdefault(ida, {})[idb] = {
-                            "relation": "possible-conflict", "weight": 0.5}
+                            "relation": "possible-conflict", "weight": 0.5,
+                            "created": now_iso}
                         self.hippo.edges.setdefault(idb, {})[ida] = {
-                            "relation": "possible-conflict", "weight": 0.5}
+                            "relation": "possible-conflict", "weight": 0.5,
+                            "created": now_iso}
                     log.append("- possible conflict (sim %.2f):" % sim)
                     log.append("    a: %s" % a["text"][:80])
                     log.append("    b: %s" % b["text"][:80])
@@ -1539,7 +1580,14 @@ class Dreamer:
         return conflicts
 
     def _read_signals(self):
-        if not self.signals_file.exists():
+        # symlink/size guards on the READ side too: dream must not follow
+        # a symlinked signals file or slurp an absurdly large one
+        # (auditor finding)
+        if not self.signals_file.exists() or self.signals_file.is_symlink():
+            return []
+        if self.signals_file.stat().st_size > 5_000_000:
+            print("warning: signals.jsonl is suspiciously large; "
+                  "ignoring it this cycle.", file=sys.stderr)
             return []
         out = []
         for line in self.signals_file.read_text("utf-8").splitlines():
@@ -1700,6 +1748,10 @@ class Mind:
         self.active = None
 
     def init(self):
+        # BEFORE any mkdir: a symlinked .mind would let init create
+        # cortex/dreams directories outside the project (auditor finding)
+        if self.dir.is_symlink():
+            raise ValueError("refusing: .mind is a symlink")
         if (self.dir / GRAPH_FILE).exists():
             print("mind memory already exists in %s (nothing changed)." % self.dir)
             print("  to reset: delete .mind/ first. for a report: python3 mind.py status")
@@ -1734,6 +1786,8 @@ then:        python3 mind.py recall "your question"
 between sessions:  python3 mind.py dream""" % self.dir)
 
     def _ensure(self):
+        if self.dir.is_symlink():
+            raise ValueError("refusing: .mind is a symlink")
         if not self.dir.exists():
             print("no mind memory here. run: python3 mind.py init", file=sys.stderr)
             sys.exit(1)
@@ -1747,7 +1801,7 @@ between sessions:  python3 mind.py dream""" % self.dir)
         nid = self.hippo.remember(text)
         self.active.generate(self.root)
         self.active.export_to_agents(self.root)
-        print("remembered: %s" % text)
+        print("remembered: %s" % self.hippo.nodes[nid]["text"])
         print("  (node %s, total nodes: %d)" % (nid, len(self.hippo.nodes)))
         print("  ACTIVE.md + AGENTS.md/CLAUDE.md/GEMINI.md updated")
 
@@ -1794,12 +1848,15 @@ between sessions:  python3 mind.py dream""" % self.dir)
         if old is None:
             print("no memory matched \"%s\" — nothing corrected." % old_hint)
             return
+        if self.hippo._clean_text(new_text) == old:
+            print("already current — nothing changed.")
+            return
         self.active.generate(self.root)
         self.active.export_to_agents(self.root)
         print("reconsolidated:")
         print("  was: %s" % old)
-        print("  now: %s" % new_text)
-        print("  (old text kept in node history; confidence lowered until re-confirmed)")
+        print("  now: %s" % self.hippo._clean_text(new_text))
+        print("  (old fact CLOSED, not erased — `why` and `--at` can still reach it)")
 
     def why(self, nid):
         """Full provenance answer for one memory: where did this fact
@@ -1836,7 +1893,9 @@ between sessions:  python3 mind.py dream""" % self.dir)
                                      other.get("text", "?")[:60]))
         events = self.hippo.journal_entries(nid)
         if events:
-            print("  journal (%d events):" % len(events))
+            trunc = ("" if len(events) <= 8 else
+                     "; last 8 shown — full log in .mind/journal.jsonl")
+            print("  journal (%d events%s):" % (len(events), trunc))
             for e in events[-8:]:
                 print("    %s %s%s" % (e.get("ts", "?")[:19], e.get("op"),
                                        " by=%s" % e.get("by") if e.get("by")
@@ -1848,7 +1907,14 @@ between sessions:  python3 mind.py dream""" % self.dir)
         """Entity view: every fact — current and superseded — that
         mentions this (normalized) term, with validity intervals."""
         self._ensure()
-        toks = _tokenize(term.lower())
+        term_l = term.lower()
+        # multi-word NORMALIZE phrases ("تايب سكريبت") must be replaced
+        # before tokenization, exactly as _extract_keys does (auditor
+        # finding: entity missed them while recall found them)
+        for phrase, rep in _NORMALIZE_PHRASES.items():
+            if phrase in term_l:
+                term_l = term_l.replace(phrase, " %s " % rep)
+        toks = _tokenize(term_l)
         wanted = {NORMALIZE.get(t, t) for t in toks} | {stem(t) for t in toks}
         wanted.discard("")
         if not wanted:
@@ -1870,9 +1936,13 @@ between sessions:  python3 mind.py dream""" % self.dir)
             span = ("%s -> now" % n.get("valid_from", "?")[:10] if vt is None
                     else "%s -> %s" % (n.get("valid_from", "?")[:10], vt[:10]))
             mark = "  " if vt is None else "✗ "
-            print("  %s[%s] %s (id %s, by %s)"
+            origin = n.get("origin", {})
+            arrow = (" -> superseded by %s" % n["superseded_by"]
+                     if n.get("superseded_by") else "")
+            print("  %s[%s] %s (id %s, by %s via %s)%s"
                   % (mark, span, n["text"], nid,
-                     n.get("origin", {}).get("by", "unknown")))
+                     origin.get("by", "unknown"),
+                     origin.get("via", "?"), arrow))
 
     def dream(self, dry_run=False):
         self._ensure()
@@ -1932,7 +2002,7 @@ commands:
   remember "text"         add a memory
   link "a" "b" [rel]      connect two memories
   recall "question"       spreading-activation recall (prints memory ids)
-  recall "q" --at DATE    what was true on DATE (YYYY-MM-DD)
+  recall "q" --at DATE    what was true then (bare date = end of that day)
   confirm <id> [...]      reinforce memories that actually answered you
   correct "old" "new"     supersede a wrong fact (transition kept in graph)
   why <id>                provenance: where a fact came from, is it still true
@@ -1967,12 +2037,21 @@ def main(argv=None):
     # reject unknown flags: a typo like `dream --dryrun` must never fall
     # through to the destructive default
     KNOWN_FLAGS = {"dream": {"--dry-run"}, "recall": {"--at"}}
-    for a in argv[1:]:
-        if a.startswith("--") and a not in KNOWN_FLAGS.get(cmd, set()):
-            allowed = KNOWN_FLAGS.get(cmd)
-            _die("unknown option %s for `%s`%s" % (
-                a, cmd,
-                " (allowed: %s)" % ", ".join(sorted(allowed)) if allowed else ""))
+    if cmd in KNOWN_FLAGS:
+        # strict scan ONLY for commands with flags: a typo like `dream
+        # --dryrun` must never fall through to the destructive default —
+        # but free-text commands must accept text that merely starts
+        # with dashes (auditor finding)
+        skip_value = False
+        for a in argv[1:]:
+            if skip_value:
+                skip_value = False
+                continue
+            if a == "--at":
+                skip_value = True
+            if a.startswith("--") and a not in KNOWN_FLAGS[cmd]:
+                _die("unknown option %s for `%s` (allowed: %s)" % (
+                    a, cmd, ", ".join(sorted(KNOWN_FLAGS[cmd]))))
     m = Mind()
     try:
         if cmd == "init":

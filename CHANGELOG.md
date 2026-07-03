@@ -1,5 +1,55 @@
 # Changelog
 
+## 6.0.1 — 2026-07-03
+
+Third-audit hardening: two independent external reviews (Codex, GLM) of
+6.0.0 produced 30 findings; each was reproduced-or-refuted. 16 confirmed
+defects fixed (every one with a regression test), the rest triaged as
+design tradeoffs now documented, and one finding refuted with a pinning
+test (`entity css` DOES find tool-only facts — category keys are written
+on the node).
+
+- **Temporal correctness: re-remembering a superseded fact now starts a
+  NEW validity segment** (valid_from = now). Before, the reopened fact
+  kept its original valid_from, so `recall --at` claimed it was true
+  during the closed interval.
+- **The live save path quarantines corrupt graphs** exactly like load —
+  `_save` used to treat a corrupt graph.json as `{}` and overwrite it,
+  making the README promise false on one path.
+- **`init` refuses a symlinked `.mind` root before any mkdir** — it used
+  to create cortex/dreams directories through the symlink before failing.
+- **Concurrency: per-process temp names in atomic writes** — 12 parallel
+  `remember` CLI calls all succeed now (a fixed `.tmp` name made
+  concurrent exporters crash each other; reproduced 4/40 failures).
+- **The provenance journal appends via a single `O_APPEND` write** —
+  it was the one unlocked write path; concurrent writers could
+  theoretically interleave lines.
+- **Free-text commands accept text starting with dashes**
+  (`remember "--dry-run is safe"` used to die as an unknown option);
+  the strict flag scan now applies only to dream/recall, and the
+  `dream --dryrun` typo-guard still bites.
+- **`entity` applies multi-word phrase normalization** («تايب سكريبت» →
+  typescript) and prints `via` + the supersession pointer per fact.
+- Dream-created conflict edges carry `created` timestamps too.
+- Input cap: a memory is a fact, not a document — texts over 10,000
+  chars are refused with guidance.
+- Signals are read with the same suspicion they are written with
+  (symlink + size guards on the read side).
+- Malformed (non-ISO) validity strings are repaired on load instead of
+  being compared lexicographically as garbage.
+- `remember`/`correct` echo the cleaned text, never raw argv (terminal
+  hygiene on the output side); same-text `correct` says "nothing
+  changed" instead of pretending to reconsolidate.
+- `why` says when it truncates the event list; `--at` bare-date
+  semantics (end of that day) documented in usage.
+- Docs: install snippets are pinned + integrity-checked using `python3`
+  only (works on Windows — `shasum` doesn't exist there); README states
+  the closed-fact retention window and the journal's
+  availability-over-completeness tradeoff plainly; SECURITY line count
+  updated.
+- 145 tests.
+
+
 ## 6.0.0 — 2026-07-03
 
 The provenance & time release — a major version because `correct` changes

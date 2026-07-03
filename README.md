@@ -23,7 +23,8 @@ adopted automatically by `.cursorrules`, `.windsurfrules`, `.clinerules`
 and `.roo/rules/mind.md` in projects that already use those tools.
 
 ```bash
-curl -O https://raw.githubusercontent.com/Da7-Tech/mind/main/mind.py
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.0.1/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='57cb707ca3d803d1a81d20f94b14bcd6498fef38b3b46d547325498edc4f32ed',h;print('mind.py: OK')"
 python3 mind.py init
 python3 mind.py remember "the project database is postgres 16"
 python3 mind.py recall "which database do we use"
@@ -32,8 +33,9 @@ python3 mind.py recall "which database do we use"
 python3 mind.py dream        # between sessions: forget, consolidate, promote
 ```
 
-That's the whole install. No server, no vector store, no embedding model,
-no configuration file.
+That's the whole install — pinned to a release tag and
+integrity-checked with nothing but `python3` (works on Windows too).
+No server, no vector store, no embedding model, no configuration file.
 
 ## Measured, not vibes
 
@@ -90,12 +92,15 @@ rounds had missed (see CHANGELOG 5.5.0).
 **Mutation-tested** (`bench/mutate.py`): first-order defects are injected
 (flipped comparisons, broken arithmetic, nudged constants) and the suite
 must catch them. Its first run exposed 17 behaviors the tests didn't
-actually pin down — each is now locked by a dedicated regression test.
+actually pin down — each is now locked by a dedicated regression test
+(raw kill rate went 33% → ~46% on a 120-mutant sample; the raw number is
+published because hiding it would be the exact sin this tool exists to
+catch).
 Surviving mutants are triaged in the tool's output: unreachable `get()`
 defaults, display-only constants, and ranking-calibration values guarded
 by the CI benchmark gate (recall@1 ≥ 0.9) rather than unit assertions.
 
-Test suite: **134 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **145 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, corrupt-graph recovery, and
 a mutation-kill class where every test pins a behavior the suite
@@ -133,6 +138,10 @@ python3 mind.py correct "database mysql" "the database is postgres 16"
 # the MySQL fact is CLOSED (valid_to = now, superseded_by = <new id>),
 # the transition is an explicit `supersedes` edge, and recall stops
 # returning the old fact — but the graph still knows you migrated.
+# Closed facts stay in the graph through the 45-day grace window, then
+# archive; beyond that the lineage lives in the successor's history
+# entries and the journal (forever), so `--at` answers within the
+# retention window and `why` answers always.
 ```
 
 ## Provenance & time — "where did this fact come from, and is it still true?"
@@ -145,6 +154,10 @@ Every fact answers both questions, from the moment it is learned:
   to **`.mind/journal.jsonl`** — an append-only log that is **never
   rotated and never cleared** (unlike `signals.jsonl`, which is session
   telemetry). Even after a fact is pruned, the journal keeps its lineage.
+  Journal appends are single `O_APPEND` writes (safe under concurrent
+  writers on local filesystems); if the journal is unwritable the memory
+  write still succeeds with a warning — availability over completeness,
+  and `why` says plainly when provenance is missing.
 - **Truth validity, separate from attention**: `weight` says how *salient*
   a memory is; `valid_from`/`valid_to` say whether it is *true*. Decay
   touches only salience — **nothing is ever marked false by forgetting**.

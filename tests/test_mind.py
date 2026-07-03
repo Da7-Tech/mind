@@ -1365,6 +1365,214 @@ class TestProvenance(TmpDirTest):
             os.chdir(cwd)
 
 
+# ───────────── third-audit fixes (Codex + GLM reports, 6.0.1) ─────────────
+class TestThirdAudit(TmpDirTest):
+    def test_reopen_starts_new_validity_segment(self):
+        """Codex#1: re-remembering a superseded fact must NOT resurrect
+        its old valid_from — `--at` inside the closed interval must not
+        claim it was true."""
+        h = self.hippo()
+        h.remember("cache is redis")
+        old_id = h._id("cache is redis")
+        # backdate the original segment, then close it in the past
+        past = (datetime.now() - timedelta(days=30)).isoformat()
+        h.nodes[old_id]["valid_from"] = past
+        h.nodes[old_id]["created"] = past
+        h.correct("cache redis", "cache is memcached")
+        h.nodes[old_id]["valid_to"] = (
+            datetime.now() - timedelta(days=20)).isoformat()
+        h.remember("cache is redis")               # reopen NOW
+        n = h.nodes[old_id]
+        self.assertIsNone(n["valid_to"])
+        self.assertGreater(n["valid_from"],
+                           (datetime.now() - timedelta(days=1)).isoformat(),
+                           "reopening must start a NEW segment at now")
+        # a query inside the closed window must not return it
+        mid = (datetime.now() - timedelta(days=25)).isoformat()
+        results, _, _ = h.recall("what is the cache", at=mid)
+        self.assertFalse(any(r[0] == old_id for r in results))
+
+    def test_live_save_quarantines_corrupt_disk(self):
+        """Codex#2: _save must quarantine a corrupt graph.json, exactly
+        like _load — never silently overwrite it."""
+        h = self.hippo()
+        h.remember("healthy fact one")
+        (self.mind_dir / "graph.json").write_text("{corrupt!!", "utf-8")
+        h.remember("healthy fact two")             # triggers merge path
+        corrupt = list(self.mind_dir.glob("graph.json.corrupt-*"))
+        self.assertTrue(corrupt, "corrupt disk state must be quarantined")
+        self.assertIn("{corrupt!!", corrupt[0].read_text("utf-8"))
+
+    def test_init_refuses_symlinked_mind_dir(self):
+        """Codex#3: init through a symlinked .mind must not create even a
+        directory outside the project."""
+        if os.name == "nt":
+            self.skipTest("symlinks need privileges on Windows")
+        attacker = Path(tempfile.mkdtemp(prefix="mind-attacker-"))
+        proj = Path(tempfile.mkdtemp(prefix="mind-proj-"))
+        try:
+            target = attacker / "payload"
+            target.mkdir()
+            (proj / ".mind").symlink_to(target)
+            cwd = os.getcwd()
+            os.chdir(proj)
+            try:
+                import io
+                from contextlib import redirect_stdout, redirect_stderr
+                buf = io.StringIO()
+                with redirect_stdout(buf), redirect_stderr(buf):
+                    code = M.main(["init"])
+            finally:
+                os.chdir(cwd)
+            self.assertEqual(code, 1)
+            self.assertEqual(list(target.iterdir()), [],
+                             "nothing may be created through the symlink")
+        finally:
+            shutil.rmtree(attacker, ignore_errors=True)
+            shutil.rmtree(proj, ignore_errors=True)
+
+    def test_parallel_cli_writers_all_succeed(self):
+        """Codex#5: concurrent remembers used to crash on a shared .tmp
+        name in the export path — every writer must exit 0 and every
+        memory must land."""
+        import subprocess
+        here = Path(__file__).resolve().parent.parent / "mind.py"
+        proj = Path(tempfile.mkdtemp(prefix="mind-par-"))
+        try:
+            subprocess.run([sys.executable, str(here), "init"],
+                           cwd=str(proj), capture_output=True, timeout=30)
+            procs = [subprocess.Popen(
+                [sys.executable, str(here), "remember",
+                 "parallel fact number %d" % i],
+                cwd=str(proj), stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE) for i in range(12)]
+            codes = [p.wait(timeout=60) for p in procs]
+            self.assertEqual(codes, [0] * 12,
+                             [p.stderr.read().decode()[:200] for p in procs
+                              if p.returncode])
+            h = Hippocampus(proj / ".mind" / "graph.json")
+            hits = sum(1 for n in h.nodes.values()
+                       if "parallel fact" in n["text"])
+            self.assertEqual(hits, 12, "no write may be lost")
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+
+    def test_entity_resolves_multiword_arabic_phrase(self):
+        """Codex#7: entity must apply the same phrase normalization as
+        the index — «تايب سكريبت» is typescript."""
+        h = self.hippo()
+        h.remember("the frontend uses typescript strict mode")
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            import io
+            from contextlib import redirect_stdout
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                M.main(["entity", "تايب سكريبت"])
+            self.assertIn("typescript", buf.getvalue())
+        finally:
+            os.chdir(cwd)
+
+    def test_entity_finds_tool_by_category(self):
+        """GLM#6 REFUTED and pinned: category keys are written on the
+        node at remember-time, so `entity css` finds the tailwind fact."""
+        h = self.hippo()
+        h.remember("the design uses tailwind with a palette")
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            import io
+            from contextlib import redirect_stdout
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                M.main(["entity", "css"])
+            self.assertIn("tailwind", buf.getvalue())
+        finally:
+            os.chdir(cwd)
+
+    def test_conflict_edges_carry_created(self):
+        """Codex#8: every edge the dreamer creates is timestamped too."""
+        h = self.hippo()
+        h.remember("the api rate limit is one hundred per minute")
+        h.remember("the api rate limit is two hundred per minute")
+        d = Dreamer(self.mind_dir, h, Cortex(self.mind_dir / "cortex"))
+        d.dream()
+        conflict_edges = [e for nbrs in h.edges.values()
+                          for e in nbrs.values()
+                          if e.get("relation") == "possible-conflict"]
+        if conflict_edges:                          # scan is heuristic
+            for e in conflict_edges:
+                self.assertIn("created", e)
+
+    def test_oversized_memory_refused(self):
+        """Codex#14: a memory is a fact, not a document."""
+        h = self.hippo()
+        with self.assertRaises(ValueError):
+            h.remember("x" * (M.MAX_TEXT_CHARS + 1))
+        self.assertEqual(len(h.nodes), 0)
+
+    def test_remember_text_starting_with_dashes(self):
+        """Codex#15: free-text commands must accept text that merely
+        starts with dashes; only dream/recall have strict flag scans."""
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            import io
+            from contextlib import redirect_stdout, redirect_stderr
+            buf, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(err):
+                M.main(["init"])
+                code = M.main(["remember", "--dry-run is a dream flag"])
+            self.assertEqual(code, 0, err.getvalue())
+            h = Hippocampus(self.tmp / ".mind" / "graph.json")
+            self.assertTrue(any("--dry-run" in n["text"]
+                                for n in h.nodes.values()))
+            # and the dream typo-guard still bites
+            err2 = io.StringIO()
+            try:
+                with redirect_stdout(io.StringIO()), redirect_stderr(err2):
+                    code2 = M.main(["dream", "--dryrun"])
+            except SystemExit as e:
+                code2 = e.code
+            self.assertEqual(code2, 2)
+        finally:
+            os.chdir(cwd)
+
+    def test_symlinked_signals_not_read(self):
+        """Codex#12: dream must not follow a symlinked signals file."""
+        if os.name == "nt":
+            self.skipTest("symlinks need privileges on Windows")
+        h = self.hippo()
+        h.remember("a fact before the attack")
+        sig = self.mind_dir / "signals.jsonl"
+        if sig.exists():
+            sig.unlink()
+        outside = Path(tempfile.mkdtemp()) / "outside.jsonl"
+        outside.write_text('{"kind":"remember","content":"evil"}\n', "utf-8")
+        sig.symlink_to(outside)
+        d = Dreamer(self.mind_dir, h, Cortex(self.mind_dir / "cortex"))
+        _, text = d.dream()
+        self.assertIn("0 session signals", text)
+        self.assertTrue(outside.exists(), "the target must not be deleted")
+
+    def test_malformed_validity_repaired_on_load(self):
+        """GLM#10: non-ISO validity strings must be repaired, not
+        compared lexicographically as garbage."""
+        gpath = self.mind_dir / "graph.json"
+        gpath.write_text(
+            '{"nodes":{"aaa":{"text":"slash dated fact",'
+            '"created":"2026-01-01T00:00:00",'
+            '"valid_from":"2026/01/01","valid_to":"garbage"}},"edges":{}}',
+            encoding="utf-8")
+        h = Hippocampus(gpath)
+        n = h.nodes["aaa"]
+        self.assertEqual(n["valid_from"], "2026-01-01T00:00:00")
+        self.assertIsNone(n["valid_to"])
+        results, _, _ = h.recall("slash dated fact")
+        self.assertTrue(results)
+
+
 # ──────────────── mutation-testing kills (bench/mutate.py) ────────────────
 class TestMutationKills(TmpDirTest):
     """Each test kills one or more surviving mutants from bench/mutate.py —

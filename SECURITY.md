@@ -29,4 +29,4 @@ hardening suggestions. You can expect an initial response within a few days.
 - The provenance journal (`journal.jsonl`) is append-only and written
   behind the same symlink/parent-boundary checks as every other file.
 - No network access, no subprocess execution, no eval — the file can be
-  fully audited in one sitting (~1,700 lines).
+  fully audited in one sitting (~2,100 lines).
