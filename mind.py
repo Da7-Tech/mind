@@ -16,7 +16,9 @@ Usage: python3 mind.py <command> [args]
   link "a" "b" [rel]   connect two memories with a weighted edge
   recall "question"    spreading-activation recall (RRF + IDF fusion)
   confirm <id> [...]   reinforce memories that actually answered you
-  correct "old" "new"  reconsolidate: rewrite a wrong memory, keep history
+  correct "old" "new"  supersede a wrong fact (transition kept, provenance logged)
+  why <id>             provenance: origin, validity, full event history
+  entity "term"        every fact about a term, current and superseded
   dream [--dry-run]    run the sleep cycle (light -> deep -> REM)
   export               regenerate agent rule files
   status               memory health report
@@ -28,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "5.6.0"
+__version__ = "6.0.0"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -39,6 +41,9 @@ ACTIVE_FILE = "ACTIVE.md"
 CORTEX_DIR = "cortex"
 DREAMS_DIR = "dreams"
 SIGNALS_FILE = "signals.jsonl"
+JOURNAL_FILE = "journal.jsonl"  # append-only provenance log — NEVER cleared
+#   (signals.jsonl is session telemetry and is cleared by dream; the
+#    journal is the permanent answer to "where did this fact come from")
 
 BOOST_PER_ACCESS = 0.15     # weight boost on confirmed recall (bump)
 WEIGHT_THRESHOLD = 0.1      # nodes below this are pruned during dreams
@@ -594,6 +599,18 @@ class Hippocampus:
             # finding: a scalar history crashed reconsolidation)
             if not isinstance(n.get("history", []), list):
                 n["history"] = []
+            # provenance + validity (6.0.0): older graphs get honest
+            # defaults — origin "unknown", validity open since creation
+            if not isinstance(n.get("origin"), dict):
+                n["origin"] = {"by": "unknown", "session": None,
+                               "via": "unknown"}
+            if not isinstance(n.get("valid_from"), str):
+                n["valid_from"] = n["created"]
+            if not isinstance(n.get("valid_to"), str):
+                n["valid_to"] = None
+            if not (n.get("superseded_by") is None or
+                    isinstance(n.get("superseded_by"), str)):
+                n.pop("superseded_by", None)
             # keys must be a list of strings; a bare string would iterate
             # character-by-character and a non-string element would crash
             # the re.sub below (auditor finding)
@@ -815,27 +832,46 @@ class Hippocampus:
         if not text:
             raise ValueError("cannot remember control-characters-only text")
         nid = self._id(text)
+        now = _now().isoformat()
+        is_new = nid not in self.nodes
         if nid in self.nodes:
             n = self.nodes[nid]
             n["weight"] = min(1.0, n["weight"] + 0.2)
             n["peak_weight"] = max(n.get("peak_weight", 1.0), n["weight"])
             n["access_count"] = n.get("access_count", 0) + 1
-            n["last_accessed"] = _now().isoformat()
+            n["last_accessed"] = now
             n["confidence"] = max(n.get("confidence", 1.0), confidence)
+            # a re-remembered superseded fact is an explicit re-assertion:
+            # the user says it IS true again — reopen its validity
+            if n.get("valid_to"):
+                n["valid_to"] = None
+                n.pop("superseded_by", None)
         else:
+            by, session = self._actor()
             self.nodes[nid] = {
                 "text": text,
                 "weight": 1.0,
                 "peak_weight": 1.0,
-                "created": _now().isoformat(),
-                "last_accessed": _now().isoformat(),
+                "created": now,
+                "last_accessed": now,
                 "access_count": 0,
                 "confidence": confidence,
                 "keys": self._extract_keys(text),
+                # provenance + truth validity, written the moment the
+                # fact is learned (structure at write time)
+                "origin": {"by": by, "session": session, "via": "remember"},
+                "valid_from": now,
+                "valid_to": None,
             }
             self.edges.setdefault(nid, {})
             self.related = None    # rebuild lazily; avoids O(N^2) per write
         self._save()
+        # journal AFTER the save: the provenance log records only facts
+        # that actually landed on disk
+        if is_new:
+            self._journal("remember", id=nid, text=text)
+        else:
+            self._journal("remember", id=nid, dup=True)
         self._log_signal("remember", text)
         return nid
 
@@ -856,9 +892,13 @@ class Hippocampus:
             self.remember(text_a)
         if id_b not in self.nodes:
             self.remember(text_b)
-        self.edges.setdefault(id_a, {})[id_b] = {"relation": relation, "weight": 1.0}
-        self.edges.setdefault(id_b, {})[id_a] = {"relation": relation, "weight": 1.0}
+        now = _now().isoformat()
+        self.edges.setdefault(id_a, {})[id_b] = {"relation": relation,
+                                                 "weight": 1.0, "created": now}
+        self.edges.setdefault(id_b, {})[id_a] = {"relation": relation,
+                                                 "weight": 1.0, "created": now}
         self._save()
+        self._journal("link", id=id_a, other=id_b, relation=relation)
         self._log_signal("link", "%s --%s--> %s" % (text_a, relation, text_b))
         return "linked: %s <-> %s" % (text_a, text_b)
 
@@ -870,9 +910,13 @@ class Hippocampus:
                 if w not in STOPWORDS}
 
     def correct(self, old_hint, new_text):
-        """Reconsolidation: find the memory best matching `old_hint`,
-        rewrite it with `new_text`, keep the old text in node history,
-        and temporarily lower confidence (it re-hardens on future recalls).
+        """Temporal reconsolidation (fusion, not erasure): find the memory
+        best matching `old_hint`, CLOSE its validity (valid_to = now,
+        superseded_by = new id) and create the corrected fact as a new
+        node carrying the old text in its history, joined by an explicit
+        `supersedes` edge. The state transition ("we were on MySQL, we
+        moved to Postgres") stays in the graph and in the provenance
+        journal — recall simply stops returning the closed fact.
 
         Destructive-op gate: the match must share at least two content
         tokens with the hint (or cover half of a short hint) — a one-word
@@ -896,58 +940,75 @@ class Hippocampus:
                 (hint_toks and len(shared) / len(hint_toks) >= 0.5)):
             return None
         old_text = node["text"]
-        history = node.setdefault("history", [])
-        history.append({"text": old_text, "replaced": _now().isoformat()})
+        now = _now().isoformat()
         new_nid = self._id(new_text)
-        node["text"] = new_text
-        node["keys"] = self._extract_keys(new_text)
-        node["confidence"] = round(node.get("confidence", 1.0) * 0.7, 3)
-        node["last_accessed"] = _now().isoformat()
-        # re-key under the new id. If a node with that exact text already
-        # exists, MERGE into it instead of clobbering it (auditor finding:
-        # the pre-existing node's history/edges/reinforcement were lost).
-        existing = self.nodes.get(new_nid) if new_nid != nid else None
+        if new_nid == nid:                 # correcting to the same text
+            return old_text
+        lowered = round(node.get("confidence", 1.0) * 0.7, 3)
+        entry = {"text": old_text, "replaced": now}
+        existing = self.nodes.get(new_nid)
         if existing is not None:
-            existing.setdefault("history", []).extend(node.get("history", []))
-            existing["access_count"] = max(existing.get("access_count", 0),
-                                           node.get("access_count", 0))
+            # the corrected text already exists: fuse into it
+            existing.setdefault("history", []).append(entry)
             existing["confidence"] = min(existing.get("confidence", 1.0),
-                                         node["confidence"])
-            existing["last_accessed"] = node["last_accessed"]
-            merged_edges = dict(self.edges.get(new_nid, {}))
-            for nbr, e in self.edges.get(nid, {}).items():
-                merged_edges.setdefault(nbr, e)
-            merged_edges.pop(new_nid, None)
-            self.edges[new_nid] = merged_edges
-            del self.nodes[nid]
-            self._deleted.add(nid)
-            self.edges.pop(nid, None)
-            for other in self.edges.values():
-                if nid in other:
-                    other.setdefault(new_nid, other[nid])
-                    del other[nid]
+                                         lowered)
+            existing["last_accessed"] = now
+            if existing.get("valid_to"):   # re-asserted → open again
+                existing["valid_to"] = None
+                existing.pop("superseded_by", None)
         else:
-            self.nodes[new_nid] = node
-            if new_nid != nid:
-                del self.nodes[nid]
-                self._deleted.add(nid)
-                self.edges[new_nid] = self.edges.pop(nid, {})
-                for other in self.edges.values():
-                    if nid in other:
-                        other[new_nid] = other.pop(nid)
+            by, session = self._actor()
+            self.nodes[new_nid] = {
+                "text": new_text,
+                "weight": node.get("weight", 1.0),
+                "peak_weight": node.get("peak_weight", 1.0),
+                "created": now,
+                "last_accessed": now,
+                "access_count": 0,
+                "confidence": lowered,
+                "keys": self._extract_keys(new_text),
+                "history": list(node.get("history", [])) + [entry],
+                "origin": {"by": by, "session": session, "via": "correct"},
+                "valid_from": now,
+                "valid_to": None,
+            }
+        # fusion: the new fact inherits the old fact's connections
+        for nbr, e in list(self.edges.get(nid, {}).items()):
+            if nbr == new_nid:
+                continue
+            self.edges.setdefault(new_nid, {}).setdefault(nbr, dict(e))
+            rev = self.edges.get(nbr, {}).get(nid)
+            if rev is not None:
+                self.edges.setdefault(nbr, {}).setdefault(new_nid, dict(rev))
+        # the explicit, timestamped state transition
+        self.edges.setdefault(new_nid, {})[nid] = {
+            "relation": "supersedes", "weight": 0.5, "created": now}
+        self.edges.setdefault(nid, {})[new_nid] = {
+            "relation": "superseded-by", "weight": 0.5, "created": now}
+        # close the old fact — invalidation is explicit and reversible,
+        # never conflated with attention decay
+        node["valid_to"] = now
+        node["superseded_by"] = new_nid
         self.related = None
         self._save()
+        self._journal("correct", old_id=nid, new_id=new_nid,
+                      old_text=old_text, new_text=new_text)
         self._log_signal("correct", "%s => %s" % (old_text, new_text))
         return old_text
 
     # -- read path ------------------------------------------------------
     def recall(self, query, top_k=RECALL_TOP_K, max_hops=RECALL_RADIUS,
-               rrf_k=60):
+               rrf_k=60, at=None):
         """Spreading activation + IDF + Reciprocal Rank Fusion.
 
         Read-only by design: recall never writes to disk. Reinforcement
         happens through the separate bump() (called on confirmed hits),
-        so health checks and repeated queries cannot skew the weights."""
+        so health checks and repeated queries cannot skew the weights.
+
+        Truth-validity filter: only facts valid AT `at` (default: now)
+        are candidates. Superseded facts stay in the graph for lineage
+        (`why`, `entity`, `recall --at <date>`) but are never returned
+        as current answers."""
         t0 = time.perf_counter()
         keys = set(self._extract_keys(query, is_query=True))
         if not keys:
@@ -958,11 +1019,13 @@ class Hippocampus:
                 for term, _ in self.related.related(w, top_k=4):
                     expanded.add(term)
         keys = expanded
-        N = max(1, len(self.nodes))
+        alive = {nid for nid, n in self.nodes.items()
+                 if self._valid_at(n, at)}
+        N = max(1, len(alive))
 
         df = defaultdict(int)
-        for node in self.nodes.values():
-            for k in set(node.get("keys", [])):
+        for nid in alive:
+            for k in set(self.nodes[nid].get("keys", [])):
                 df[k] += 1
         idf = {k: math.log(1 + N / (1 + df.get(k, 0))) for k in keys}
 
@@ -973,7 +1036,8 @@ class Hippocampus:
         # reinforcement (soak-test finding).
         direct = defaultdict(float)
         q_lower = query.lower()
-        for nid, node in self.nodes.items():
+        for nid in alive:
+            node = self.nodes[nid]
             w_bias = 0.35 + 0.65 * node.get("weight", 1.0)
             n_keys = set(node.get("keys", []))
             shared = keys & n_keys
@@ -987,8 +1051,9 @@ class Hippocampus:
 
         # pattern completion: no direct hits -> fuzzy-match node texts so a
         # partial or misspelled cue can still reactivate the memory.
-        if not direct and self.nodes:
-            for nid, node in self.nodes.items():
+        if not direct and alive:
+            for nid in alive:
+                node = self.nodes[nid]
                 sim = self.embedder.similarity(query, node["text"])
                 if sim >= 0.25:
                     direct[nid] = sim * FUZZY_ACTIVATION * node.get("weight", 1.0)
@@ -1004,6 +1069,8 @@ class Hippocampus:
                 spread[nid] += act
                 if hop < max_hops and act > SPREADING_THRESHOLD:
                     for nbr, ed in self.edges.get(nid, {}).items():
+                        if nbr not in alive:   # closed facts don't relay
+                            continue
                         nxt[nbr] += act * ACTIVATION_DECAY * ed.get("weight", 1.0) / (hop + 1)
             wave = nxt
             if not wave:
@@ -1025,7 +1092,7 @@ class Hippocampus:
         # Defense in depth: activation can only reach ids absent from
         # self.nodes if the graph was mutated externally mid-flight —
         # drop them instead of raising.
-        fused = {nid: s for nid, s in fused.items() if nid in self.nodes}
+        fused = {nid: s for nid, s in fused.items() if nid in alive}
         ranked = sorted(fused.items(), key=lambda x: -x[1])
         if len(ranked) > 1:
             reranked = []
@@ -1078,6 +1145,8 @@ class Hippocampus:
                 changed = True
         if changed:
             self._save()
+            self._journal("confirm", ids=[nid for nid in node_ids
+                                          if nid in self.nodes])
         return changed
 
     def decay(self, dry_run=False):
@@ -1093,6 +1162,20 @@ class Hippocampus:
         pruned = []
         for nid in list(self.nodes.keys()):
             n = self.nodes[nid]
+            # superseded facts are CLOSED states, not competing memories:
+            # they don't decay against the living, and once their closure
+            # ages past the grace window they archive regardless of
+            # access_count — their lineage stays in history entries, the
+            # supersedes edge, and the permanent journal
+            vt = n.get("valid_to")
+            if vt:
+                try:
+                    closed_days = (now - datetime.fromisoformat(vt)).days
+                except (TypeError, ValueError):
+                    closed_days = 0
+                if closed_days > GRACE_DAYS:
+                    pruned.append((nid, "[superseded] " + n["text"]))
+                continue
             try:
                 days = (now - datetime.fromisoformat(n["last_accessed"])).days
             except (TypeError, ValueError):
@@ -1129,6 +1212,10 @@ class Hippocampus:
                     self.edges.pop(nid, None)
                     for other in self.edges.values():
                         other.pop(nid, None)
+                # pruning is a fact-lifecycle event too: the journal keeps
+                # the id→text mapping even after the node leaves the graph
+                self._journal("prune", ids=[nid for nid, _ in pruned],
+                              texts=[t for _, t in pruned])
             else:
                 print("warning: archive.md is not writable (symlink?); "
                       "keeping %d prunable memories." % len(pruned),
@@ -1162,6 +1249,76 @@ class Hippocampus:
             f.write(json.dumps({"kind": kind, "content": content,
                                 "ts": _now().isoformat()},
                                ensure_ascii=False) + "\n")
+
+    # -- provenance -----------------------------------------------------
+    @staticmethod
+    def _actor():
+        """Who is writing. Agents/harnesses set MIND_BY and MIND_SESSION
+        in the environment; the zero-setup default is 'agent'."""
+        return (os.environ.get("MIND_BY", "agent"),
+                os.environ.get("MIND_SESSION"))
+
+    def _journal(self, op, **fields):
+        """Append-only provenance log (journal.jsonl). Unlike
+        signals.jsonl (telemetry, cleared by dream), the journal is NEVER
+        rotated or deleted: every fact-mutating operation records who,
+        when, and what, so "where did this fact come from" stays
+        answerable for the life of the project. Journal failure warns but
+        never blocks a memory write (availability over completeness —
+        documented tradeoff)."""
+        jf = self.path.parent / JOURNAL_FILE
+        # same trust boundary as every other write: a symlinked journal
+        # OR a symlinked .mind root must never leak a file outside the
+        # project (the lock file had this exact hole once — test finding)
+        try:
+            _reject_symlinked_parents(jf, self.path.parent)
+        except ValueError:
+            print("warning: .mind is unsafe (symlink?); skipping "
+                  "provenance entry.", file=sys.stderr)
+            return
+        if jf.is_symlink():
+            print("warning: journal.jsonl is a symlink; skipping "
+                  "provenance entry.", file=sys.stderr)
+            return
+        by, session = self._actor()
+        entry = {"ts": _now().isoformat(), "op": op, "by": by}
+        if session:
+            entry["session"] = session
+        entry.update(fields)
+        try:
+            with jf.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError as e:
+            print("warning: journal.jsonl not writable (%s); provenance "
+                  "entry lost." % e, file=sys.stderr)
+
+    def journal_entries(self, node_id=None):
+        """Read the provenance log, optionally filtered to one node."""
+        jf = self.path.parent / JOURNAL_FILE
+        if not jf.exists():
+            return []
+        out = []
+        for line in jf.read_text("utf-8").splitlines():
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if node_id is None or node_id in (e.get("id"), e.get("old_id"),
+                                              e.get("new_id")) \
+                    or node_id in (e.get("ids") or []):
+                out.append(e)
+        return out
+
+    # -- temporal validity ----------------------------------------------
+    @staticmethod
+    def _valid_at(node, at=None):
+        """Truth validity, distinct from attention (weight): a fact is
+        valid from valid_from until valid_to (open = still true). ISO
+        strings compare lexicographically, so no parsing is needed."""
+        at = at or _now().isoformat()
+        vf = node.get("valid_from") or node.get("created") or ""
+        vt = node.get("valid_to")
+        return vf <= at and (vt is None or at < vt)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -1305,6 +1462,8 @@ class Dreamer:
         emb = self.hippo.embedder
         clusters = []
         for nid, n in self.hippo.nodes.items():
+            if not self.hippo._valid_at(n):   # closed facts don't cluster
+                continue
             placed = False
             for c in clusters:
                 if emb.similarity(n["text"], c["centroid"]) > CLUSTER_SIM:
@@ -1342,7 +1501,10 @@ class Dreamer:
         are flagged and linked, never auto-deleted. The user (or agent)
         resolves them with `mind correct`."""
         emb = self.hippo.embedder
-        nodes = list(self.hippo.nodes.items())
+        # a superseded fact conflicting with its successor is not a
+        # contradiction — it's history. Scan only currently-valid facts.
+        nodes = [(nid, n) for nid, n in self.hippo.nodes.items()
+                 if self.hippo._valid_at(n)]
         N = max(1, len(nodes))
         df = defaultdict(int)
         for _, n in nodes:
@@ -1409,7 +1571,11 @@ class Active:
         self.path = mind_dir / ACTIVE_FILE
 
     def generate(self, project_root):
-        nodes_sorted = sorted(self.hippo.nodes.values(),
+        # working memory shows only facts that are currently TRUE:
+        # superseded facts keep their lineage in the graph but never
+        # occupy the agent's always-on context
+        nodes_sorted = sorted((n for n in self.hippo.nodes.values()
+                               if self.hippo._valid_at(n)),
                               key=lambda n: -n["weight"])
         hot, used = [], 0
         for n in nodes_sorted:
@@ -1589,13 +1755,16 @@ between sessions:  python3 mind.py dream""" % self.dir)
         self._ensure()
         print(self.hippo.link(a, b, relation))
 
-    def recall(self, query):
+    def recall(self, query, at=None):
         self._ensure()
-        results, latency, kinds = self.hippo.recall(query)
+        results, latency, kinds = self.hippo.recall(query, at=at)
         if not results:
-            print("no results for \"%s\" (empty graph or no match)" % query)
+            print("no results for \"%s\"%s (empty graph or no match)"
+                  % (query, " at %s" % at[:10] if at else ""))
             return
-        print("recall for \"%s\" — %d results [%.2f ms]\n" % (query, len(results), latency))
+        when = " (as of %s)" % at[:10] if at else ""
+        print("recall for \"%s\"%s — %d results [%.2f ms]\n"
+              % (query, when, len(results), latency))
         for i, (nid, score, n) in enumerate(results, 1):
             print("  %d. [%.3f] (%s) %s" % (i, score, kinds.get(nid, "trace"), n["text"]))
             print("     (confidence %.1f, recalled %dx, weight %.2f, id %s)"
@@ -1632,6 +1801,79 @@ between sessions:  python3 mind.py dream""" % self.dir)
         print("  now: %s" % new_text)
         print("  (old text kept in node history; confidence lowered until re-confirmed)")
 
+    def why(self, nid):
+        """Full provenance answer for one memory: where did this fact
+        come from, is it still true, and every event in its life."""
+        self._ensure()
+        n = self.hippo.nodes.get(nid)
+        if n is None:
+            print("unknown id: %s (get ids from `recall` or `entity`)" % nid,
+                  file=sys.stderr)
+            sys.exit(1)
+        origin = n.get("origin", {})
+        vt = n.get("valid_to")
+        print("memory %s" % nid)
+        print("  text:       %s" % n["text"])
+        print("  status:     %s" % (
+            "STILL TRUE (valid since %s)" % n.get("valid_from", "?")[:19]
+            if vt is None else
+            "SUPERSEDED on %s -> %s" % (vt[:19], n.get("superseded_by", "?"))))
+        print("  origin:     by=%s via=%s%s" % (
+            origin.get("by", "unknown"), origin.get("via", "unknown"),
+            " session=%s" % origin["session"] if origin.get("session") else ""))
+        print("  created:    %s" % n.get("created", "?")[:19])
+        print("  confirmed:  %dx (confidence %.2f, weight %.2f)"
+              % (n.get("access_count", 0), n.get("confidence", 1.0),
+                 n.get("weight", 1.0)))
+        for h in n.get("history", []):
+            print("  previously: %s (replaced %s)"
+                  % (h.get("text", "?"), h.get("replaced", "?")[:19]))
+        rels = [(nbr, e) for nbr, e in self.hippo.edges.get(nid, {}).items()
+                if e.get("relation") in ("supersedes", "superseded-by")]
+        for nbr, e in rels:
+            other = self.hippo.nodes.get(nbr, {})
+            print("  %s: %s (%s)" % (e["relation"], nbr,
+                                     other.get("text", "?")[:60]))
+        events = self.hippo.journal_entries(nid)
+        if events:
+            print("  journal (%d events):" % len(events))
+            for e in events[-8:]:
+                print("    %s %s%s" % (e.get("ts", "?")[:19], e.get("op"),
+                                       " by=%s" % e.get("by") if e.get("by")
+                                       else ""))
+        else:
+            print("  journal:    (no entries — predates 6.0.0 or journal lost)")
+
+    def entity(self, term):
+        """Entity view: every fact — current and superseded — that
+        mentions this (normalized) term, with validity intervals."""
+        self._ensure()
+        toks = _tokenize(term.lower())
+        wanted = {NORMALIZE.get(t, t) for t in toks} | {stem(t) for t in toks}
+        wanted.discard("")
+        if not wanted:
+            print("no indexable term in \"%s\"" % term)
+            return
+        rows = []
+        for nid, n in self.hippo.nodes.items():
+            nkeys = set(n.get("keys", []))
+            nstems = {stem(k) for k in nkeys}
+            if wanted & nkeys or wanted & nstems:
+                rows.append((n.get("valid_from", ""), nid, n))
+        if not rows:
+            print("no facts mention \"%s\"" % term)
+            return
+        rows.sort()
+        print("entity \"%s\" — %d fact(s):\n" % (term, len(rows)))
+        for _, nid, n in rows:
+            vt = n.get("valid_to")
+            span = ("%s -> now" % n.get("valid_from", "?")[:10] if vt is None
+                    else "%s -> %s" % (n.get("valid_from", "?")[:10], vt[:10]))
+            mark = "  " if vt is None else "✗ "
+            print("  %s[%s] %s (id %s, by %s)"
+                  % (mark, span, n["text"], nid,
+                     n.get("origin", {}).get("by", "unknown")))
+
     def dream(self, dry_run=False):
         self._ensure()
         memo, text = self.dreamer.dream(dry_run=dry_run)
@@ -1653,6 +1895,8 @@ between sessions:  python3 mind.py dream""" % self.dir)
     def status(self):
         self._ensure()
         n_nodes = len(self.hippo.nodes)
+        n_valid = sum(1 for n in self.hippo.nodes.values()
+                      if self.hippo._valid_at(n))
         n_edges = len({frozenset((a, b))
                        for a, nbrs in self.hippo.edges.items()
                        for b in nbrs})
@@ -1663,16 +1907,20 @@ between sessions:  python3 mind.py dream""" % self.dir)
         sig = self.dir / SIGNALS_FILE
         if sig.exists():
             pending = sum(1 for ln in sig.read_text("utf-8").splitlines() if ln.strip())
+        journal_n = len(self.hippo.journal_entries())
         print("""=== mind memory health ===
 path:            %s
-nodes:           %d
+nodes:           %d (%d currently true, %d superseded)
 edges:           %d
 avg weight:      %.3f
 cortex files:    %d
 working memory:  %d bytes (~%d tokens)
 pending signals: %d
-version:         %s""" % (self.dir, n_nodes, n_edges, avg_w, cortex_n,
-                          active_size, active_size // 4, pending, __version__))
+journal events:  %d (append-only provenance)
+version:         %s""" % (self.dir, n_nodes, n_valid, n_nodes - n_valid,
+                          n_edges, avg_w, cortex_n,
+                          active_size, active_size // 4, pending,
+                          journal_n, __version__))
 
 
 USAGE = """mind — brain-like memory for any coding agent (v%s)
@@ -1684,8 +1932,11 @@ commands:
   remember "text"         add a memory
   link "a" "b" [rel]      connect two memories
   recall "question"       spreading-activation recall (prints memory ids)
+  recall "q" --at DATE    what was true on DATE (YYYY-MM-DD)
   confirm <id> [...]      reinforce memories that actually answered you
-  correct "old" "new"     fix a wrong memory (reconsolidation)
+  correct "old" "new"     supersede a wrong fact (transition kept in graph)
+  why <id>                provenance: where a fact came from, is it still true
+  entity "term"           every fact about a term, current and superseded
   dream [--dry-run]       run the sleep cycle
   export                  regenerate agent files
   status                  health report
@@ -1708,14 +1959,14 @@ def main(argv=None):
     import difflib
     cmd = argv[0]
     COMMANDS = {"init", "remember", "link", "recall", "confirm", "correct",
-                "dream", "export", "status"}
+                "why", "entity", "dream", "export", "status"}
     if cmd not in COMMANDS:
         sug = difflib.get_close_matches(cmd, COMMANDS, n=1, cutoff=0.6)
         hint = " did you mean `%s`?" % sug[0] if sug else ""
         _die("unknown command: %s.%s\n\n%s" % (cmd, hint, USAGE))
     # reject unknown flags: a typo like `dream --dryrun` must never fall
     # through to the destructive default
-    KNOWN_FLAGS = {"dream": {"--dry-run"}}
+    KNOWN_FLAGS = {"dream": {"--dry-run"}, "recall": {"--at"}}
     for a in argv[1:]:
         if a.startswith("--") and a not in KNOWN_FLAGS.get(cmd, set()):
             allowed = KNOWN_FLAGS.get(cmd)
@@ -1736,10 +1987,33 @@ def main(argv=None):
                 _die('usage: python3 mind.py link "a" "b" ["relation"]')
             m.link(argv[1], argv[2], argv[3] if len(argv) > 3 else "related")
         elif cmd == "recall":
-            q = " ".join(argv[1:]).strip()
+            args = argv[1:]
+            at = None
+            if "--at" in args:
+                i = args.index("--at")
+                if i + 1 >= len(args):
+                    _die("--at needs a date: recall \"q\" --at YYYY-MM-DD")
+                at = args[i + 1]
+                args = args[:i] + args[i + 2:]
+                try:
+                    datetime.fromisoformat(at)
+                except ValueError:
+                    _die("invalid --at date %r (use YYYY-MM-DD)" % at)
+                if len(at) == 10:          # bare date → inclusive end of day
+                    at += "T23:59:59"
+            q = " ".join(args).strip()
             if not q:
-                _die('usage: python3 mind.py recall "question"')
-            m.recall(q)
+                _die('usage: python3 mind.py recall "question" [--at YYYY-MM-DD]')
+            m.recall(q, at=at)
+        elif cmd == "why":
+            if len(argv) != 2 or not argv[1].strip():
+                _die('usage: python3 mind.py why <id> (ids come from recall/entity output)')
+            m.why(argv[1].strip())
+        elif cmd == "entity":
+            term = " ".join(argv[1:]).strip()
+            if not term:
+                _die('usage: python3 mind.py entity "term"')
+            m.entity(term)
         elif cmd == "confirm":
             if len(argv) < 2:
                 _die('usage: python3 mind.py confirm <id> [<id>...] (ids come from recall output)')

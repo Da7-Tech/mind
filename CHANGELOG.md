@@ -1,5 +1,49 @@
 # Changelog
 
+## 6.0.0 — 2026-07-03
+
+The provenance & time release — a major version because `correct` changes
+meaning: facts are now **closed, never erased**. Prompted by a public
+critique that was largely right: mind answered "what relates to this?"
+brilliantly but could not answer "where did this fact come from, and is
+it still true?". Now it answers both, deterministically, still in one
+stdlib file.
+
+- **Write-time provenance**: every node records `origin` (`by` /
+  `session` from the `MIND_BY` / `MIND_SESSION` env vars, and the command
+  it came through). Every mutation — remember, link, confirm, correct,
+  prune — appends to **`.mind/journal.jsonl`**, an append-only log that
+  is never rotated and never cleared (unlike `signals.jsonl`, which is
+  session telemetry and always was). Even pruned facts keep their lineage.
+- **Truth validity, separate from attention**: nodes carry
+  `valid_from`/`valid_to`. `weight` (Ebbinghaus decay) is *salience*;
+  validity is *truth* — **forgetting never falsifies**. Only an explicit
+  `correct` closes a fact.
+- **`correct` is now temporal fusion**: the wrong fact gets
+  `valid_to = now` + `superseded_by`, the corrected fact inherits its
+  edges and history, and a timestamped `supersedes` edge records the
+  state transition ("we were on MySQL, we moved to Postgres" stays
+  queryable). Recall, working memory, clustering, and the contradiction
+  scan all exclude closed facts; re-`remember`ing a closed fact re-opens
+  it (explicit re-assertion wins).
+- **New commands**: `why <id>` (origin, validity interval, prior texts,
+  supersession links, journal events); `entity "term"` (every fact about
+  a normalized term — current and superseded, with intervals);
+  `recall "q" --at YYYY-MM-DD` (what was true *then*).
+- **Edges carry `created` timestamps** (uni-temporal).
+- Superseded facts archive after the grace window regardless of
+  confirmations — they are closed states, not competing memories.
+- Backward compatible on disk: pre-6.0 graphs load with honest defaults
+  (`origin: unknown`, validity open since creation).
+- The new journal write goes through the same symlink/parent-boundary
+  checks as every other file (the suite caught the gap immediately).
+- Honest scope, stated in the README: entity resolution is *lexical*
+  (normalization + stemming + concept seed unify spellings, inflections,
+  and AR↔EN variants); pronouns/free descriptions need a model and are
+  out of scope. Credit given where due: Graphiti's bi-temporal model is
+  the reference point — this is the zero-dependency, deterministic take.
+- 134 tests (12 new provenance/validity tests).
+
 ## 5.6.0 — 2026-07-02
 
 The languages release: mind is engineered for English + Arabic — this

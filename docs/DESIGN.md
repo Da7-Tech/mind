@@ -20,14 +20,21 @@ dreams between sessions, and portable to any agent through one standard file.
    per confirmed recall, so important memories harden and trivia fades.
    This prevents garbage accumulation: in the 180-day soak, junk older
    than the grace window survived 0/256 while core facts survived 15/15.
-4. **Timestamps + confidence + conflict flags** — newer/more-trusted wins,
-   but conflicts are *flagged*, never auto-deleted; `correct` performs
-   explicit reconsolidation with history.
-5. **One `init` + automatic export** for every agent
+4. **Truth is not attention** (6.0.0) — `weight` (Ebbinghaus salience)
+   and `valid_from`/`valid_to` (fact validity) are separate axes: decay
+   never falsifies, and only an explicit `correct` closes a fact —
+   creating a `supersedes` edge instead of erasing (temporal fusion).
+   Conflicts are *flagged*, never auto-deleted.
+5. **Provenance at write time** (6.0.0) — every node carries `origin`
+   (who/via/session), and every mutation appends to `journal.jsonl`,
+   which is never cleared — "where did this fact come from" stays
+   answerable after pruning, unlike the session telemetry in
+   `signals.jsonl`. `why`/`entity`/`recall --at` expose it.
+6. **One `init` + automatic export** for every agent
    (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`) behind guard markers.
-6. **Writes during the session, dreams between sessions** — the agent
+7. **Writes during the session, dreams between sessions** — the agent
    itself is the live half of the loop; the dreamer is the offline half.
-7. **Measure before claiming** — accuracy/latency/size are benchmarked
+8. **Measure before claiming** — accuracy/latency/size are benchmarked
    (`bench/bench.py`) and published; misses are documented. The same
    principle applies to the tests themselves: a seeded fuzzer
    (`bench/fuzz.py`, in CI) attacks the file formats and the CLI, and a

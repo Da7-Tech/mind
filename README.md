@@ -95,7 +95,7 @@ Surviving mutants are triaged in the tool's output: unreachable `get()`
 defaults, display-only constants, and ranking-calibration values guarded
 by the CI benchmark gate (recall@1 ≥ 0.9) rather than unit assertions.
 
-Test suite: **122 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **134 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, corrupt-graph recovery, and
 a mutation-kill class where every test pins a behavior the suite
@@ -126,24 +126,61 @@ DREAMER  between sessions  python3 mind.py dream [--dry-run]
                       to cortex; flag contradictions (never auto-delete)
 ```
 
-Wrong memory? **Reconsolidation** is built in:
+Wrong memory? **Reconsolidation is temporal fusion** (6.0.0), not erasure:
 
 ```bash
 python3 mind.py correct "database mysql" "the database is postgres 16"
-# old text kept in node history; confidence lowered until re-confirmed
+# the MySQL fact is CLOSED (valid_to = now, superseded_by = <new id>),
+# the transition is an explicit `supersedes` edge, and recall stops
+# returning the old fact — but the graph still knows you migrated.
 ```
+
+## Provenance & time — "where did this fact come from, and is it still true?"
+
+Every fact answers both questions, from the moment it is learned:
+
+- **Write-time provenance**: every node records `origin` (who wrote it —
+  agents set `MIND_BY` / `MIND_SESSION` env vars — and via which command),
+  and every mutation (remember / link / confirm / correct / prune) appends
+  to **`.mind/journal.jsonl`** — an append-only log that is **never
+  rotated and never cleared** (unlike `signals.jsonl`, which is session
+  telemetry). Even after a fact is pruned, the journal keeps its lineage.
+- **Truth validity, separate from attention**: `weight` says how *salient*
+  a memory is; `valid_from`/`valid_to` say whether it is *true*. Decay
+  touches only salience — **nothing is ever marked false by forgetting**.
+  Only an explicit `correct` (or a contradiction you resolve) closes a
+  fact's validity.
+- **Ask the graph**:
+
+```bash
+python3 mind.py why a1b2c3d4e5f6        # origin, validity, history, events
+python3 mind.py entity "database"       # every fact about a term — current
+                                        # and superseded, with intervals
+python3 mind.py recall "which db" --at 2026-01-15   # what was true THEN
+```
+
+Honest scope: entity resolution is **lexical** (normalization + stemming +
+the concept seed unify spellings, inflections, and AR↔EN variants of the
+same term) — pronouns and free descriptions ("the new hire" = "Sara") are
+not resolved; that needs a model and would break the zero-dependency
+promise.
 
 ## Why not just use ___?
 
-| | spreading-activation recall | sleep consolidation | works with any agent | zero setup / zero keys | consolidation costs $0 (no LLM) |
-|---|---|---|---|---|---|
-| mem0 | ✗ | ✗ | ✗ (SDK) | ✗ OSS self-host or cloud, but needs LLM + embedder keys | ✗ |
-| Letta (MemGPT) | ✗ | ✓ sleep-time compute | ✗ (own server) | ✗ full platform | ✗ burns tokens |
-| Zep / Graphiti | ~ graph traversal | ✗ | ✗ | ✗ Neo4j + LLM keys | ✗ |
-| HippoRAG 2 | ✓ PageRank | ✗ | ✗ (batch RAG lib) | ✗ GPU/API | ✗ |
-| OpenClaw dreams | ✗ | ✓ | ✗ (OpenClaw only) | ✓ inside OpenClaw | ✗ burns tokens |
-| claude-mem | ✗ | ✗ compression | ~ several agents | ✗ Bun + worker + Chroma | ✗ |
-| **mind** | **✓** | **✓ deterministic** | **✓ AGENTS/CLAUDE/GEMINI** | **✓ one file** | **✓** |
+| | spreading-activation recall | sleep consolidation | temporal validity | provenance log | works with any agent | zero setup / zero keys | consolidation costs $0 (no LLM) |
+|---|---|---|---|---|---|---|---|
+| mem0 | ✗ | ✗ | ✗ | ~ metadata | ✗ (SDK) | ✗ needs LLM + embedder keys | ✗ |
+| Letta (MemGPT) | ✗ | ✓ sleep-time compute | ✗ | ✗ | ✗ (own server) | ✗ full platform | ✗ burns tokens |
+| Zep / Graphiti | ~ graph traversal | ✗ | ✓ bi-temporal (its core strength) | ✓ | ✗ | ✗ Neo4j + LLM keys | ✗ |
+| HippoRAG 2 | ✓ PageRank | ✗ | ✗ | ✗ | ✗ (batch RAG lib) | ✗ GPU/API | ✗ |
+| OpenClaw dreams | ✗ | ✓ | ✗ | ✗ | ✗ (OpenClaw only) | ✓ inside OpenClaw | ✗ burns tokens |
+| claude-mem | ✗ | ✗ compression | ✗ | ~ session refs | ~ several agents | ✗ Bun + worker + Chroma | ✗ |
+| **mind** | **✓** | **✓ deterministic** | **✓ valid-time + `--at`** | **✓ append-only journal + `why`** | **✓ AGENTS/CLAUDE/GEMINI** | **✓ one file** | **✓** |
+
+Credit where due: Graphiti's bi-temporal model is the reference point for
+temporal knowledge graphs — mind's valid-time layer (6.0.0) is the
+zero-dependency, deterministic take on the same idea, not a claim to
+have out-modeled it.
 
 Honest note: [Brain Memory](https://github.com/omelas-tech/brain) is the
 closest project in spirit (files + decay + sleep phases) — credit where due.
@@ -228,7 +265,7 @@ nothing else to configure. A ready-made Hermes skill lives in
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 118 tests
+python3 -m unittest discover -s tests   # 134 tests
 python3 bench/bench.py                  # reproduce the EN/AR numbers
 python3 bench/multilang.py              # 8 untuned languages
 python3 bench/soak.py                   # 180 simulated days

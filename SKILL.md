@@ -1,7 +1,7 @@
 ---
 name: mind
-description: Per-project memory graph with recall, decay, and dreams.
-version: 5.6.0
+description: Project memory graph with recall, provenance, and dreams.
+version: 6.0.0
 author: Da7-Tech
 license: MIT
 platforms: [linux, macos, windows]
@@ -36,7 +36,7 @@ built-in `memory` tool — and it is not a RAG system for large corpora.
 
 - `python3` (3.9+) and `curl` on PATH — nothing else: no API keys, no
   server, no packages. The tool is one stdlib-only file, MIT-licensed,
-  from https://github.com/Da7-Tech/mind (122 tests + benchmarks incl. 10 languages + fuzzer + 180-day
+  from https://github.com/Da7-Tech/mind (134 tests + benchmarks incl. 10 languages + fuzzer + 180-day
   soak test run in its CI on Linux/macOS/Windows).
 
 ## How to Run
@@ -46,8 +46,8 @@ tag and integrity-checked:
 
 ```bash
 cd <project>
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v5.6.0/mind.py
-echo "467e82c0e8225d1cc3f072ea380dc53e02284c66343bdc59f1a284b8bb1ec84b  mind.py" | shasum -a 256 -c
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.0.0/mind.py
+echo "9b4236103d84c4a0bd7b9dd976a95af3c576a0549d778b55816ffa9dfc99f57c  mind.py" | shasum -a 256 -c
 python3 mind.py init
 ```
 
@@ -65,6 +65,9 @@ their rule files synced too (adopted only when present).
 | A recalled memory actually answered | `python3 mind.py confirm <id>` (ids in recall output) |
 | "X and Y are related" | `python3 mind.py link "X" "Y" "relation"` |
 | "That's wrong, it's actually Z" | `python3 mind.py correct "old fact hint" "Z"` |
+| "Where did this fact come from?" | `python3 mind.py why <id>` |
+| "What do we know about X?" | `python3 mind.py entity "X"` |
+| "What was true on DATE?" | `python3 mind.py recall "q" --at YYYY-MM-DD` |
 | "Clean up memory" | `python3 mind.py dream --dry-run`, show plan, then `dream` |
 | Health report | `python3 mind.py status` |
 
@@ -76,11 +79,17 @@ their rule files synced too (adopted only when present).
    `confirm <id>` — confirmed memories harden (+2 weeks stability) and
    their edges restrengthen; unconfirmed ones decay and get pruned
    (into `.mind/archive.md`, never destroyed).
-3. For corrections use `correct` (old text is kept in node history).
-4. For housekeeping, always run `dream --dry-run` first and show the plan;
+3. For corrections use `correct` — the wrong fact is CLOSED (not erased):
+   its validity ends now, a `supersedes` edge records the transition, and
+   `why <id>` / `recall --at` can still reach it. Never re-`remember` a
+   wrong fact to "overwrite" it — that reopens it.
+4. Provenance is automatic (append-only `.mind/journal.jsonl`, never
+   cleared). Set `MIND_BY` and `MIND_SESSION` env vars when running
+   commands so `why` can attribute facts to you/this session.
+5. For housekeeping, always run `dream --dry-run` first and show the plan;
    apply only on approval. Every dream action is explained in
    `.mind/dreams/<date>.md`.
-5. Nightly automation costs zero tokens via the `cronjob` tool in no-agent
+6. Nightly automation costs zero tokens via the `cronjob` tool in no-agent
    mode (the script IS the job — no model call). Use the `write_file` tool
    to create `~/.hermes/scripts/mind_dream.sh` with this body:
 
@@ -111,7 +120,7 @@ their rule files synced too (adopted only when present).
 ## Verification
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v5.6.0/mind.py && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
+cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.0.0/mind.py && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
 ```
 
 Expected: one result containing `7413` with a printed memory id.

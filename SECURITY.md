@@ -26,5 +26,7 @@ hardening suggestions. You can expect an initial response within a few days.
   (`bench/fuzz.py`, 420 adversarial cases, runs in CI) holds the contract
   "no traceback, no data loss, graph always loads clean" against corrupt
   graph files and hostile CLI input.
+- The provenance journal (`journal.jsonl`) is append-only and written
+  behind the same symlink/parent-boundary checks as every other file.
 - No network access, no subprocess execution, no eval — the file can be
   fully audited in one sitting (~1,700 lines).

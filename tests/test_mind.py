@@ -221,16 +221,23 @@ class TestRememberRecall(TmpDirTest):
 
 
 class TestCorrect(TmpDirTest):
-    def test_correct_rewrites_and_keeps_history(self):
+    def test_correct_supersedes_and_keeps_history(self):
+        """6.0.0 temporal fusion: correct CLOSES the old fact instead of
+        erasing it — the transition stays queryable."""
         h = self.hippo()
         h.remember("the database is mysql")
         old = h.correct("database mysql", "the database is postgres")
         self.assertEqual(old, "the database is mysql")
-        self.assertEqual(len(h.nodes), 1)
-        node = next(iter(h.nodes.values()))
-        self.assertIn("postgres", node["text"])
-        self.assertEqual(node["history"][0]["text"], "the database is mysql")
-        self.assertLess(node["confidence"], 1.0)
+        self.assertEqual(len(h.nodes), 2, "old fact is closed, not erased")
+        old_id = h._id("the database is mysql")
+        new_id = h._id("the database is postgres")
+        old_node, new_node = h.nodes[old_id], h.nodes[new_id]
+        self.assertIsNotNone(old_node["valid_to"])
+        self.assertEqual(old_node["superseded_by"], new_id)
+        self.assertIsNone(new_node["valid_to"])
+        self.assertEqual(new_node["history"][0]["text"], "the database is mysql")
+        self.assertLess(new_node["confidence"], 1.0)
+        self.assertEqual(h.edges[new_id][old_id]["relation"], "supersedes")
 
     def test_correct_moves_edges(self):
         h = self.hippo()
@@ -1164,6 +1171,198 @@ class TestNoSpaceScripts(TmpDirTest):
         results, _, _ = h.recall("서버 어디")
         self.assertTrue(results)
         self.assertIn("프랑크푸르트", results[0][2]["text"])
+
+
+# ─────────── provenance + temporal validity (6.0.0) ───────────
+class TestProvenance(TmpDirTest):
+    def test_origin_recorded_at_write_time(self):
+        os.environ["MIND_BY"] = "test-agent"
+        os.environ["MIND_SESSION"] = "s-123"
+        try:
+            h = self.hippo()
+            nid = h.remember("the payment provider is stripe")
+            n = h.nodes[nid]
+            self.assertEqual(n["origin"]["by"], "test-agent")
+            self.assertEqual(n["origin"]["session"], "s-123")
+            self.assertEqual(n["origin"]["via"], "remember")
+            self.assertEqual(n["valid_from"], n["created"])
+            self.assertIsNone(n["valid_to"])
+        finally:
+            del os.environ["MIND_BY"], os.environ["MIND_SESSION"]
+
+    def test_journal_records_every_mutation(self):
+        h = self.hippo()
+        a = h.remember("service alpha uses redis")
+        h.remember("service beta uses kafka")
+        h.link("service alpha uses redis", "service beta uses kafka", "peer")
+        h.bump([a])
+        h.correct("alpha redis", "service alpha uses memcached")
+        ops = [e["op"] for e in h.journal_entries()]
+        self.assertEqual(ops, ["remember", "remember", "link",
+                               "confirm", "correct"])
+        ev = h.journal_entries()[-1]
+        self.assertEqual(ev["old_text"], "service alpha uses redis")
+        self.assertIn("by", ev)
+        self.assertIn("ts", ev)
+
+    def test_journal_survives_dream(self):
+        """THE core provenance guarantee: unlike signals.jsonl, the
+        journal is never cleared by consolidation."""
+        h = self.hippo()
+        h.remember("durable fact about the pipeline")
+        d = Dreamer(self.mind_dir, h, Cortex(self.mind_dir / "cortex"))
+        d.dream()
+        d.dream()
+        self.assertFalse((self.mind_dir / "signals.jsonl").exists(),
+                         "signals are telemetry and ARE cleared")
+        self.assertTrue(len(h.journal_entries()) >= 1,
+                        "the journal must survive every dream")
+
+    def test_superseded_fact_excluded_from_recall_but_not_lost(self):
+        h = self.hippo()
+        h.remember("the database is mysql five")
+        h.correct("database mysql", "the database is postgres sixteen")
+        results, _, _ = h.recall("which database do we use")
+        texts = [n["text"] for _, _, n in results]
+        self.assertTrue(any("postgres" in t for t in texts))
+        self.assertFalse(any("mysql" in t for t in texts),
+                         "closed facts are not current answers")
+        old_id = h._id("the database is mysql five")
+        self.assertIn(old_id, h.nodes, "…but the fact is still in the graph")
+
+    def test_recall_at_past_date_returns_the_old_truth(self):
+        """Bi-temporal-lite: what was true THEN is answerable."""
+        h = self.hippo()
+        h.remember("the database is mysql five")
+        # backdate the fact so "yesterday" falls inside its validity
+        old_id = h._id("the database is mysql five")
+        past = (datetime.now() - timedelta(days=10)).isoformat()
+        h.nodes[old_id]["valid_from"] = past
+        h.nodes[old_id]["created"] = past
+        h.correct("database mysql", "the database is postgres sixteen")
+        yesterday = (datetime.now() - timedelta(days=1)).isoformat()
+        results, _, _ = h.recall("which database do we use", at=yesterday)
+        self.assertTrue(results)
+        self.assertIn("mysql", results[0][2]["text"],
+                      "as-of recall must return the fact valid at that time")
+
+    def test_re_remember_reopens_a_closed_fact(self):
+        """Explicit re-assertion beats an old supersession."""
+        h = self.hippo()
+        h.remember("the cache is redis")
+        h.correct("cache redis", "the cache is memcached")
+        h.remember("the cache is redis")            # user says: it IS redis
+        n = h.nodes[h._id("the cache is redis")]
+        self.assertIsNone(n["valid_to"])
+        results, _, _ = h.recall("what is the cache")
+        self.assertTrue(any("redis" in x[2]["text"] for x in results))
+
+    def test_superseded_fact_pruned_after_grace_without_confirms(self):
+        """Closed states leave the hippocampus after grace regardless of
+        access_count — lineage stays in journal/history."""
+        h = self.hippo()
+        h.remember("the region is eu-west one")
+        h.bump([h._id("the region is eu-west one")])
+        h.bump([h._id("the region is eu-west one")])   # 2 confirms
+        h.correct("region eu-west", "the region is me-central one")
+        old_id = h._id("the region is eu-west one")
+        h.nodes[old_id]["valid_to"] = (
+            datetime.now() - timedelta(days=60)).isoformat()
+        pruned = h.decay()
+        self.assertNotIn(old_id, h.nodes)
+        self.assertTrue(any("superseded" in t for t in pruned))
+        arch = (self.mind_dir / "archive.md").read_text("utf-8")
+        self.assertIn("eu-west", arch)
+
+    def test_valid_but_unconfirmed_old_fact_still_prunes_to_archive(self):
+        """Honest boundary: decay (attention) still archives unconfirmed
+        valid facts after grace — but never marks them false: no
+        valid_to is ever set by decay."""
+        h = self.hippo()
+        nid = h.remember("rarely needed trivia about lunch")
+        h.nodes[nid]["last_accessed"] = (
+            datetime.now() - timedelta(days=50)).isoformat()
+        h.nodes[nid]["created"] = h.nodes[nid]["last_accessed"]
+        h.decay()
+        self.assertNotIn(nid, h.nodes)
+        # the journal still knows it existed and that it was pruned
+        ops = [e["op"] for e in h.journal_entries(nid)]
+        self.assertIn("prune", [e["op"] for e in h.journal_entries()])
+
+    def test_edges_carry_created_timestamps(self):
+        h = self.hippo()
+        a = h.remember("khalid owns the billing service")
+        b = h.remember("billing service uses stripe")
+        h.link("khalid owns the billing service",
+               "billing service uses stripe", "owns")
+        self.assertIn("created", h.edges[a][b])
+
+    def test_old_graph_loads_with_honest_defaults(self):
+        """Pre-6.0 graphs must load: origin=unknown, validity open."""
+        gpath = self.mind_dir / "graph.json"
+        gpath.write_text(
+            '{"nodes":{"aaa":{"text":"legacy fact from 5.x",'
+            '"created":"2026-01-01T00:00:00"}},"edges":{}}',
+            encoding="utf-8")
+        h = Hippocampus(gpath)
+        n = h.nodes["aaa"]
+        self.assertEqual(n["origin"]["by"], "unknown")
+        self.assertEqual(n["valid_from"], "2026-01-01T00:00:00")
+        self.assertIsNone(n["valid_to"])
+        results, _, _ = h.recall("legacy fact")
+        self.assertTrue(results)
+
+    def test_working_memory_excludes_superseded(self):
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        a = Active(self.mind_dir, h, c)
+        h.remember("the database is mysql five")
+        h.correct("database mysql", "the database is postgres sixteen")
+        a.generate(self.tmp)
+        active = (self.mind_dir / "ACTIVE.md").read_text("utf-8")
+        hot = active.split("## Hot memories")[1].split("##")[0]
+        self.assertIn("postgres", hot)
+        self.assertNotIn("mysql", hot)
+
+    def test_cli_why_and_entity_and_at(self):
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            import io
+            from contextlib import redirect_stdout, redirect_stderr
+            def run(*args):
+                out, err = io.StringIO(), io.StringIO()
+                try:
+                    with redirect_stdout(out), redirect_stderr(err):
+                        code = M.main(list(args))
+                except SystemExit as e:
+                    code = e.code
+                return code, out.getvalue(), err.getvalue()
+            run("init")
+            run("remember", "the database is mysql five")
+            run("correct", "database mysql", "the database is postgres sixteen")
+            h = Hippocampus(self.tmp / ".mind" / "graph.json")
+            new_id = h._id("the database is postgres sixteen")
+            old_id = h._id("the database is mysql five")
+            code, out, _ = run("why", new_id)
+            self.assertEqual(code, 0)
+            self.assertIn("STILL TRUE", out)
+            self.assertIn("previously:", out)
+            code, out, _ = run("why", old_id)
+            self.assertEqual(code, 0)
+            self.assertIn("SUPERSEDED", out)
+            code, out, _ = run("entity", "database")
+            self.assertEqual(code, 0)
+            self.assertIn("postgres", out)
+            self.assertIn("mysql", out)      # superseded shown, marked
+            self.assertIn("✗", out)
+            code, out, _ = run("recall", "which database", "--at", "2020-01-01")
+            self.assertEqual(code, 0)
+            self.assertIn("no results", out)
+            code, _, err = run("recall", "which database", "--at", "not-a-date")
+            self.assertEqual(code, 2)
+        finally:
+            os.chdir(cwd)
 
 
 # ──────────────── mutation-testing kills (bench/mutate.py) ────────────────
