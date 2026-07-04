@@ -14,7 +14,8 @@ hardening suggestions. You can expect an initial response within a few days.
 ## Security properties (and their tests)
 
 - Atomic, durable writes: O_NOFOLLOW + fsync-before-rename everywhere,
-  including the lock file (`tests/test_mind.py::TestAuditFindings`).
+  including the lock file (`tests/test_mind.py` — the audit-regression classes
+  `TestAuditFindings2`, `TestThirdAudit`, `TestFourthAudit`).
 - Symlinked agent files, lock files, archive files and export parents are
   refused or skipped — never written through. The lock file's parent chain
   is checked before creation, so even a symlinked `.mind/` root cannot
@@ -23,10 +24,13 @@ hardening suggestions. You can expect an initial response within a few days.
 - Memory text is stripped of terminal control characters on every write
   path, including `correct`.
 - Hostile on-disk state is repaired, not trusted: a seeded fuzzer
-  (`bench/fuzz.py`, 420 adversarial cases, runs in CI) holds the contract
+  (`bench/fuzz.py`, 420 adversarial cases full / 160 quick in CI) holds
+  the contract
   "no traceback, no data loss, graph always loads clean" against corrupt
   graph files and hostile CLI input.
 - The provenance journal (`journal.jsonl`) is append-only and written
   behind the same symlink/parent-boundary checks as every other file.
+- Node ids are `md5[:12]` content addresses — no security property is
+  derived from them.
 - No network access, no subprocess execution, no eval — the file can be
   fully audited in one sitting (~2,100 lines).

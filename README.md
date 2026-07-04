@@ -23,8 +23,8 @@ adopted automatically by `.cursorrules`, `.windsurfrules`, `.clinerules`
 and `.roo/rules/mind.md` in projects that already use those tools.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.0.2/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='0fc0983bd67e0c6bf036ff3e0030897d931627466761baaca79873fc65f6cff4',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.0/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='992548ea1d5e28b3d3fffaecfb5374cc30b55ab27b4a2c363755d70346e5ffa3',h;print('mind.py: OK')"
 python3 mind.py init
 python3 mind.py remember "the project database is postgres 16"
 python3 mind.py recall "which database do we use"
@@ -82,8 +82,17 @@ language is a smoke benchmark, not the 20-query EN/AR suite; heavy
 inflection without stemming will cost precision in cases it doesn't
 cover. Thai is tokenized the same way but not yet benchmarked.)
 
-**Fuzzed** (`bench/fuzz.py`, seeded + deterministic, runs in CI): 420
-adversarial cases — hostile graph files (NaN/Infinity, wrong-typed fields,
+**Discrimination, measured** (`bench/discrim.py`, runs in CI): two
+independent audits correctly pointed out that needle-in-clean-noise
+recall says nothing about telling apart facts that SHARE vocabulary —
+so this benchmark uses only lexically competing distractors, including
+the audits' exact failure cases ("what is my name" vs "file name must
+match the class name", in both English and Arabic). Current score:
+**12/12**, gated at ≥ 0.85 in CI so discrimination can never silently
+regress again.
+
+**Fuzzed** (`bench/fuzz.py`, seeded + deterministic): 420 adversarial
+cases in the full run (CI runs the 160-case quick set on every push) — hostile graph files (NaN/Infinity, wrong-typed fields,
 control characters, truncated JSON, dangling edges) and hostile CLI input.
 Contract: never a traceback, never data loss, the graph always loads clean
 afterwards. Its first run caught a real defect that six earlier audit
@@ -100,7 +109,7 @@ Surviving mutants are triaged in the tool's output: unreachable `get()`
 defaults, display-only constants, and ranking-calibration values guarded
 by the CI benchmark gate (recall@1 ≥ 0.9) rather than unit assertions.
 
-Test suite: **145 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **158 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, corrupt-graph recovery, and
 a mutation-kill class where every test pins a behavior the suite
@@ -180,6 +189,8 @@ promise.
 
 ## Why not just use ___?
 
+![why not just use](assets/why-not-just-use.jpeg)
+
 | | spreading-activation recall | sleep consolidation | temporal validity | provenance log | works with any agent | zero setup / zero keys | consolidation costs $0 (no LLM) |
 |---|---|---|---|---|---|---|---|
 | mem0 | ✗ | ✗ | ✗ | ~ metadata | ✗ (SDK) | ✗ needs LLM + embedder keys | ✗ |
@@ -238,7 +249,7 @@ so connections that never earn a confirmation decay and prune away.
 
 ## Honest limitations
 
-- Recall is lexical + graph-structural + a curated **concept seed** (~90
+- Recall is lexical + graph-structural + a curated **concept seed** (83
   unambiguous tool→category mappings: tailwind→css, hetzner→cloud,
   sentry→errors...). Cross-domain synonymy *outside* that seed and the
   corpus still misses; polysemous words (black, express, spring...) are
@@ -259,6 +270,11 @@ so connections that never earn a confirmation decay and prune away.
 - Tokens shorter than 3 characters (`db`, `ai`, `os`) are not indexed —
   write them out once ("database", "openai") and the co-occurrence index
   bridges the rest.
+- Timestamps are naive local time compared lexicographically (ISO). On a
+  single machine this is exact; syncing one `.mind/` across machines in
+  different time zones can skew validity ordering by the zone offset.
+- Node ids are `md5[:12]` of the text — content addressing only; no
+  security property is (or should be) derived from them.
 - A fact recalled fewer than twice and untouched for longer than the 45-day
   grace window decays out of the graph (into the archive). Facts you need
   less often than ~every six weeks should live in cortex notes, not the
@@ -278,13 +294,17 @@ nothing else to configure. A ready-made Hermes skill lives in
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 134 tests
+python3 -m unittest discover -s tests   # 158 tests
 python3 bench/bench.py                  # reproduce the EN/AR numbers
 python3 bench/multilang.py              # 8 untuned languages
 python3 bench/soak.py                   # 180 simulated days
+python3 bench/discrim.py                # competing-distractor recall
 python3 bench/fuzz.py                   # 420 adversarial cases
 python3 bench/mutate.py                 # does the suite actually bite?
 ```
+
+Exit codes are a contract: `0` success (including "no results"),
+`1` runtime/library failure, `2` usage error.
 
 Design rationale: [docs/DESIGN.md](docs/DESIGN.md) ·
 Arabic README: [README.ar.md](README.ar.md) · License: MIT

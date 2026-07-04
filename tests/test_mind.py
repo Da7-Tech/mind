@@ -945,6 +945,10 @@ class TestAuditFindings2(TmpDirTest):
         src = (Path(__file__).resolve().parent.parent / "mind.py").read_text("utf-8")
         self.assertEqual(src.count("datetime.now()"), 1,
                          "only _now() may call datetime.now()")
+        for banned in ("datetime.today()", "date.today()", "time.time()",
+                       "utcnow(", "fromtimestamp("):
+            self.assertNotIn(banned, src,
+                             "%s bypasses the injectable clock" % banned)
 
     def test_correct_cleans_control_chars_and_hashes_like_remember(self):
         """correct() is a write path: it must apply the same control-char
@@ -1446,10 +1450,11 @@ class TestThirdAudit(TmpDirTest):
                  "parallel fact number %d" % i],
                 cwd=str(proj), stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE) for i in range(12)]
-            codes = [p.wait(timeout=60) for p in procs]
+            errs = [p.communicate(timeout=60)[1] for p in procs]
+            codes = [p.returncode for p in procs]
             self.assertEqual(codes, [0] * 12,
-                             [p.stderr.read().decode()[:200] for p in procs
-                              if p.returncode])
+                             [e.decode()[:200] for e, c in zip(errs, codes)
+                              if c])
             h = Hippocampus(proj / ".mind" / "graph.json")
             hits = sum(1 for n in h.nodes.values()
                        if "parallel fact" in n["text"])
@@ -1571,6 +1576,160 @@ class TestThirdAudit(TmpDirTest):
         self.assertIsNone(n["valid_to"])
         results, _, _ = h.recall("slash dated fact")
         self.assertTrue(results)
+
+
+# ───────── fourth-audit fixes (Opus/GLM/Codex reports, 6.1.0) ─────────
+class TestFourthAudit(TmpDirTest):
+    def test_identity_query_beats_pronoun_distractor_cross_script(self):
+        """Opus#1: an Arabic identity query must find an ENGLISH name fact
+        over an Arabic distractor that merely contains a pronoun."""
+        h = self.hippo()
+        h.remember("my name is khaled from riyadh")
+        h.remember("اعمل على تحسين الاداء في المشروع")
+        r, _, _ = h.recall("ما اسمي")
+        self.assertTrue(r)
+        self.assertIn("khaled", r[0][2]["text"])
+
+    def test_identity_query_beats_name_noun_distractors(self):
+        """GLM#1: facts that merely CONTAIN "name" must not outrank the
+        user's actual name on identity queries."""
+        h = self.hippo()
+        h.remember("file name must match the class name")
+        h.remember("the env var name is DATABASE_URL")
+        h.remember("my name is khaled and I live in riyadh")
+        r, _, _ = h.recall("what is my name")
+        self.assertTrue(r)
+        self.assertIn("khaled", r[0][2]["text"])
+
+    def test_arabic_identity_beats_arabic_noun_distractor(self):
+        h = self.hippo()
+        h.remember("اسم الملف يجب ان يطابق اسم الصنف")
+        h.remember("اسمي داحم وأعمل من الرياض")
+        r, _, _ = h.recall("ما اسمي")
+        self.assertTrue(r)
+        self.assertIn("داحم", r[0][2]["text"])
+
+    def test_stored_fact_with_name_noun_gets_no_identity_keys(self):
+        h = self.hippo()
+        nid = h.remember("file name must match the class name")
+        self.assertFalse(set(h.nodes[nid]["keys"]) & {"user", "city",
+                                                      "المستخدم", "المدينة"})
+        nid2 = h.remember("my name is khaled")
+        self.assertTrue(set(h.nodes[nid2]["keys"]) & M.IDENTITY_KEYS)
+
+    def test_concurrent_field_update_not_lost(self):
+        """GLM#2: a bump in process A must survive an unrelated remember
+        in process B (dirty-node merge, not whole-graph clobber)."""
+        g = self.mind_dir / "graph.json"
+        h1 = Hippocampus(g)
+        nid = h1.remember("shared fact alpha")
+        h2 = Hippocampus(g)              # loads the stale copy
+        h1.bump([nid])                   # disk: access_count = 1
+        h2.remember("completely different beta")
+        h3 = Hippocampus(g)
+        self.assertEqual(h3.nodes[nid]["access_count"], 1,
+                         "the confirmation must not be silently erased")
+
+    def test_arabic_stem_dict_before_prefix_strip(self):
+        """GLM#3: كلمة/كلمات must unify (the ك is a root letter, not a
+        prefix)."""
+        self.assertEqual(stem("كلمة"), "كلم")
+        self.assertEqual(stem("كلمات"), "كلم")
+        self.assertEqual(stem("وظيفة"), stem("وظائف"))
+        self.assertEqual(stem("رسالة"), stem("رسائل"))
+
+    def test_short_token_memory_is_recallable(self):
+        """Opus#2: "db ai os" must not become an unreachable black hole."""
+        h = self.hippo()
+        nid = h.remember("db ai os")
+        self.assertTrue(h.nodes[nid]["keys"])
+        r, _, _ = h.recall("db ai os")
+        self.assertTrue(r)
+        self.assertEqual(r[0][0], nid)
+
+    def test_oversized_text_capped_on_load(self):
+        """GLM#4: the write-path cap must hold on the load path too."""
+        g = self.mind_dir / "graph.json"
+        g.write_text(json.dumps({"nodes": {"aaa": {
+            "text": "x" * 50000, "created": "2026-01-01T00:00:00"}},
+            "edges": {}}), "utf-8")
+        h = Hippocampus(g)
+        self.assertLessEqual(len(h.nodes["aaa"]["text"]), M.MAX_TEXT_CHARS)
+
+    def test_bidi_override_stripped(self):
+        """GLM#6: RTL-override characters must never reach agent files."""
+        h = self.hippo()
+        nid = h.remember("safe\u202egnp.txt file fact")
+        self.assertNotIn("\u202e", h.nodes[nid]["text"])
+
+    def test_quarantine_names_unique_same_second(self):
+        """Codex: two corruptions in one second must both be preserved."""
+        g = self.mind_dir / "graph.json"
+        g.write_text("{bad", "utf-8"); Hippocampus(g)
+        g.write_text("{bad2", "utf-8"); Hippocampus(g)
+        self.assertEqual(len(list(self.mind_dir.glob(
+            "graph.json.corrupt-*"))), 2)
+
+    def test_why_answers_from_journal_after_prune(self):
+        """Codex: provenance must outlive the graph — `why` falls back to
+        the permanent journal for pruned ids."""
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            import io
+            from contextlib import redirect_stdout, redirect_stderr
+            def run(*args):
+                out, err = io.StringIO(), io.StringIO()
+                try:
+                    with redirect_stdout(out), redirect_stderr(err):
+                        code = M.main(list(args))
+                except SystemExit as e:
+                    code = e.code
+                return code, out.getvalue()
+            run("init")
+            run("remember", "the region is eu-west one")
+            run("correct", "region eu-west", "the region is me-central one")
+            h = Hippocampus(self.tmp / ".mind" / "graph.json")
+            old = h._id("the region is eu-west one")
+            h.nodes[old]["valid_to"] = (
+                datetime.now() - timedelta(days=60)).isoformat()
+            h._dirty.add(old)      # direct mutation → mark for the merge
+            h.decay()
+            self.assertNotIn(old, h.nodes)
+            code, out = run("why", old)
+            self.assertEqual(code, 0)
+            self.assertIn("PRUNED", out)
+            self.assertIn("eu-west", out)
+        finally:
+            os.chdir(cwd)
+
+    def test_boundary_containment_enforced(self):
+        """GLM#8: a path entirely outside the boundary must be refused,
+        not silently passed."""
+        outside = Path(tempfile.mkdtemp()) / "x.txt"
+        with self.assertRaises(ValueError):
+            M._reject_symlinked_parents(outside, self.mind_dir)
+
+    def test_archive_appends_not_rewrites(self):
+        """GLM#9: the archive must grow by appending."""
+        h = self.hippo()
+        nid = h.remember("first pruned trivia note")
+        h.nodes[nid]["last_accessed"] = (
+            datetime.now() - timedelta(days=50)).isoformat()
+        h.nodes[nid]["created"] = h.nodes[nid]["last_accessed"]
+        h.decay()
+        arch = self.mind_dir / "archive.md"
+        first = arch.read_text("utf-8")
+        self.assertIn("first pruned", first)
+        nid2 = h.remember("second pruned trivia note")
+        h.nodes[nid2]["last_accessed"] = (
+            datetime.now() - timedelta(days=50)).isoformat()
+        h.nodes[nid2]["created"] = h.nodes[nid2]["last_accessed"]
+        h.decay()
+        both = arch.read_text("utf-8")
+        self.assertIn("first pruned", both)
+        self.assertIn("second pruned", both)
+        self.assertEqual(both.count("# mind archive"), 1)
 
 
 # ──────────────── mutation-testing kills (bench/mutate.py) ────────────────

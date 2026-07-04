@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.0.2"
+__version__ = "6.1.0"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -95,8 +95,13 @@ def _reject_symlinked_parents(path, boundary):
         if p == boundary:
             break
         parent = os.path.dirname(p)
-        if parent == p:            # reached filesystem root without hitting boundary
-            break
+        if parent == p:
+            # reached filesystem root WITHOUT crossing the boundary: the
+            # path is not inside the trust boundary at all — refuse
+            # instead of silently passing (auditor finding: the boundary
+            # argument promised a containment check it never performed)
+            raise ValueError("path %s escapes the trust boundary %s"
+                             % (path, boundary))
         p = parent
 
 
@@ -136,6 +141,19 @@ def _atomic_write(path, data, boundary=None):
             if os.name != "nt" or attempt == 39:
                 raise
             time.sleep(0.025)
+    # full durability: fsync the DIRECTORY too, or the rename itself can
+    # be lost on power failure (auditor finding — the docs promised more
+    # than fsync-the-file delivers). Windows has no dir-fsync; skip.
+    if os.name != "nt":
+        try:
+            dfd = os.open(os.path.dirname(os.path.abspath(str(path))) or ".",
+                          os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
 
 
 # ────────────────────────────────────────────────────────────────
@@ -193,6 +211,8 @@ STOPWORDS = frozenset({
     "have", "has", "are", "was", "were", "not", "but", "you", "all", "can",
     "her", "him", "his", "she", "they", "them", "our", "out", "use", "using",
     "used", "what", "when", "where", "which", "who", "why", "how",
+    "is", "be", "been", "being", "does", "did", "will", "its", "it",
+    "my", "our", "your", "their",
     # Arabic
     "من", "على", "في", "الى", "إلى", "التي", "التى", "الذي", "الذى", "هذا",
     "هذه", "عند", "قد", "ماذا", "اي", "أي", "لماذا", "كيف", "ما", "عن", "مع",
@@ -299,6 +319,18 @@ PRONOUN_FALLBACK = {
 }
 IDENTITY_KEYS = {"user", "project", "city", "name", "المستخدم", "المشروع",
                  "المدينة", "الاسم"}
+# Storage-side identity trigger (6.1.0): a STORED fact earns identity keys
+# only for explicit first-person identity statements — a fact that merely
+# CONTAINS "name" or "اعمل" must not (auditor finding: "file name must
+# match the class name" outranked the user's actual name on identity
+# queries, and an Arabic distractor with a bare pronoun beat an English
+# name fact). Queries keep the broad PRONOUN_FALLBACK behavior.
+_IDENT_POSSESSIVE = {"اسمي", "اسمنا", "مدينتي", "مدينتنا", "مشروعي",
+                     "مشروعنا", "عملي", "myself"}
+_IDENT_FIRST_PERSON = {"my", "our", "انا", "أنا", "نحن", "اني", "أني",
+                       "انني", "إني"}
+_IDENT_NOUNS = {"name", "project", "city", "team", "company", "اسم",
+                "الاسم", "مشروع", "المشروع", "مدينة", "المدينة"}
 
 _AR_SUFFIXES = ("تها", "تهن", "تنا", "تهم", "ية", "ون", "ين", "ان",
                 "ات", "ها", "هن", "هم", "نا", "ة", "ي", "ت", "ن")
@@ -314,6 +346,8 @@ _BROKEN_PLURALS = {
     "مشاريع": "مشروع", "ملفات": "ملف", "وكلاء": "وكيل", "خبراء": "خبير",
     "قرارات": "قرار", "روابط": "رابط", "بيانات": "بيان", "حروف": "حرف",
     "كلمات": "كلم", "عقد": "عقد", "نماذج": "نموذج",
+    "وظيفة": "وظيف", "وظائف": "وظيف", "رسالة": "رسال", "رسائل": "رسال",
+    "جدول": "جدول", "جداول": "جدول",
 }
 
 
@@ -321,6 +355,11 @@ def stem(w):
     """Light bilingual stemmer. Arabic: prefix/suffix stripping + broken-plural
     seed dictionary. English: common suffix stripping."""
     if w and "؀" <= w[0] <= "ۿ":  # Arabic
+        # full-word broken-plural lookup FIRST: stripping a "prefix" that
+        # is actually the first ROOT letter (كلمة -> لمة) used to bypass
+        # the dictionary entirely (auditor finding)
+        if w in _BROKEN_PLURALS:
+            return _BROKEN_PLURALS[w]
         s = w
         for p in _AR_PREFIXES:
             if s.startswith(p) and len(s) - len(p) >= 3:
@@ -541,6 +580,11 @@ class Hippocampus:
         self.related = None
         self.embedder = HashEmbed()
         self._deleted = set()   # node ids deleted this session (see _save merge)
+        self._dirty = set()     # node ids THIS session actually modified:
+        #   the merge overwrites the disk only with these — untouched
+        #   stale copies used to clobber another process's confirmations
+        #   (auditor finding: bump in process A, unrelated remember in
+        #   process B → A's access_count silently reset)
         self._pruned_edges = set()  # (a, b) edge pairs pruned this session:
         #   without this, an edge decayed to empty and removed from
         #   self.edges is silently REVIVED from disk by the read-merge-write
@@ -551,7 +595,8 @@ class Hippocampus:
     def _quarantine(self, reason):
         """Never silently erase a user's memory: quarantine and start fresh."""
         bak = self.path.with_suffix(
-            ".json.corrupt-%s" % _now().strftime("%H%M%S"))
+            ".json.corrupt-%s-%d" % (_now().strftime("%H%M%S%f"),
+                                     os.getpid()))
         try:
             self.path.rename(bak)
             print("warning: could not read %s (%s).\n"
@@ -641,9 +686,14 @@ class Hippocampus:
             raw_keys = n.get("keys", [])
             if not isinstance(raw_keys, list):
                 raw_keys = []
-            n["keys"] = [re.sub(r'[،؛؟!."\']', '', k).strip()
+            n["keys"] = [re.sub(r'[،؛؟!."\']', '', k).strip()[:100]
                          for k in raw_keys if isinstance(k, str)]
-            n["keys"] = [k for k in n["keys"] if k]
+            n["keys"] = [k for k in n["keys"] if k][:24]
+            # the write-path text cap must hold on the LOAD path too — a
+            # synced/hand-edited graph with one 100MB node used to defeat
+            # it entirely (auditor finding)
+            if len(n["text"]) > MAX_TEXT_CHARS:
+                n["text"] = n["text"][:MAX_TEXT_CHARS]
             out[nid] = n
         return out
 
@@ -719,12 +769,18 @@ class Hippocampus:
                     # OSError — so a save contended for >10s would crash the
                     # very scenario the lock exists for. Keep waiting instead,
                     # exactly like the POSIX path.
-                    while True:
-                        try:
+                    for _attempt in range(18):   # ~3 min: LK_LOCK waits
+                        try:                        # ~10s per call
                             msvcrt.locking(lockf.fileno(), msvcrt.LK_LOCK, 1)
                             break
                         except OSError:
-                            continue
+                            continue                # keep waiting, bounded
+                    else:
+                        # a hung (alive but frozen) holder must not
+                        # livelock us forever (auditor finding)
+                        raise ValueError("could not acquire the graph lock "
+                                         "after ~3 minutes — is another "
+                                         "process hung?")
                     lock_backend = ("msvcrt", msvcrt)
             try:
                 if self.path.exists():
@@ -747,7 +803,14 @@ class Hippocampus:
                         merged_n = {k: v
                                     for k, v in self._repair_nodes(dn).items()
                                     if k not in self._deleted}
-                        merged_n.update(self.nodes)
+                        # field-freshness: only nodes this session touched
+                        # overwrite the disk copy; for everything else the
+                        # DISK is fresher (auditor finding)
+                        for k in self._dirty:
+                            if k in self.nodes:
+                                merged_n[k] = self.nodes[k]
+                        for k, v in self.nodes.items():
+                            merged_n.setdefault(k, v)
                         # Build the merged edges from the DISK copy, stripping
                         # both deleted nodes and edges this process pruned,
                         # THEN apply our live edges. Order matters: pruned
@@ -776,6 +839,7 @@ class Hippocampus:
                 # subsequent op had recreated)
                 self._deleted.clear()
                 self._pruned_edges.clear()
+                self._dirty.clear()
             finally:
                 if lock_backend is not None:
                     name, module = lock_backend
@@ -833,12 +897,32 @@ class Hippocampus:
             for cat in CONCEPT_SEED.get(t, ()):
                 keys.setdefault(cat)
         text_tokens = set(re.findall(r'[\w؀-ۿ]+', cleaned.lower()))
-        if text_tokens & PRONOUN_FALLBACK or (is_query and len(keys) == 0):
+        # zero-key black hole (auditor finding): text made entirely of
+        # short tokens ("db ai os") used to be stored unreachable — fall
+        # back to indexing the short tokens themselves
+        if not keys:
+            for t in sorted(text_tokens):
+                if len(t) >= 2 and t not in STOPWORDS:
+                    keys.setdefault(t)
+        if is_query:
+            if text_tokens & PRONOUN_FALLBACK or len(keys) == 0:
+                for k in sorted(IDENTITY_KEYS):
+                    keys.setdefault(k)
+        elif (text_tokens & _IDENT_POSSESSIVE) or \
+                (text_tokens & _IDENT_FIRST_PERSON
+                 and text_tokens & _IDENT_NOUNS):
             for k in sorted(IDENTITY_KEYS):
                 keys.setdefault(k)
         self._ensure_related()
         if self.related is not None:
             for w in list(keys):
+                # expand RARE terms only: a term already frequent in the
+                # corpus has direct hits, and expanding it just smears its
+                # neighbours' vocabulary onto unrelated facts (auditor
+                # finding: "name" imported the distractors' keys onto the
+                # user's real name fact and onto identity queries)
+                if self.related.df.get(stem(w.lower()), 0) >= 2:
+                    continue
                 for term, sc in self.related.related(w, top_k=4):
                     if sc >= 0.15:
                         keys.setdefault(term)
@@ -851,7 +935,8 @@ class Hippocampus:
         remember and link so their node ids agree (auditor finding: link
         hashed the raw text while remember hashed the cleaned text, creating
         a phantom edge that the dangling-edge filter then silently dropped)."""
-        return re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text or "").strip()
+        return re.sub(u"[\x00-\x08\x0b-\x1f\x7f\u202a-\u202e\u2066-\u2069]",
+                      "", text or "").strip()
 
     # -- write path ---------------------------------------------------
     def remember(self, text, confidence=1.0):
@@ -874,6 +959,7 @@ class Hippocampus:
             n["access_count"] = n.get("access_count", 0) + 1
             n["last_accessed"] = now
             n["confidence"] = max(n.get("confidence", 1.0), confidence)
+            self._dirty.add(nid)
             # a re-remembered superseded fact is an explicit re-assertion:
             # the user says it IS true again — reopen a NEW validity
             # segment starting now (the closed segment stays queryable in
@@ -901,6 +987,7 @@ class Hippocampus:
                 "valid_to": None,
             }
             self.edges.setdefault(nid, {})
+            self._dirty.add(nid)
             self.related = None    # rebuild lazily; avoids O(N^2) per write
         self._save()
         # journal AFTER the save: the provenance log records only facts
@@ -1031,6 +1118,8 @@ class Hippocampus:
         # never conflated with attention decay
         node["valid_to"] = now
         node["superseded_by"] = new_nid
+        self._dirty.add(nid)
+        self._dirty.add(new_nid)
         self.related = None
         self._save()
         self._journal("correct", old_id=nid, new_id=new_nid,
@@ -1052,12 +1141,23 @@ class Hippocampus:
         (`why`, `entity`, `recall --at <date>`) but are never returned
         as current answers."""
         t0 = time.perf_counter()
+        q_tokens = set(re.findall(r"[\w؀-ۿ]+", query.lower()))
+        # a PURE identity question ("what is my name") carries a pronoun
+        # and essentially no content terms; "أين الخادم الرئيسي" carries a
+        # pronoun AND real content — only the former skips the rerank
+        q_content = {t for t in q_tokens
+                     if len(t) >= 3 and t not in STOPWORDS
+                     and t not in PRONOUN_FALLBACK
+                     and t not in IDENTITY_KEYS}
+        identity_q = bool(q_tokens & PRONOUN_FALLBACK) and len(q_content) <= 1
         keys = set(self._extract_keys(query, is_query=True))
         if not keys:
             return [], 0.0, {}
         expanded = set(keys)
         if self.related is not None:
             for w in list(keys):
+                if self.related.df.get(stem(w.lower()), 0) >= 2:
+                    continue                     # same rare-term-only rule
                 for term, _ in self.related.related(w, top_k=4):
                     expanded.add(term)
         keys = expanded
@@ -1136,11 +1236,15 @@ class Hippocampus:
         # drop them instead of raising.
         fused = {nid: s for nid, s in fused.items() if nid in alive}
         ranked = sorted(fused.items(), key=lambda x: -x[1])
-        if len(ranked) > 1:
+        # identity questions ("what is my name") are decided by lexical
+        # identity evidence; the char-gram rerank favors token repetition
+        # ("file name ... class name") and must sit this one out
+        # (auditor finding)
+        if len(ranked) > 1 and not identity_q:
             reranked = []
             for nid, base in ranked[:top_k * 3]:
                 sim = self.embedder.similarity(query, self.nodes[nid]["text"])
-                reranked.append((nid, base + sim * 0.5))
+                reranked.append((nid, base * (1.0 + sim)))
             reranked.sort(key=lambda x: -x[1])
             ranked = reranked
 
@@ -1184,6 +1288,7 @@ class Hippocampus:
                     rev = self.edges.get(nbr, {}).get(nid)
                     if rev is not None:
                         rev["weight"] = e["weight"]
+                self._dirty.add(nid)
                 changed = True
         if changed:
             self._save()
@@ -1238,6 +1343,7 @@ class Hippocampus:
             new_weight = max(0.0, min(1.0, n.get("peak_weight", 1.0) * retention))
             if not dry_run:
                 n["weight"] = new_weight
+                self._dirty.add(nid)
             if new_weight < WEIGHT_THRESHOLD and access < 2 and days > GRACE_DAYS:
                 pruned.append((nid, n["text"]))
         if dry_run:
@@ -1274,11 +1380,21 @@ class Hippocampus:
             return False
         lines = ["\n## forgotten on %s\n" % now.date()]
         lines += ["- %s" % t for t in texts]
-        prev = arch.read_text("utf-8") if arch.exists() else \
+        header = "" if arch.exists() else \
             "# mind archive — memories pruned by decay (restore with `remember`)\n"
+        # APPEND, don't rewrite: the archive only grows, and rewriting the
+        # whole file per prune batch is O(archive) forever (auditor
+        # finding). Same trust-boundary checks as every other write.
         try:
-            _atomic_write(arch, prev + "\n".join(lines) + "\n",
-                          boundary=self.path.parent)
+            _reject_symlinked_parents(arch, self.path.parent)
+            fd = os.open(str(arch),
+                         os.O_WRONLY | os.O_CREAT | os.O_APPEND |
+                         getattr(os, "O_NOFOLLOW", 0), 0o644)
+            try:
+                os.write(fd, (header + "\n".join(lines) + "\n")
+                         .encode("utf-8"))
+            finally:
+                os.close(fd)
         except (OSError, ValueError):
             return False
         return True
@@ -1342,13 +1458,24 @@ class Hippocampus:
             print("warning: journal.jsonl not writable (%s); provenance "
                   "entry lost." % e, file=sys.stderr)
 
-    def journal_entries(self, node_id=None):
-        """Read the provenance log, optionally filtered to one node."""
+    def journal_entries(self, node_id=None, tail_bytes=10_000_000):
+        """Read the provenance log, optionally filtered to one node.
+        The log is append-only and never cleared, so reads are capped to
+        the last `tail_bytes` (10MB ≈ years of normal use) — `why` and
+        `status` must not O(file) forever (auditor finding)."""
         jf = self.path.parent / JOURNAL_FILE
         if not jf.exists():
             return []
+        size = jf.stat().st_size
+        with jf.open("rb") as f:
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()                    # skip the partial line
+                print("note: journal is %.1f MB; reading the last 10 MB."
+                      % (size / 1e6), file=sys.stderr)
+            data = f.read().decode("utf-8", "replace")
         out = []
-        for line in jf.read_text("utf-8").splitlines():
+        for line in data.splitlines():
             try:
                 e = json.loads(line)
             except json.JSONDecodeError:
@@ -1876,9 +2003,26 @@ between sessions:  python3 mind.py dream""" % self.dir)
         self._ensure()
         n = self.hippo.nodes.get(nid)
         if n is None:
-            print("unknown id: %s (get ids from `recall` or `entity`)" % nid,
-                  file=sys.stderr)
-            sys.exit(1)
+            # the fact may have been pruned from the graph — the journal
+            # is permanent, so provenance must still answer (auditor
+            # finding: the docs promised lineage the command refused)
+            events = self.hippo.journal_entries(nid)
+            if not events:
+                print("unknown id: %s (get ids from `recall` or `entity`)"
+                      % nid, file=sys.stderr)
+                sys.exit(1)
+            print("memory %s" % nid)
+            print("  status:     PRUNED from the graph — journal lineage:")
+            for e in events:
+                extra = ""
+                for f in ("text", "old_text", "new_text"):
+                    if e.get(f):
+                        extra = "  %s" % e[f][:70]
+                        break
+                print("    %s %s by=%s%s" % (e.get("ts", "?")[:19],
+                                             e.get("op"),
+                                             e.get("by", "?"), extra))
+            return
         origin = n.get("origin", {})
         vt = n.get("valid_to")
         print("memory %s" % nid)
@@ -1982,12 +2126,14 @@ between sessions:  python3 mind.py dream""" % self.dir)
         n_edges = len({frozenset((a, b))
                        for a, nbrs in self.hippo.edges.items()
                        for b in nbrs})
-        avg_w = (sum(n["weight"] for n in self.hippo.nodes.values()) / n_nodes) if n_nodes else 0
+        avg_w = (sum(n["weight"] for n in self.hippo.nodes.values()
+                     if self.hippo._valid_at(n)) / n_valid) if n_valid else 0
         cortex_n = len(list(self.cortex.files()))
         active_size = (self.dir / ACTIVE_FILE).stat().st_size if (self.dir / ACTIVE_FILE).exists() else 0
         pending = 0
         sig = self.dir / SIGNALS_FILE
-        if sig.exists():
+        if sig.exists() and not sig.is_symlink() \
+                and sig.stat().st_size <= 5_000_000:
             pending = sum(1 for ln in sig.read_text("utf-8").splitlines() if ln.strip())
         journal_n = len(self.hippo.journal_entries())
         print("""=== mind memory health ===

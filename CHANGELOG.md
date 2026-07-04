@@ -1,5 +1,80 @@
 # Changelog
 
+## 6.1.0 — 2026-07-04
+
+The discrimination release. Three independent external audits (Opus, GLM,
+Codex) of 6.0.2 produced ~25 findings; every runnable claim was reproduced
+first, then fixed with a regression test — plus a new benchmark class so
+the deepest finding can never silently return.
+
+- **Identity-key pollution fixed** (both audits' #1): a stored fact that
+  merely CONTAINED "name"/"اعمل" inherited full identity keys and
+  outranked the user's actual name on "what is my name?" queries — in
+  both scripts. Stored facts now earn identity keys only for explicit
+  first-person identity statements; queries keep the broad fallback.
+  Three cross-script regression tests reproduce the audits' exact cases.
+- **Recall discrimination hardened**: co-occurrence expansion now applies
+  to RARE terms only (frequent terms have direct hits; expanding them
+  smeared distractor vocabulary onto unrelated facts), pure identity
+  questions skip the char-gram rerank (it rewards token repetition, e.g.
+  "file name … class name"), and missing basic stopwords (is/my/our/…)
+  were added. Head rerank recalibrated to `base × (1 + sim)` so fusion
+  rank keeps real weight.
+- **New `bench/discrim.py` (in CI, gate ≥ 0.85)**: recall@1 against
+  lexically COMPETING distractors — the thing the audits rightly said
+  1.00-on-clean-noise never measured. Current score 12/12.
+- **Concurrent field-freshness (GLM #2)**: the save merge now overwrites
+  the disk only with nodes THIS session actually touched — a stale
+  untouched copy in process B can no longer erase process A's
+  confirmation. Reproduced, fixed, regression-tested.
+- **Arabic stemmer (GLM #3)**: broken-plural dictionary is consulted on
+  the FULL word before prefix stripping — كلمة/كلمات unify again (the ك
+  is a root letter); dictionary extended (وظيفة/وظائف, رسالة/رسائل,
+  جدول/جداول).
+- **Short-token black hole (Opus #2)**: "db ai os" used to be stored
+  unreachable (zero keys); such texts now index their short tokens and
+  are recallable verbatim.
+- **Load-path caps (GLM #4)**: MAX_TEXT_CHARS and key-list caps are
+  enforced in `_repair_nodes` too — one oversized node in a synced
+  graph.json no longer defeats the write-path cap.
+- **`why` outlives the graph (Codex)**: for pruned ids it now answers
+  from the permanent journal (status PRUNED + full lineage) instead of
+  refusing.
+- **Durability completed (Codex)**: atomic writes fsync the destination
+  DIRECTORY after rename on POSIX (a rename alone can be lost on power
+  failure); quarantine filenames now carry microseconds + pid, so two
+  corruptions in the same second both survive.
+- **Bidi hardening (GLM #6)**: RTL/LTR override and isolate controls
+  (U+202A–E, U+2066–69) are stripped with the other control characters —
+  they could spoof text in the exported agent files.
+- **Bounded Windows lock wait (GLM #7)**: ~3 minutes, then a clear error
+  — a hung lock holder can no longer livelock writers forever.
+- **Boundary containment (GLM #8)**: the parent-symlink walk now REFUSES
+  a path that never crosses the trust boundary instead of silently
+  passing.
+- **Read-side guards (GLM #9)**: `status` applies the signals
+  symlink/size guard; the archive APPENDS (O_APPEND) instead of
+  rewriting itself per prune batch; journal reads are tail-capped at
+  10 MB with a note.
+- **Docs made exact**: Arabic install is pinned + integrity-checked like
+  English (it wasn't — worse security for Arabic readers, in the tool's
+  own words unacceptable); Arabic README got the comparison table,
+  discrimination section, and scope/limitation lines; test counts
+  unified (158); "420 fuzz cases" now says CI runs the 160-case quick
+  set; concept-seed count stated exactly (83); SECURITY.md references
+  real test classes; naive-local-time and md5-id limits documented; the
+  exit-code contract documented; the orphaned comparison image linked.
+- Suite hygiene: parallel-writer test closes its pipes (no more
+  ResourceWarnings); the injectable-clock test also bans
+  datetime.today()/time.time()/utcnow/fromtimestamp.
+- SKILL doctrine rewritten from field feedback: memory duty is
+  proactive (store 1–3 facts after every substantive task, unprompted),
+  keep a rolling "current focus" fact, never ask permission for
+  remember/confirm/dream/obvious housekeeping, dream daily AND at ≥ 10
+  pending signals, and query memory before claiming ignorance.
+- 158 tests.
+
+
 ## 6.0.2 — 2026-07-03
 
 - **Windows: atomic writes retry `os.replace` on `PermissionError`** —
