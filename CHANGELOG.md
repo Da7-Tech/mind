@@ -1,5 +1,17 @@
 # Changelog
 
+## 6.1.3 — 2026-07-04
+
+- **Windows: reads retry transient PermissionError too** — a reader that
+  opens graph.json in the instant another process is os.replace-ing it
+  gets a transient sharing violation on Windows. The write and lock
+  paths already retried; the unlocked read path (load + merge re-read)
+  now does as well — closing the third and last member of the same
+  sharing-violation family (windows-latest 3.9 CI caught 7/8 parallel
+  confirms). The parallel-confirm test now also asserts every process
+  exit code, so the next failure names its cause directly.
+
+
 ## 6.1.2 — 2026-07-04
 
 Second verification wave (two fresh independent verifiers). Wave-1 fixes

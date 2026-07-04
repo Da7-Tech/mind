@@ -1764,9 +1764,12 @@ class TestWaveTwo(TmpDirTest):
             procs = [subprocess.Popen(
                 [sys.executable, str(here), "confirm", nid],
                 cwd=str(proj), stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL) for _ in range(8)]
-            for pr in procs:
-                pr.wait(timeout=60)
+                stderr=subprocess.PIPE) for _ in range(8)]
+            errs = [pr.communicate(timeout=60)[1] for pr in procs]
+            codes = [pr.returncode for pr in procs]
+            self.assertEqual(codes, [0] * 8,
+                             [e.decode()[:150] for e, c in zip(errs, codes)
+                              if c])
             g = json.loads((proj / ".mind" / "graph.json").read_text("utf-8"))
             self.assertEqual(g["nodes"][nid]["access_count"], 8)
         finally:

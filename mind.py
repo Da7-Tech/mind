@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.1.2"
+__version__ = "6.1.3"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -103,6 +103,20 @@ def _reject_symlinked_parents(path, boundary):
             raise ValueError("path %s escapes the trust boundary %s"
                              % (path, boundary))
         p = parent
+
+
+def _read_text_retry(path):
+    """Read a file that a concurrent writer may be os.replace-ing this
+    very instant: Windows raises transient PermissionError to readers
+    during the swap (CI finding — third member of the same sharing
+    family, after the write and lock paths). POSIX never retries."""
+    for attempt in range(200):
+        try:
+            return Path(path).read_text("utf-8")
+        except PermissionError:
+            if os.name != "nt" or attempt == 199:
+                raise
+            time.sleep(0.05)
 
 
 def _atomic_write(path, data, boundary=None):
@@ -731,7 +745,7 @@ class Hippocampus:
         if not self.path.exists():
             return
         try:
-            data = json.loads(self.path.read_text("utf-8"))
+            data = json.loads(_read_text_retry(self.path))
             if not isinstance(data, dict):
                 raise ValueError("graph.json is not a JSON object")
             if not isinstance(data.get("nodes", {}), dict) or \
@@ -794,7 +808,7 @@ class Hippocampus:
             try:
                 if self.path.exists():
                     try:
-                        disk = json.loads(self.path.read_text("utf-8"))
+                        disk = json.loads(_read_text_retry(self.path))
                     except (json.JSONDecodeError, ValueError) as e:
                         # never silently overwrite a corrupt graph during a
                         # live save: quarantine it exactly like _load does

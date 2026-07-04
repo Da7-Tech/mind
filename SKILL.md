@@ -1,7 +1,7 @@
 ---
 name: mind
 description: Project memory graph with recall, provenance, and dreams.
-version: 6.1.2
+version: 6.1.3
 author: Da7 (Da7-Tech)
 license: MIT
 platforms: [linux, macos, windows]
@@ -46,8 +46,8 @@ tag and integrity-checked:
 
 ```bash
 cd <project>
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.2/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='0aed7ca21051251870cb3ac1ec0cce9d9447f64ab741b2c07b9f1cedea0e5775',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.3/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='27a40a5d44ea9b2fdce0eb18bb90bcbb885d98064e085cc2579cf3b16c18be97',h;print('mind.py: OK')"
 python3 mind.py init
 ```
 
@@ -123,7 +123,7 @@ their rule files synced too (adopted only when present).
 ## Verification
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.2/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='0aed7ca21051251870cb3ac1ec0cce9d9447f64ab741b2c07b9f1cedea0e5775',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
+cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.3/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='27a40a5d44ea9b2fdce0eb18bb90bcbb885d98064e085cc2579cf3b16c18be97',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
 ```
 
 Expected: one result containing `7413` with a printed memory id.
