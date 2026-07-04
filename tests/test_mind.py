@@ -1784,6 +1784,74 @@ class TestWaveTwo(TmpDirTest):
             self.assertIn("khaled", r[0][2]["text"])
 
 
+# ───────── wave-3 fixes (second verification wave, 6.1.2) ─────────
+class TestWaveThree(TmpDirTest):
+    B = "<!-- mind:memory begin (auto-generated, do not edit) -->"
+    E = "<!-- mind:memory end -->"
+
+    def _cli(self, *args):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        cwd = os.getcwd(); os.chdir(self.tmp)
+        try:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                try:
+                    return M.main(list(args))
+                except SystemExit as e:
+                    return e.code
+        finally:
+            os.chdir(cwd)
+
+    def test_confirm_racing_decay_not_lost(self):
+        """Wave-2 finding: dream's decay used to whole-copy a stale node
+        over a concurrent confirm — 20/25 trials lost the increment."""
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        nid = h0.remember("race target fact for decay")
+        for _ in range(5):
+            h0.bump([nid])                    # disk: access = 5
+        h1 = Hippocampus(g)
+        h2 = Hippocampus(g)                   # dreamer with a stale copy
+        h1.bump([nid])                        # disk: 6
+        h2.decay()                            # must not clobber back to 5
+        h3 = Hippocampus(g)
+        self.assertEqual(h3.nodes[nid]["access_count"], 6)
+
+    def test_export_preserves_user_quoted_markers(self):
+        """Wave-2 F1: a user file that QUOTES the guard-marker syntax in a
+        fence must keep every line of it."""
+        self._cli("init"); self._cli("remember", "x fact")
+        (self.tmp / "CLAUDE.md").write_text(
+            "# my rules\n```\n%s\nIMPORTANT_USER_RULE: never deploy\n%s\n"
+            "```\nEND_OF_GUIDE\n" % (self.B, self.E), "utf-8")
+        self._cli("export"); self._cli("export")
+        c = (self.tmp / "CLAUDE.md").read_text("utf-8")
+        self.assertIn("IMPORTANT_USER_RULE", c)
+        self.assertIn("END_OF_GUIDE", c)
+
+    def test_export_preserves_lone_end_marker_file(self):
+        """Wave-2 F2: a user file consisting of the END marker must
+        survive TWO exports."""
+        self._cli("init"); self._cli("remember", "x fact")
+        (self.tmp / "GEMINI.md").write_text(self.E + "\n", "utf-8")
+        self._cli("export"); self._cli("export")
+        g = (self.tmp / "GEMINI.md").read_text("utf-8")
+        self.assertGreaterEqual(g.count(self.E), 2,
+                                "the user's own END marker was destroyed")
+
+    def test_export_preserves_text_between_marker_like_blocks(self):
+        """Wave-2 F3: text between two user marker-like blocks (that are
+        NOT ours — no ACTIVE header) must survive."""
+        self._cli("init"); self._cli("remember", "x fact")
+        (self.tmp / "AGENTS.md").write_text(
+            "HEAD\n%s\nstale1\n%s\nMIDDLE user text\n%s\nstale2\n%s\nTAIL\n"
+            % (self.B, self.E, self.B, self.E), "utf-8")
+        self._cli("export")
+        a = (self.tmp / "AGENTS.md").read_text("utf-8")
+        for piece in ("HEAD", "MIDDLE user text", "TAIL"):
+            self.assertIn(piece, a)
+
+
 # ──────────────── mutation-testing kills (bench/mutate.py) ────────────────
 class TestMutationKills(TmpDirTest):
     """Each test kills one or more surviving mutants from bench/mutate.py —

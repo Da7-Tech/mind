@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.1.1"
+__version__ = "6.1.2"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -133,14 +133,14 @@ def _atomic_write(path, data, boundary=None):
     # grant FILE_SHARE_DELETE). Readers are short-lived — retry briefly
     # (CI finding: 1/12 parallel writers lost this race on
     # windows-latest; POSIX never enters the loop).
-    for attempt in range(40):
+    for attempt in range(200):
         try:
             os.replace(tmp, str(path))
             break
         except PermissionError:
-            if os.name != "nt" or attempt == 39:
+            if os.name != "nt" or attempt == 199:
                 raise
-            time.sleep(0.025)
+            time.sleep(0.05)
     # full durability: fsync the DIRECTORY too, or the rename itself can
     # be lost on power failure (auditor finding — the docs promised more
     # than fsync-the-file delivers). Windows has no dir-fsync; skip.
@@ -580,6 +580,10 @@ class Hippocampus:
         self.related = None
         self.embedder = HashEmbed()
         self._deleted = set()   # node ids deleted this session (see _save merge)
+        self._decayed = {}      # nid -> decayed weight this session: decay
+        #   touches ONLY salience, so it must never whole-copy a node over
+        #   a concurrent confirm's fresh counters (auditor finding, wave 2:
+        #   confirm racing dream lost the increment in 20/25 trials)
         self._bumped = {}       # nid -> reinforcement delta this session:
         #   applied ON TOP of the fresh disk copy inside the locked merge,
         #   so two processes confirming the same fact both count (auditor
@@ -833,6 +837,16 @@ class Hippocampus:
                                 self._finite(n.get("peak_weight", 1.0),
                                              1.0, 0.0, 1.0), n["weight"])
                             n["last_accessed"] = now_iso
+                        # decay updates: salience only, on the fresh copy —
+                        # min() because decay never raises a weight, and a
+                        # concurrent confirm's boost must win the tie
+                        for k, w in self._decayed.items():
+                            n = merged_n.get(k)
+                            if n is None or k in self._dirty \
+                                    or k in self._bumped:
+                                continue
+                            n["weight"] = min(self._finite(
+                                n.get("weight", 1.0), 1.0, 0.0, 1.0), w)
                         # Build the merged edges from the DISK copy, stripping
                         # both deleted nodes and edges this process pruned,
                         # THEN apply our live edges. Order matters: pruned
@@ -863,6 +877,7 @@ class Hippocampus:
                 self._pruned_edges.clear()
                 self._dirty.clear()
                 self._bumped.clear()
+                self._decayed.clear()
             finally:
                 if lock_backend is not None:
                     name, module = lock_backend
@@ -1371,7 +1386,7 @@ class Hippocampus:
             new_weight = max(0.0, min(1.0, n.get("peak_weight", 1.0) * retention))
             if not dry_run:
                 n["weight"] = new_weight
-                self._dirty.add(nid)
+                self._decayed[nid] = new_weight
             if new_weight < WEIGHT_THRESHOLD and access < 2 and days > GRACE_DAYS:
                 pruned.append((nid, n["text"]))
         if dry_run:
@@ -1869,9 +1884,23 @@ class Active:
             user_content = ""
             if tpath.exists():
                 content = tpath.read_text("utf-8")
-                if self.BEGIN in content:
-                    before = content.split(self.BEGIN)[0]
-                    after = content.split(self.END)[-1] if self.END in content else ""
+                # OUR block is identified structurally (BEGIN marker whose
+                # body starts with our exact generated header), never by a
+                # bare marker string: users legitimately quote the marker
+                # syntax in fenced docs, and split-on-first/last silently
+                # destroyed everything in between (auditor finding, wave 2)
+                ours = -1
+                idx = content.find(self.BEGIN)
+                while idx != -1:
+                    body = content[idx + len(self.BEGIN):].lstrip("\n")
+                    if body.startswith("# ACTIVE.md — mind working memory"):
+                        ours = idx
+                        break
+                    idx = content.find(self.BEGIN, idx + 1)
+                if ours != -1:
+                    j = content.find(self.END, ours)
+                    before = content[:ours]
+                    after = (content[j + len(self.END):] if j != -1 else "")
                     user_content = (before + after).strip()
                     # strip our own separator artifacts so re-export is idempotent
                     user_content = re.sub(

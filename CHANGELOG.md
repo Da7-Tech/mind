@@ -1,5 +1,31 @@
 # Changelog
 
+## 6.1.2 — 2026-07-04
+
+Second verification wave (two fresh independent verifiers). Wave-1 fixes
+held under 5× stress reruns; two new findings, both fixed same-day:
+
+- **Confirm racing dream no longer loses the increment** (reproduced
+  20/25 trials): decay only changes salience, so it now records
+  weight-only updates applied to the fresh disk copy (min-merge — a
+  concurrent confirm's boost wins the tie) instead of whole-copying a
+  stale node over concurrent counters.
+- **Export can no longer destroy user text that QUOTES the guard-marker
+  syntax** (three reproduced variants, worst: a CLAUDE.md documenting
+  mind itself lost its rules silently). Our block is now identified
+  structurally — a BEGIN marker whose body starts with the exact
+  generated ACTIVE header — never by bare marker strings; user-quoted
+  markers, a lone END-marker file, and text between marker-like blocks
+  all survive re-exports byte-for-byte (three regression tests).
+- Windows CI: the os.replace retry budget under contention raised
+  1s → 10s (one 3.9 runner starved with 12 parallel writers).
+- Also verified clean by the wave: --at boundary semantics (11 probes),
+  entity/why on 3-deep supersession chains, 30 dreams on a 500-node
+  graph (append-only journal, idempotent promotions, bounded conflict
+  edges, 0.3s max), and all suites/benches.
+- 165 tests.
+
+
 ## 6.1.1 — 2026-07-04
 
 First verification wave on 6.1.0 (three parallel independent verifiers:

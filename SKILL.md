@@ -1,7 +1,7 @@
 ---
 name: mind
 description: Project memory graph with recall, provenance, and dreams.
-version: 6.1.1
+version: 6.1.2
 author: Da7 (Da7-Tech)
 license: MIT
 platforms: [linux, macos, windows]
@@ -36,7 +36,7 @@ built-in `memory` tool — and it is not a RAG system for large corpora.
 
 - `python3` (3.9+) and `curl` on PATH — nothing else: no API keys, no
   server, no packages. The tool is one stdlib-only file, MIT-licensed,
-  from https://github.com/Da7-Tech/mind (161 tests + benchmarks incl. 10 languages + discrimination + fuzzer + 180-day
+  from https://github.com/Da7-Tech/mind (165 tests + benchmarks incl. 10 languages + discrimination + fuzzer + 180-day
   soak test run in its CI on Linux/macOS/Windows).
 
 ## How to Run
@@ -46,8 +46,8 @@ tag and integrity-checked:
 
 ```bash
 cd <project>
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.1/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='8d58eae04e422b24cb5e80fb9322008ed408df9e6b09b7b8076a50c0adb5101b',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.2/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='0aed7ca21051251870cb3ac1ec0cce9d9447f64ab741b2c07b9f1cedea0e5775',h;print('mind.py: OK')"
 python3 mind.py init
 ```
 
@@ -123,7 +123,7 @@ their rule files synced too (adopted only when present).
 ## Verification
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.1/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='8d58eae04e422b24cb5e80fb9322008ed408df9e6b09b7b8076a50c0adb5101b',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
+cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.2/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='0aed7ca21051251870cb3ac1ec0cce9d9447f64ab741b2c07b9f1cedea0e5775',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
 ```
 
 Expected: one result containing `7413` with a printed memory id.
