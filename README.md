@@ -23,8 +23,8 @@ adopted automatically by `.cursorrules`, `.windsurfrules`, `.clinerules`
 and `.roo/rules/mind.md` in projects that already use those tools.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.0/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='992548ea1d5e28b3d3fffaecfb5374cc30b55ab27b4a2c363755d70346e5ffa3',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.1/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='8d58eae04e422b24cb5e80fb9322008ed408df9e6b09b7b8076a50c0adb5101b',h;print('mind.py: OK')"
 python3 mind.py init
 python3 mind.py remember "the project database is postgres 16"
 python3 mind.py recall "which database do we use"
@@ -102,14 +102,14 @@ rounds had missed (see CHANGELOG 5.5.0).
 (flipped comparisons, broken arithmetic, nudged constants) and the suite
 must catch them. Its first run exposed 17 behaviors the tests didn't
 actually pin down — each is now locked by a dedicated regression test
-(raw kill rate went 33% → ~46% on a 120-mutant sample; the raw number is
+(raw kill rate went 33% → 43% on the seeded 120-mutant sample; the raw number is
 published because hiding it would be the exact sin this tool exists to
 catch).
 Surviving mutants are triaged in the tool's output: unreachable `get()`
 defaults, display-only constants, and ranking-calibration values guarded
 by the CI benchmark gate (recall@1 ≥ 0.9) rather than unit assertions.
 
-Test suite: **158 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **161 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, corrupt-graph recovery, and
 a mutation-kill class where every test pins a behavior the suite
@@ -294,7 +294,7 @@ nothing else to configure. A ready-made Hermes skill lives in
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 158 tests
+python3 -m unittest discover -s tests   # 161 tests
 python3 bench/bench.py                  # reproduce the EN/AR numbers
 python3 bench/multilang.py              # 8 untuned languages
 python3 bench/soak.py                   # 180 simulated days

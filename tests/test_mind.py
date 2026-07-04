@@ -1732,6 +1732,58 @@ class TestFourthAudit(TmpDirTest):
         self.assertEqual(both.count("# mind archive"), 1)
 
 
+# ───────── wave-2 adversarial findings (Opus prober, 6.1.1) ─────────
+class TestWaveTwo(TmpDirTest):
+    def test_concurrent_confirms_all_count(self):
+        """Two processes that both loaded access_count=N and both confirm
+        must land N+2, not N+1 — reinforcement deltas re-apply on the
+        fresh disk copy inside the locked merge."""
+        g = self.mind_dir / "graph.json"
+        h1 = Hippocampus(g)
+        nid = h1.remember("race condition target fact")
+        h2 = Hippocampus(g)              # both see access_count = 0
+        h1.bump([nid])
+        h2.bump([nid])
+        h3 = Hippocampus(g)
+        self.assertEqual(h3.nodes[nid]["access_count"], 2)
+        self.assertGreaterEqual(h3.nodes[nid]["weight"], 1.0 - 1e-9)
+
+    def test_parallel_cli_confirms_exact(self):
+        """8 parallel `confirm` subprocesses must all count (was 8→3-6)."""
+        import subprocess
+        here = Path(__file__).resolve().parent.parent / "mind.py"
+        proj = Path(tempfile.mkdtemp(prefix="mind-conf-"))
+        try:
+            subprocess.run([sys.executable, str(here), "init"],
+                           cwd=str(proj), capture_output=True, timeout=30)
+            subprocess.run([sys.executable, str(here), "remember",
+                            "the reinforcement target"],
+                           cwd=str(proj), capture_output=True, timeout=30)
+            g = json.loads((proj / ".mind" / "graph.json").read_text("utf-8"))
+            nid = next(iter(g["nodes"]))
+            procs = [subprocess.Popen(
+                [sys.executable, str(here), "confirm", nid],
+                cwd=str(proj), stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL) for _ in range(8)]
+            for pr in procs:
+                pr.wait(timeout=60)
+            g = json.loads((proj / ".mind" / "graph.json").read_text("utf-8"))
+            self.assertEqual(g["nodes"][nid]["access_count"], 8)
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+
+    def test_who_am_i_identity_phrasings(self):
+        """"who am I" (and friends) must reach the name fact — the
+        short-token fallback must not disarm the identity fallback."""
+        h = self.hippo()
+        h.remember("my name is khaled")
+        for q in ("who am I", "whoami", "what do I do",
+                  "tell me about myself", "من أنا"):
+            r, _, _ = h.recall(q)
+            self.assertTrue(r, "zero results for %r" % q)
+            self.assertIn("khaled", r[0][2]["text"])
+
+
 # ──────────────── mutation-testing kills (bench/mutate.py) ────────────────
 class TestMutationKills(TmpDirTest):
     """Each test kills one or more surviving mutants from bench/mutate.py —

@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.1.0"
+__version__ = "6.1.1"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -315,7 +315,7 @@ PRONOUN_FALLBACK = {
     "انا", "أنا", "انني", "أني", "اسمي", "اسمنا", "مدينتي", "مدينتنا",
     "مشروعي", "مشروعنا", "عملي", "اعمل", "أعمل", "اين", "أين", "ماذا",
     "مشروعه", "تعمل", "تعملون", "تعملين",
-    "name", "myself",
+    "name", "myself", "who", "whoami", "mine",
 }
 IDENTITY_KEYS = {"user", "project", "city", "name", "المستخدم", "المشروع",
                  "المدينة", "الاسم"}
@@ -580,6 +580,11 @@ class Hippocampus:
         self.related = None
         self.embedder = HashEmbed()
         self._deleted = set()   # node ids deleted this session (see _save merge)
+        self._bumped = {}       # nid -> reinforcement delta this session:
+        #   applied ON TOP of the fresh disk copy inside the locked merge,
+        #   so two processes confirming the same fact both count (auditor
+        #   finding: read-modify-write raced — 20 parallel confirms landed
+        #   as 8-14)
         self._dirty = set()     # node ids THIS session actually modified:
         #   the merge overwrites the disk only with these — untouched
         #   stale copies used to clobber another process's confirmations
@@ -654,7 +659,7 @@ class Hippocampus:
             n["weight"] = self._finite(n["weight"], 1.0, 0.0, 1.0)
             n["peak_weight"] = self._finite(n["peak_weight"], 1.0, 0.0, 1.0)
             n["confidence"] = self._finite(n["confidence"], 1.0, 0.0, 1.0)
-            n["access_count"] = self._finite(n["access_count"], 0, 0)
+            n["access_count"] = int(self._finite(n["access_count"], 0, 0))
             # history must be a list — correct() appends to it (fuzzer
             # finding: a scalar history crashed reconsolidation)
             if not isinstance(n.get("history", []), list):
@@ -811,6 +816,23 @@ class Hippocampus:
                                 merged_n[k] = self.nodes[k]
                         for k, v in self.nodes.items():
                             merged_n.setdefault(k, v)
+                        # reinforcement deltas: re-apply OUR confirms on
+                        # top of the freshest copy, so concurrent confirms
+                        # from other processes are added to, never raced
+                        now_iso = _now().isoformat()
+                        for k, d in self._bumped.items():
+                            n = merged_n.get(k)
+                            if n is None or k in self._dirty:
+                                continue   # dirty copy already includes it
+                            n["access_count"] = int(self._finite(
+                                n.get("access_count", 0), 0, 0)) + d
+                            n["weight"] = min(1.0, self._finite(
+                                n.get("weight", 1.0), 1.0, 0.0, 1.0)
+                                + BOOST_PER_ACCESS * d)
+                            n["peak_weight"] = max(
+                                self._finite(n.get("peak_weight", 1.0),
+                                             1.0, 0.0, 1.0), n["weight"])
+                            n["last_accessed"] = now_iso
                         # Build the merged edges from the DISK copy, stripping
                         # both deleted nodes and edges this process pruned,
                         # THEN apply our live edges. Order matters: pruned
@@ -840,6 +862,7 @@ class Hippocampus:
                 self._deleted.clear()
                 self._pruned_edges.clear()
                 self._dirty.clear()
+                self._bumped.clear()
             finally:
                 if lock_backend is not None:
                     name, module = lock_backend
@@ -899,13 +922,17 @@ class Hippocampus:
         text_tokens = set(re.findall(r'[\w؀-ۿ]+', cleaned.lower()))
         # zero-key black hole (auditor finding): text made entirely of
         # short tokens ("db ai os") used to be stored unreachable — fall
-        # back to indexing the short tokens themselves
+        # back to indexing the short tokens themselves. Remember whether
+        # any REAL content keys existed first: the short-token fallback
+        # must not disarm the identity fallback for queries like
+        # "who am I" (auditor finding, wave 2)
+        had_content = bool(keys)
         if not keys:
             for t in sorted(text_tokens):
                 if len(t) >= 2 and t not in STOPWORDS:
                     keys.setdefault(t)
         if is_query:
-            if text_tokens & PRONOUN_FALLBACK or len(keys) == 0:
+            if text_tokens & PRONOUN_FALLBACK or not had_content:
                 for k in sorted(IDENTITY_KEYS):
                     keys.setdefault(k)
         elif (text_tokens & _IDENT_POSSESSIVE) or \
@@ -959,7 +986,7 @@ class Hippocampus:
             n["access_count"] = n.get("access_count", 0) + 1
             n["last_accessed"] = now
             n["confidence"] = max(n.get("confidence", 1.0), confidence)
-            self._dirty.add(nid)
+            self._bumped[nid] = self._bumped.get(nid, 0) + 1
             # a re-remembered superseded fact is an explicit re-assertion:
             # the user says it IS true again — reopen a NEW validity
             # segment starting now (the closed segment stays queryable in
@@ -969,6 +996,7 @@ class Hippocampus:
                 n["valid_to"] = None
                 n.pop("superseded_by", None)
                 n["valid_from"] = now
+                self._dirty.add(nid)
         else:
             by, session = self._actor()
             self.nodes[nid] = {
@@ -1288,7 +1316,7 @@ class Hippocampus:
                     rev = self.edges.get(nbr, {}).get(nid)
                     if rev is not None:
                         rev["weight"] = e["weight"]
-                self._dirty.add(nid)
+                self._bumped[nid] = self._bumped.get(nid, 0) + 1
                 changed = True
         if changed:
             self._save()

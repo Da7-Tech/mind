@@ -1,5 +1,32 @@
 # Changelog
 
+## 6.1.1 — 2026-07-04
+
+First verification wave on 6.1.0 (three parallel independent verifiers:
+fix-reproduction, adversarial probing, claims-vs-reality). The fix
+verifier confirmed all 12 prior fixes; the prober found two NEW real
+defects; the claims checker found two stale numbers. All fixed:
+
+- **Concurrent confirms all count now**: two processes that both loaded
+  access_count=N and both confirmed used to land N+1 (20 parallel
+  confirms landed as 8–14). Reinforcement is now recorded as a DELTA and
+  re-applied on the fresh disk copy inside the locked merge — 20
+  parallel CLI confirms land exactly 20 (regression-tested at 8-way in
+  CI and 2-instance in unit).
+- **"who am I" answers again**: the 6.1.0 short-token fallback disarmed
+  the empty-query identity fallback. The identity fallback now keys off
+  "had any real content keys", and who/whoami/mine joined the English
+  pronoun set — who am I / whoami / what do I do / tell me about myself
+  all reach the name fact (regression test).
+- access_count survives repair as an int (was drifting to float).
+- Docs: Arabic seed count corrected to 83 (one "~90" survived 6.1.0);
+  mutation kill-rate stated as the deterministic seeded 43% (was "~46%");
+  Arabic README gained the last missing EN sections (reinforcement loop,
+  agents-integration, development, contributing + Brain Memory credit,
+  OpenClaw comparison row).
+- 161 tests.
+
+
 ## 6.1.0 — 2026-07-04
 
 The discrimination release. Three independent external audits (Opus, GLM,
