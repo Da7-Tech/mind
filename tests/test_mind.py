@@ -2500,5 +2500,32 @@ class TestSeventhAudit(TmpDirTest):
                              "values must be length-capped")
 
 
+class TestEighthAudit(TmpDirTest):
+    """6.2.4 — panel round 2: supersession-transition edges are pair-
+    specific and must never be inherited through correction fusion."""
+
+    def test_fusion_does_not_inherit_supersession_edges(self):
+        # A->B->C->A: `why B` used to show TWO superseded-by edges (its own
+        # plus one inherited when C->A fused), contradicting the scalar
+        h = Hippocampus(self.mind_dir / "graph.json")
+        h.remember("theme color red")
+        h.correct("red", "theme color blue")
+        h.correct("blue", "theme color green")
+        h.correct("green", "theme color red")
+        blue = h._id("theme color blue")
+        sb = [nbr for nbr, e in h.edges.get(blue, {}).items()
+              if e.get("relation") == "superseded-by"]
+        self.assertEqual(len(sb), 1,
+                         "a fact is superseded exactly once")
+        self.assertEqual(sb[0], h.nodes[blue].get("superseded_by"),
+                         "edge and scalar must tell one story")
+        red = h._id("theme color red")
+        self.assertIsNone(h.nodes[red].get("valid_to"))
+        self.assertEqual(
+            [e for e in h.edges.get(red, {}).values()
+             if e.get("relation") == "superseded-by"], [],
+            "the reopened live fact wears no superseded-by edge")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

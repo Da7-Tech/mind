@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.2.3"
+__version__ = "6.2.4"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -1260,13 +1260,21 @@ class Hippocampus:
                 "valid_from": now,
                 "valid_to": None,
             }
-        # fusion: the new fact inherits the old fact's connections
+        # fusion: the new fact inherits the old fact's KNOWLEDGE
+        # connections — but never its supersession-transition edges: those
+        # mark one specific pair's state change, and inheriting them gave a
+        # node a second "superseded-by" edge contradicting its own
+        # superseded_by field in `why` after an A->B->C->A chain (auditor
+        # finding, 6.2.4; display-only, but provenance must not lie)
         for nbr, e in list(self.edges.get(nid, {}).items()):
             if nbr == new_nid:
                 continue
+            if e.get("relation") in ("supersedes", "superseded-by"):
+                continue
             self.edges.setdefault(new_nid, {}).setdefault(nbr, dict(e))
             rev = self.edges.get(nbr, {}).get(nid)
-            if rev is not None:
+            if rev is not None and rev.get("relation") not in (
+                    "supersedes", "superseded-by"):
                 self.edges.setdefault(nbr, {}).setdefault(new_nid, dict(rev))
         # the explicit, timestamped state transition
         self.edges.setdefault(new_nid, {})[nid] = {

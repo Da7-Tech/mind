@@ -1,5 +1,25 @@
 # Changelog
 
+## 6.2.4 — 2026-07-06
+
+Panel round 2 (three fresh auditors cross-examining round 1 + re-breaking
+every fix). Verdicts: two auditors ZERO findings — all v6.2.3 fixes
+survived every re-break variant (concurrent poison injection, malformed
+markers, boundary dates), all round-1 claims independently reproduced
+(identity order-independence, 16-way confirm exactness, SIGKILL crash
+safety, O_APPEND journal no-loss, auto-dream firing at exactly 10
+signals, live-tag field simulation end-to-end). One LOW display finding,
+fixed:
+
+- **Correction fusion no longer inherits supersession-transition edges**:
+  after an A→B→C→A chain, `why B` showed two "superseded-by" edges (its
+  own plus one inherited when C→A fused), contradicting its own
+  superseded_by field. Transition edges mark one specific pair's state
+  change and stay with that pair; knowledge edges are still inherited.
+  recall/entity/validity were never affected (display-only), but
+  provenance must not lie. 188 tests.
+
+
 ## 6.2.3 — 2026-07-06
 
 Three-auditor panel round on 6.2.2 (line-by-line + adversarial CLI + docs
