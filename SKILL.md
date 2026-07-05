@@ -1,7 +1,7 @@
 ---
 name: mind
 description: Project memory graph with recall, provenance, and dreams.
-version: 6.1.3
+version: 6.2.0
 author: Da7 (Da7-Tech)
 license: MIT
 platforms: [linux, macos, windows]
@@ -36,7 +36,7 @@ built-in `memory` tool — and it is not a RAG system for large corpora.
 
 - `python3` (3.9+) and `curl` on PATH — nothing else: no API keys, no
   server, no packages. The tool is one stdlib-only file, MIT-licensed,
-  from https://github.com/Da7-Tech/mind (165 tests + benchmarks incl. 10 languages + discrimination + fuzzer + 180-day
+  from https://github.com/Da7-Tech/mind (175 tests + benchmarks incl. 10 languages + discrimination + fuzzer + 180-day
   soak test run in its CI on Linux/macOS/Windows).
 
 ## How to Run
@@ -46,8 +46,8 @@ tag and integrity-checked:
 
 ```bash
 cd <project>
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.3/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='27a40a5d44ea9b2fdce0eb18bb90bcbb885d98064e085cc2579cf3b16c18be97',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.0/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='39a2f6e4a832032f97502444fd0f0208c84806e87f6f8d2d6b30794c2ffd2339',h;print('mind.py: OK')"
 python3 mind.py init
 ```
 
@@ -68,7 +68,7 @@ their rule files synced too (adopted only when present).
 | "Where did this fact come from?" | `python3 mind.py why <id>` |
 | "What do we know about X?" | `python3 mind.py entity "X"` |
 | "What was true on DATE?" | `python3 mind.py recall "q" --at YYYY-MM-DD` |
-| "Clean up memory" / daily or ≥10 pending signals | `python3 mind.py dream` (no permission needed) |
+| Force a consolidation (it also SELF-RUNS after writes) | `python3 mind.py dream` (no permission needed) |
 | Health report | `python3 mind.py status` |
 
 ## Procedure
@@ -86,15 +86,16 @@ their rule files synced too (adopted only when present).
 4. Provenance is automatic (append-only `.mind/journal.jsonl`, never
    cleared). Set `MIND_BY` and `MIND_SESSION` env vars when running
    commands so `why` can attribute facts to you/this session.
-5. Consolidation cadence: run `dream` once per day (no journal for
-   today in `.mind/dreams/`) AND whenever `status` shows ≥ 10 pending
-   signals — without asking. It is deterministic and reversible
-   (archive, never delete); use `--dry-run` first only when the user
-   explicitly asks to review the plan. Every action is explained in
-   `.mind/dreams/<date>.md`.
-6. Nightly automation costs zero tokens via the `cronjob` tool in no-agent
-   mode (the script IS the job — no model call). Use the `write_file` tool
-   to create `~/.hermes/scripts/mind_dream.sh` with this body:
+5. Consolidation is SELF-RUNNING (6.2.0): after write commands, a full
+   dream cycle fires automatically when >= 10 signals pend or the last
+   dream is from a previous day — you normally never schedule anything.
+   `dream` forces a cycle; it is deterministic and reversible (archive,
+   never delete); use `--dry-run` only when the user explicitly asks to
+   review the plan. Every action is explained in `.mind/dreams/<date>.md`.
+6. Optional belt-and-suspenders for projects that go DAYS without any
+   write (auto-dream piggybacks on writes): a zero-token nightly cron via
+   the `cronjob` tool in no-agent mode. Use the `write_file` tool to
+   create `~/.hermes/scripts/mind_dream.sh` with this body:
 
    ```
    #!/bin/sh
@@ -123,7 +124,7 @@ their rule files synced too (adopted only when present).
 ## Verification
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.3/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='27a40a5d44ea9b2fdce0eb18bb90bcbb885d98064e085cc2579cf3b16c18be97',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
+cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.0/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='39a2f6e4a832032f97502444fd0f0208c84806e87f6f8d2d6b30794c2ffd2339',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
 ```
 
 Expected: one result containing `7413` with a printed memory id.

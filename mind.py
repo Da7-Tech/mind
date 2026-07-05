@@ -26,11 +26,11 @@ Usage: python3 mind.py <command> [args]
 Design: docs/DESIGN.md  |  License: MIT  |  https://github.com/Da7-Tech/mind
 """
 import sys, os, json, re, time, math, hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.1.3"
+__version__ = "6.2.0"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -55,6 +55,8 @@ PROMOTION_THRESHOLD = 3     # cluster of >= 3 related nodes -> cortex
 ACTIVE_TOKEN_BUDGET = 800   # working-memory budget in characters (~200 tokens)
 STABILITY_BASE_DAYS = 3.0   # Ebbinghaus: base memory stability
 STABILITY_PER_ACCESS = 14.0  # one confirmed recall buys ~two weeks of stability
+AUTO_DREAM_SIGNALS = 10     # pending write signals that trigger an auto-dream
+AUTO_DREAM_HOURS = 24       # ...or last dream older than this (with >=1 signal)
 GRACE_DAYS = 45             # no memory dies within 45 days of its last access
 #   (soak-test finding: monthly-cadence facts have recall gaps up to ~34
 #    days; a 30-day grace lost them to the nightly dream one day before
@@ -1597,7 +1599,14 @@ class Dreamer:
 
     def __init__(self, mind_dir, hippo, cortex):
         self.dir = mind_dir / DREAMS_DIR
-        self.dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # a dangling-symlink dreams/ raises EEXIST here (exists() is
+            # False so exist_ok can't swallow it). Constructing the Dreamer
+            # must never take down unrelated commands — dream() itself
+            # already refuses the unsafe journal write gracefully.
+            pass
         self.hippo = hippo
         self.cortex = cortex
         self.signals_file = mind_dir / SIGNALS_FILE
@@ -1679,11 +1688,24 @@ class Dreamer:
         try:
             # a second dream on the same date APPENDS its cycle to the day's
             # journal instead of silently replacing it (auditor finding:
-            # only the last cycle of the day used to survive)
-            if memo.exists() and not memo.is_symlink():
-                memo_text = (memo.read_text("utf-8").rstrip()
-                             + "\n\n---\n\n" + memo_text)
-            _atomic_write(memo, memo_text, boundary=self.hippo.path.parent)
+            # only the last cycle of the day used to survive). The append
+            # is a single O_APPEND os.write — same pattern as the archive —
+            # because concurrent auto-dreams from parallel write commands
+            # each land whole; the old read-modify-rewrite raced and
+            # dropped sibling cycles (auditor finding, 6.2.0 wave)
+            if memo.is_symlink():
+                raise ValueError("dream journal is a symlink")
+            _reject_symlinked_parents(memo, self.hippo.path.parent)
+            payload = memo_text
+            if memo.exists():
+                payload = "\n---\n\n" + memo_text
+            fd = os.open(str(memo),
+                         os.O_WRONLY | os.O_CREAT | os.O_APPEND |
+                         getattr(os, "O_NOFOLLOW", 0), 0o644)
+            try:
+                os.write(fd, payload.encode("utf-8"))
+            finally:
+                os.close(fd)
         except ValueError:
             print("warning: .mind/dreams is unsafe (symlink?); "
                   "skipping dream journal for this run.", file=sys.stderr)
@@ -1794,6 +1816,36 @@ class Dreamer:
         return out
 
 
+def _invocation(project_root=None):
+    """The exact command an agent must type to reach THIS mind.py.
+
+    The exported doctrine used to hardcode `python3 mind.py ...` — which
+    silently fails for every user who keeps mind.py anywhere but the project
+    root (field finding: an agent read the instructions, ran the command,
+    got 'No such file', and gave up — memory stayed empty for a whole day).
+    Relative form is kept when the script lives anywhere inside the
+    project tree (shorter, runnable from the project root, and survives
+    the project being moved); absolute otherwise.
+    """
+    try:
+        script = Path(sys.argv[0]).resolve()
+    except (OSError, ValueError):
+        return "python3 mind.py"
+    if script.name != "mind.py":        # imported (tests) or odd embedding
+        return "python3 mind.py"
+    if project_root is not None:
+        try:
+            rel = script.relative_to(Path(project_root).resolve())
+            cmd = str(rel)
+        except ValueError:
+            cmd = str(script)
+    else:
+        cmd = str(script)
+    if " " in cmd:
+        cmd = '"%s"' % cmd
+    return "python3 %s" % cmd
+
+
 # ────────────────────────────────────────────────────────────────
 # Layer 1: Working memory — always-on context + agent export
 # ────────────────────────────────────────────────────────────────
@@ -1835,18 +1887,46 @@ class Active:
             if len(hot) >= 8:
                 break
         cortex_files = ["- `cortex/%s`" % f.name for f in self.cortex.files()[:6]]
+        inv = _invocation(project_root)
+        # The standing-orders doctrine below is the write-side automation:
+        # it rides the one channel every coding agent already auto-loads
+        # (AGENTS.md / CLAUDE.md / GEMINI.md), the same way Hermes puts its
+        # memory contract in the always-on system prompt and OpenClaw puts
+        # "Write It Down" in its workspace AGENTS.md. Save-triggers + an
+        # aggressive never-save list + declarative-not-imperative phrasing
+        # + recall-before-ignorance are the four elements both proved out.
         content = """# ACTIVE.md — mind working memory
 
-> auto-generated %s — do not edit by hand (use `python3 mind.py ...`).
+> auto-generated %s — do not edit by hand (memory tool: `%s ...`).
 
-## How the agent uses this memory
-- Need something not listed below? Run `python3 mind.py recall "your question"`.
-- A recalled memory actually answered you? Reinforce it: `python3 mind.py confirm <id>`
-  (ids are printed by recall). Confirmed memories harden; unconfirmed ones fade.
-- Learned something new? Run `python3 mind.py remember "the fact"`.
-- Two facts belong together? `python3 mind.py link "a" "b" "relation"`.
-- A stored fact is wrong? `python3 mind.py correct "old" "corrected fact"`.
-- Between sessions: `python3 mind.py dream` reorganizes memory; journal in `.mind/dreams/`.
+## Standing orders — memory is part of the job, not a request
+You (the agent) maintain this project's memory AUTOMATICALLY while you work.
+Nothing survives a session unless it is saved here — "mental notes" are lost
+on restart. Never ask the user for permission to remember/recall/confirm:
+these are your normal duties; do them and mention it in one short line.
+
+**Save immediately** — `%s remember "the fact"` — when:
+- the user states a preference, correction, decision, or STABLE personal/team detail
+- you learn a stable fact about the environment, stack, conventions, or a tool quirk
+- you solved something whose lesson will matter beyond this session
+One fact per memory: split a braindump into atomic facts (several remember
+commands chained in one shell call is fine) — composite blobs recall poorly.
+**Before finishing any substantive task:** save the 1-3 durable facts it taught you.
+**Session ending, or context about to be compacted?** Save durable facts FIRST.
+
+**Never save** (rot is worse than forgetting): task progress, TODO state,
+"fixed bug X", PR/issue numbers, commit SHAs, file counts — anything stale
+within a week or trivially re-discoverable.
+Phrase memories as declarative facts, not instructions to yourself:
+"project uses pytest" ✓ — "always run pytest" ✗.
+
+**Recall before claiming ignorance:** asked about prior work, decisions,
+people, dates, or preferences? Run `%s recall "the question"` BEFORE saying
+you don't know. Reinforce hits that actually answered you:
+`%s confirm <id>` (ids are printed by recall).
+A stored fact turned out wrong? `%s correct "old hint" "corrected fact"`
+(supersedes cleanly — never remember a duplicate alongside it).
+Two facts belong together? `%s link "a" "b" "relation"`.
 
 ## Hot memories (highest weight now)
 %s
@@ -1854,16 +1934,34 @@ class Active:
 ## Cortex index (consolidated knowledge)
 %s
 
-## Agent behavior rules
-- Do not guess. If the answer is not here, run `recall` before assuming.
-- Record new durable facts with `remember` as you learn them.
-- Every memory has a weight: recalled often -> reinforced; unused -> decays and is pruned.
-""" % (_now().strftime("%Y-%m-%d %H:%M"),
-            "\n".join(hot) if hot else "- (memory is empty — start with `remember`)",
-            "\n".join(cortex_files) if cortex_files else "- (no cortex yet)")
+## Memory health
+%s
+- maintenance is self-running: after your writes, a dream cycle (decay,
+  dedup, promotion, conflict scan) fires automatically when due — no cron
+  needed. `%s dream` forces one; journal lands in `.mind/dreams/`.
+""" % (_now().strftime("%Y-%m-%d %H:%M"), inv,
+            inv, inv, inv, inv, inv,
+            "\n".join(hot) if hot else "- (memory is empty — save the first fact NOW: stack, conventions, who the user is)",
+            "\n".join(cortex_files) if cortex_files else "- (no cortex yet)",
+            self._health_line(), inv)
         # boundary = .mind/ so a symlinked parent can't redirect the write
         _atomic_write(self.path, content, boundary=self.path.parent)
         return str(self.path.relative_to(project_root))
+
+    def _health_line(self):
+        """One status line the agent sees every session (the Hermes
+        capacity-header idea: visible state drives correct behavior)."""
+        total = len(self.hippo.nodes)
+        valid = sum(1 for n in self.hippo.nodes.values()
+                    if self.hippo._valid_at(n))
+        last = "never"
+        ddir = self.dir / DREAMS_DIR
+        if ddir.exists():
+            days = sorted(p.stem for p in ddir.glob("????-??-??.md"))
+            if days:
+                last = days[-1]
+        return ("- %d memories (%d currently true) · last dream: %s"
+                % (total, valid, last))
 
     def export_to_agents(self, project_root):
         """Write the working-memory block into every agent's instruction file,
@@ -1984,16 +2082,20 @@ layers:
   .mind/dreams/      dream journals
   .mind/signals.jsonl session signals
 
-agent files exported:
-  AGENTS.md   (Codex, Cursor, Zed, ...)
+agent files exported (each carries the standing-orders contract that makes
+your agent save and recall memories automatically, without being asked):
+  AGENTS.md   (Kimi Code, Codex, Cursor, Zed, zcode, ...)
   CLAUDE.md   (Claude Code)
   GEMINI.md   (Gemini CLI)
   (.cursorrules / .windsurfrules / .clinerules / .roo/rules/mind.md
    are adopted automatically when the project already uses them)
 
-start with:  python3 mind.py remember "first thing to remember"
-then:        python3 mind.py recall "your question"
-between sessions:  python3 mind.py dream""" % self.dir)
+automatic from here on:
+  - your agent reads the contract every session and saves/recalls on its own
+  - consolidation self-runs: writes trigger a dream cycle when due (no cron)
+
+manual commands (optional):  %s remember/recall/dream/status""" % (
+            self.dir, _invocation(self.root)))
 
     def _ensure(self):
         if self.dir.is_symlink():
@@ -2006,6 +2108,56 @@ between sessions:  python3 mind.py dream""" % self.dir)
         self.dreamer = Dreamer(self.dir, self.hippo, self.cortex)
         self.active = Active(self.dir, self.hippo, self.cortex)
 
+    def _auto_dream(self):
+        """Self-running consolidation — the `git gc --auto` pattern.
+
+        Hermes consolidates in-turn via its char-budget nudge; OpenClaw runs
+        a nightly dreaming cron. An external CLI can rely on neither (no
+        agent loop of ours, and containers/CI rarely have cron), so mind
+        piggybacks maintenance on the writes themselves: after a write
+        command, a full dream cycle fires when enough session signals have
+        accumulated (>= AUTO_DREAM_SIGNALS) or the last dream is from a
+        previous calendar day (daily cadence — the date-granular check
+        means a just-before-midnight dream can re-fire after midnight,
+        which only errs toward consolidating sooner). Failures never
+        break the write that triggered it.
+        Kill switch: MIND_AUTO_DREAM=0.
+        """
+        if os.environ.get("MIND_AUTO_DREAM", "1").lower() in ("0", "false", "no"):
+            return False
+        try:
+            pending = 0
+            sig = self.dir / SIGNALS_FILE
+            if sig.exists() and not sig.is_symlink() \
+                    and sig.stat().st_size <= 5_000_000:
+                pending = sum(1 for ln in sig.read_text("utf-8").splitlines()
+                              if ln.strip())
+            if pending == 0:
+                return False
+            last_date = None
+            ddir = self.dir / DREAMS_DIR
+            if ddir.exists():
+                days = sorted(p.stem for p in ddir.glob("????-??-??.md"))
+                if days:
+                    try:
+                        last_date = datetime.strptime(days[-1], "%Y-%m-%d").date()
+                    except ValueError:
+                        last_date = None
+            stale = (last_date is None or
+                     last_date <= (_now() - timedelta(hours=AUTO_DREAM_HOURS)).date())
+            if not (pending >= AUTO_DREAM_SIGNALS or stale):
+                return False
+            memo, _ = self.dreamer.dream(dry_run=False)
+            self.active.generate(self.root)
+            self.active.export_to_agents(self.root)
+            print("  🌙 auto-dream: memory consolidated (%s)"
+                  % (memo or "journal skipped"))
+            return True
+        except Exception as e:                       # noqa: BLE001
+            # maintenance must never break the write it rode on
+            print("  (auto-dream skipped: %s)" % e, file=sys.stderr)
+            return False
+
     def remember(self, text):
         self._ensure()
         nid = self.hippo.remember(text)
@@ -2014,10 +2166,12 @@ between sessions:  python3 mind.py dream""" % self.dir)
         print("remembered: %s" % self.hippo.nodes[nid]["text"])
         print("  (node %s, total nodes: %d)" % (nid, len(self.hippo.nodes)))
         print("  ACTIVE.md + AGENTS.md/CLAUDE.md/GEMINI.md updated")
+        self._auto_dream()
 
     def link(self, a, b, relation="related"):
         self._ensure()
         print(self.hippo.link(a, b, relation))
+        self._auto_dream()
 
     def recall(self, query, at=None):
         self._ensure()
@@ -2046,6 +2200,7 @@ between sessions:  python3 mind.py dream""" % self.dir)
             print("reinforced %d memor%s — stability +%d days each, edges "
                   "restrengthened" % (len(known), "y" if len(known) == 1 else "ies",
                                       int(STABILITY_PER_ACCESS)))
+            self._auto_dream()
         for nid in unknown:
             print("unknown id: %s (get ids from `recall` output)" % nid,
                   file=sys.stderr)
@@ -2067,6 +2222,7 @@ between sessions:  python3 mind.py dream""" % self.dir)
         print("  was: %s" % old)
         print("  now: %s" % self.hippo._clean_text(new_text))
         print("  (old fact CLOSED, not erased — `why` and `--at` can still reach it)")
+        self._auto_dream()
 
     def why(self, nid):
         """Full provenance answer for one memory: where did this fact
@@ -2236,10 +2392,13 @@ commands:
   correct "old" "new"     supersede a wrong fact (transition kept in graph)
   why <id>                provenance: where a fact came from, is it still true
   entity "term"           every fact about a term, current and superseded
-  dream [--dry-run]       run the sleep cycle
+  dream [--dry-run]       force a sleep cycle (also fires AUTOMATICALLY
+                          after writes when >=%d signals pend or the last
+                          dream is from a previous day; MIND_AUTO_DREAM=0
+                          disables)
   export                  regenerate agent files
   status                  health report
-""" % __version__
+""" % (__version__, AUTO_DREAM_SIGNALS)
 
 
 def _die(msg, code=2):

@@ -1,5 +1,45 @@
 # Changelog
 
+## 6.2.0 — 2026-07-05
+
+**Automatic operation.** Field report that motivated it: a real user ran
+`init`, worked on the codebase all day, and memory stayed empty — the agent
+was never driven to write, and the dream never ran. This release transplants
+the proven automation mechanism of Hermes' built-in memory and OpenClaw's
+workspace memory into mind's own architecture:
+
+- **Standing orders replace the passive usage notes** in the exported
+  `AGENTS.md`/`CLAUDE.md`/`GEMINI.md` block — the channel every coding
+  agent (Kimi Code, Codex, Claude Code, Gemini CLI, Cursor, zcode…)
+  auto-loads each session. Save-triggers (preferences, corrections, stable
+  environment facts, lessons), an end-of-task checkpoint ("save the 1-3
+  durable facts it taught you" — the load-bearing line for purely technical
+  workdays), a session-end/pre-compaction flush rule, an aggressive
+  never-save list (task progress, PR numbers, SHAs, anything stale in a
+  week), declarative-not-imperative phrasing, one-fact-per-memory
+  atomicity, recall-before-claiming-ignorance, and an explicit
+  no-permission-asking rule.
+- **The exported commands carry the real invocation path** (absolute when
+  `mind.py` lives outside the project root). Previously they hardcoded
+  `python3 mind.py`, which silently failed for any other layout — the
+  root cause of the field report.
+- **Auto-dream: consolidation self-runs.** After `remember`/`correct`/
+  `link`/`confirm`, a full dream cycle fires when >= 10 write signals
+  pend or the last dream is from a previous calendar day (daily cadence;
+  the `git gc --auto` pattern — no cron, works in containers/CI).
+  Failures never break the triggering write. Same-day concurrent cycles
+  append to the day's journal via O_APPEND, so parallel writers cannot
+  drop each other's cycle records. Kill switch: `MIND_AUTO_DREAM=0`.
+- **`Memory health` line in the exported block** (count, currently-true,
+  last dream) — visible state drives correct agent behavior.
+- **A dangling-symlink `dreams/` no longer crashes every command** (the
+  Dreamer constructor now degrades gracefully; the journal write path
+  already refused unsafe dirs).
+- Field-tested with six agent-in-project simulations (agent sees ONLY the
+  exported AGENTS.md): unprompted saves, correction-not-duplication,
+  cross-session recall + reinforcement, zero junk on trivia, automatic
+  mid-session consolidation at the signal threshold. 175 tests.
+
 ## 6.1.3 — 2026-07-04
 
 - **Windows: reads retry transient PermissionError too** — a reader that

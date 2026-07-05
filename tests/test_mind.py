@@ -2134,5 +2134,145 @@ class TestCLI(TmpDirTest):
         self.assertNotEqual(code, 0)
 
 
+class TestAutomatic(unittest.TestCase):
+    """6.2.0 — automatic operation: the standing-orders doctrine rides the
+    exported agent files with the REAL invocation path, and consolidation
+    self-runs (auto-dream) after writes. The mechanism is the proven
+    Hermes/OpenClaw pattern: contract in the always-loaded context file +
+    self-running maintenance."""
+
+    def setUp(self):
+        self._tmpd = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmpd.name)
+        self.proj = self.tmp / "proj"
+        self.proj.mkdir()
+
+    def tearDown(self):
+        self._tmpd.cleanup()
+
+    def _cli(self, cwd, script, *args, env_extra=None):
+        import subprocess
+        env = dict(os.environ)
+        env.pop("MIND_AUTO_DREAM", None)
+        if env_extra:
+            env.update(env_extra)
+        return subprocess.run(
+            [sys.executable, str(script)] + list(args),
+            cwd=str(cwd), capture_output=True, text=True, env=env)
+
+    def _install(self, where):
+        here = Path(__file__).resolve().parents[1] / "mind.py"
+        dst = Path(where) / "mind.py"
+        shutil.copy(str(here), str(dst))
+        return dst
+
+    # -- doctrine content ------------------------------------------------
+    def test_export_carries_standing_orders(self):
+        script = self._install(self.proj)
+        self._cli(self.proj, script, "init")
+        text = (self.proj / "AGENTS.md").read_text("utf-8")
+        for phrase in ("Standing orders", "AUTOMATICALLY",
+                       "Never ask the user for permission",
+                       "Never save", "declarative facts",
+                       "Recall before claiming ignorance",
+                       "Before finishing any substantive task",
+                       "context about to be compacted"):
+            self.assertIn(phrase, text, "doctrine must include: %s" % phrase)
+
+    def test_export_uses_relative_invocation_in_root(self):
+        script = self._install(self.proj)
+        self._cli(self.proj, script, "init")
+        text = (self.proj / "AGENTS.md").read_text("utf-8")
+        self.assertIn("`python3 mind.py remember", text)
+
+    def test_export_uses_absolute_invocation_outside_root(self):
+        tooldir = self.tmp / "tools"
+        tooldir.mkdir()
+        script = self._install(tooldir)
+        self._cli(self.proj, script, "init")
+        text = (self.proj / "AGENTS.md").read_text("utf-8")
+        self.assertIn(str(script), text,
+                      "commands must carry the real path when mind.py is "
+                      "not in the project root (field finding)")
+        self.assertNotIn("`python3 mind.py recall", text)
+
+    def test_health_line_present(self):
+        script = self._install(self.proj)
+        self._cli(self.proj, script, "init")
+        self._cli(self.proj, script, "remember", "the db is postgres")
+        text = (self.proj / "AGENTS.md").read_text("utf-8")
+        self.assertIn("Memory health", text)
+        self.assertIn("last dream:", text)
+
+    # -- auto-dream ------------------------------------------------------
+    def test_first_write_triggers_auto_dream(self):
+        script = self._install(self.proj)
+        self._cli(self.proj, script, "init")
+        r = self._cli(self.proj, script, "remember", "project uses flask")
+        self.assertIn("auto-dream", r.stdout)
+        dreams = list((self.proj / ".mind" / "dreams").glob("*.md"))
+        self.assertEqual(len(dreams), 1, "first write must consolidate "
+                         "(no prior dream = stale)")
+
+    def test_fresh_dream_not_repeated_below_threshold(self):
+        script = self._install(self.proj)
+        self._cli(self.proj, script, "init")
+        self._cli(self.proj, script, "remember", "project uses flask")
+        r2 = self._cli(self.proj, script, "remember", "user name is dahem")
+        self.assertNotIn("auto-dream", r2.stdout,
+                         "a fresh dream + 1 signal must NOT re-dream")
+
+    def test_signal_threshold_triggers_second_cycle(self):
+        script = self._install(self.proj)
+        self._cli(self.proj, script, "init")
+        self._cli(self.proj, script, "remember", "seed fact zero")  # dreams
+        fired = False
+        for i in range(M.AUTO_DREAM_SIGNALS + 1):
+            r = self._cli(self.proj, script, "remember",
+                          "distinct fact %d about topic%d" % (i, i))
+            fired = fired or ("auto-dream" in r.stdout)
+        self.assertTrue(fired, "accumulated signals must trigger a cycle")
+        journal = (self.proj / ".mind" / "dreams")
+        text = "".join(p.read_text("utf-8") for p in journal.glob("*.md"))
+        self.assertGreaterEqual(text.count("# Dream journal"), 2)
+
+    def test_kill_switch(self):
+        script = self._install(self.proj)
+        self._cli(self.proj, script, "init")
+        r = self._cli(self.proj, script, "remember", "no dream",
+                      env_extra={"MIND_AUTO_DREAM": "0"})
+        self.assertNotIn("auto-dream", r.stdout)
+        self.assertEqual(list((self.proj / ".mind" / "dreams").glob("*.md")),
+                         [])
+
+    def test_auto_dream_failure_never_breaks_the_write(self):
+        if os.name == "nt":
+            self.skipTest("symlinks need privileges on Windows")
+        script = self._install(self.proj)
+        self._cli(self.proj, script, "init")
+        # sabotage the dreams dir so the dream journal write is refused
+        ddir = self.proj / ".mind" / "dreams"
+        shutil.rmtree(str(ddir))
+        ddir.symlink_to(self.tmp / "elsewhere-nonexistent")
+        r = self._cli(self.proj, script, "remember", "the write must land")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("remembered", r.stdout)
+        graph = (self.proj / ".mind" / "graph.json").read_text("utf-8")
+        self.assertIn("the write must land", graph)
+
+    def test_correct_with_stale_dream_consolidates(self):
+        script = self._install(self.proj)
+        self._cli(self.proj, script, "init")
+        self._cli(self.proj, script, "remember", "server is in frankfurt")
+        # make the last dream stale (>24h): rename today's journal to 2001
+        ddir = self.proj / ".mind" / "dreams"
+        for p2 in ddir.glob("*.md"):
+            p2.rename(ddir / "2001-01-01.md")
+        r = self._cli(self.proj, script, "correct",
+                      "frankfurt", "server is in helsinki")
+        self.assertIn("auto-dream", r.stdout,
+                      "correct with a stale dream must consolidate")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

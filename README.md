@@ -18,13 +18,13 @@ you sleep through a **deterministic dream cycle** — no LLM calls, no token
 bill, every decision explained in a journal you can read.
 
 It plugs into **every agent at once**: one memory, exported to `AGENTS.md`
-(Codex, Cursor, Zed, ...), `CLAUDE.md` (Claude Code) and `GEMINI.md` — and
+(Kimi Code, Codex, Cursor, Zed, ...), `CLAUDE.md` (Claude Code) and `GEMINI.md` — and
 adopted automatically by `.cursorrules`, `.windsurfrules`, `.clinerules`
 and `.roo/rules/mind.md` in projects that already use those tools.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.1.3/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='27a40a5d44ea9b2fdce0eb18bb90bcbb885d98064e085cc2579cf3b16c18be97',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.0/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='39a2f6e4a832032f97502444fd0f0208c84806e87f6f8d2d6b30794c2ffd2339',h;print('mind.py: OK')"
 python3 mind.py init
 python3 mind.py remember "the project database is postgres 16"
 python3 mind.py recall "which database do we use"
@@ -109,7 +109,7 @@ Surviving mutants are triaged in the tool's output: unreachable `get()`
 defaults, display-only constants, and ranking-calibration values guarded
 by the CI benchmark gate (recall@1 ≥ 0.9) rather than unit assertions.
 
-Test suite: **165 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **175 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, corrupt-graph recovery, and
 a mutation-kill class where every test pins a behavior the suite
@@ -280,21 +280,63 @@ so connections that never earn a confirmation decay and prune away.
   less often than ~every six weeks should live in cortex notes, not the
   hippocampus — that's the brain deal: use it or archive it.
 
-## Using with Hermes, Claude Code, Codex, Gemini CLI...
+## Automatic operation (6.2.0) — how memory works without being asked
+
+`mind` is not a background daemon; your agent is the writer. What makes it
+*automatic* is the same proven mechanism Hermes uses for its built-in memory
+and OpenClaw uses for its workspace memory:
+
+1. **The contract rides the always-loaded file.** `mind init` embeds
+   *standing orders* into `AGENTS.md`/`CLAUDE.md`/`GEMINI.md` — the files
+   every coding agent auto-injects each session. They tell the agent to save
+   stable facts as it works (with an aggressive never-save list to prevent
+   rot), to save 1–3 durable facts before finishing any substantive task,
+   and to `recall` before ever claiming ignorance — **never asking the user
+   for permission**. The exported commands carry the real path to your
+   `mind.py`, so they work from anywhere.
+2. **Consolidation self-runs.** After write commands, a full dream cycle
+   (decay, dedup, promotion, conflict scan) fires automatically when due —
+   at most once per `MIND_AUTO_DREAM` window (default: daily, or every 10
+   pending write signals). No cron, no server: it works in containers and
+   CI. Disable with `MIND_AUTO_DREAM=0`; force one with `mind dream`.
+3. **Reinforcement is earned by use.** `recall` prints ids; the contract has
+   the agent `confirm` hits that actually answered — so exactly the
+   memories that keep proving useful harden, and unused ones fade.
+
+Field-tested end-to-end: six simulated agent-in-project scenarios (an
+agent given ONLY the exported `AGENTS.md`, never told about memory)
+saved stated preferences and technical lessons unprompted, corrected a
+migrated fact via `correct` instead of duplicating it, recalled and
+reinforced across a session reset, saved **zero** junk on a
+trivia-only session, and consolidated automatically mid-session at the
+signal threshold.
+
+## Using with Kimi Code, Hermes, Claude Code, Codex, Gemini CLI...
 
 `mind init` writes the working memory into `AGENTS.md`, `CLAUDE.md` and
 `GEMINI.md` with guard markers, preserving your existing content. If the
 project already has `.cursorrules`, `.windsurfrules`, `.clinerules` or a
 `.roo/` directory, those rule files are kept in sync too — adopted, never
 imposed on projects that don't use them.
-Any agent that reads those files gets the memory and the instructions to use it —
-nothing else to configure. A ready-made Hermes skill lives in
-[`SKILL.md`](SKILL.md).
+
+| Agent | Reads | Works |
+|---|---|---|
+| Kimi Code CLI | `AGENTS.md` (merged root → cwd) | out of the box |
+| Codex CLI, Cursor, Zed, zcode | `AGENTS.md` | out of the box |
+| Claude Code | `CLAUDE.md` | out of the box |
+| Gemini CLI | `GEMINI.md` | out of the box |
+| Hermes | skill | ready-made [`SKILL.md`](SKILL.md) |
+
+Any agent that reads those files gets the memory and the standing orders to
+maintain it — nothing else to configure. Optional extra for agents with
+lifecycle hooks (e.g. Kimi's `SessionEnd`, Claude Code's `Stop`): wire
+`python3 mind.py dream` as a hook for end-of-session consolidation — purely
+optional, since auto-dream already covers it.
 
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 165 tests
+python3 -m unittest discover -s tests   # 175 tests
 python3 bench/bench.py                  # reproduce the EN/AR numbers
 python3 bench/multilang.py              # 8 untuned languages
 python3 bench/soak.py                   # 180 simulated days
