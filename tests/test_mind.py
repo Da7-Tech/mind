@@ -2191,7 +2191,10 @@ class TestAutomatic(unittest.TestCase):
         script = self._install(tooldir)
         self._cli(self.proj, script, "init")
         text = (self.proj / "AGENTS.md").read_text("utf-8")
-        self.assertIn(str(script), text,
+        # compare against the RESOLVED path: on Windows, tempdirs come back
+        # in 8.3 short form (RUNNER~1) while the tool exports the resolved
+        # long form — both name the same file (windows-latest CI finding)
+        self.assertIn(str(Path(script).resolve()), text,
                       "commands must carry the real path when mind.py is "
                       "not in the project root (field finding)")
         self.assertNotIn("`python3 mind.py recall", text)
