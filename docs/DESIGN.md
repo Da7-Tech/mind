@@ -47,7 +47,7 @@ Five cooperating stages, each added to fix a defect found by live testing:
 
 | stage | technique | fixes |
 |---|---|---|
-| 1. normalization | script-aware tokenizer (whole words for spaced scripts, character bigrams for CJK/kana/Hangul/Thai) + bilingual stemming + AR↔EN seed map | "بايثون" ↔ "python"; Chinese/Japanese recall at all (was 3/6, now measured 9/9 in bench/multilang.py) |
+| 1. normalization | script-aware tokenizer (whole words for spaced scripts, character bigrams for CJK/kana/Hangul/Thai) + bilingual stemming + AR↔EN seed map | "بايثون" ↔ "python"; Chinese/Japanese recall at all (was 3/6, now measured 3/3 per language — 24/24 overall in bench/multilang.py) |
 | 2. concept seed | 83 curated tool→category mappings, applied to memories AND queries | category questions ("what css framework") reaching tool-only memories ("tailwind") — the benchmark's one standing miss before 5.5.0. Polysemous words excluded by design |
 | 3. auto-expansion | co-occurrence index + constrained 2-hop PageRank | unknown-unknowns ("database" finds the sqlite node) |
 | 4. fusion | **RRF + IDF** over direct & spreading channels | rank ties in multi-hop recall |
