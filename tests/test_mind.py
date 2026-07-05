@@ -2449,5 +2449,56 @@ class TestSixthAudit(TmpDirTest):
                          "near-future closing means already closed")
 
 
+class TestSeventhAudit(TmpDirTest):
+    """6.2.3 — panel round: a future-dated last_edge_decay marker must not
+    freeze edge homeostasis forever (max-wins merge made it permanent)."""
+
+    def test_future_decay_marker_unfreezes(self):
+        h = Hippocampus(self.mind_dir / "graph.json")
+        h.remember("the office wifi rotates quarterly")
+        h.remember("deploys run through the jenkins pipeline")
+        h.link("the office wifi rotates quarterly",
+               "deploys run through the jenkins pipeline")
+        ida = h._id("the office wifi rotates quarterly")
+        idb = h._id("deploys run through the jenkins pipeline")
+        # poison the disk with a far-future marker (clock skew / hand edit)
+        gpath = self.mind_dir / "graph.json"
+        g = json.loads(gpath.read_text("utf-8"))
+        g["meta"] = {"last_edge_decay": "2099-01-01"}
+        gpath.write_text(json.dumps(g), encoding="utf-8")
+        h2 = Hippocampus(gpath)
+        today = str(datetime.now().date())
+        self.assertEqual(h2.meta.get("last_edge_decay"), today,
+                         "future marker must be clamped to today at load")
+        c = Cortex(self.mind_dir / "cortex")
+        d = Dreamer(self.mind_dir, h2, c)
+        d.dream()          # today: counts as already-decayed, no decay
+        self.assertEqual(h2.edges[ida][idb]["weight"], 1.0)
+        base, orig = datetime.now(), M._now
+        try:
+            M._now = lambda: base + timedelta(days=1)
+            d.dream()      # tomorrow: decay must RESUME (was frozen to 2099)
+            w1 = h2.edges[ida][idb]["weight"]
+            self.assertLess(w1, 1.0, "decay must resume the next day")
+            d.dream()      # same-day second cycle: no compounding
+            self.assertEqual(h2.edges[ida][idb]["weight"], w1)
+        finally:
+            M._now = orig
+
+    def test_meta_values_hardened(self):
+        gpath = self.mind_dir / "graph.json"
+        h = Hippocampus(gpath)
+        h.remember("seed fact for meta test")
+        g = json.loads(gpath.read_text("utf-8"))
+        g["meta"] = {"ansi": "x\x1b[31m", "huge": "A" * 2_000_000,
+                     "num": 7, "ok": "2026-01-01"}
+        gpath.write_text(json.dumps(g), encoding="utf-8")
+        h2 = Hippocampus(gpath)
+        self.assertNotIn("ansi", h2.meta, "control chars must be dropped")
+        self.assertNotIn("num", h2.meta, "non-strings must be dropped")
+        self.assertLessEqual(len(h2.meta.get("huge", "")), 64,
+                             "values must be length-capped")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

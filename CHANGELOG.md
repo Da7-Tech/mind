@@ -1,5 +1,33 @@
 # Changelog
 
+## 6.2.3 — 2026-07-06
+
+Three-auditor panel round on 6.2.2 (line-by-line + adversarial CLI + docs
+truth / temporal semantics + concurrency + mutation triage / field
+simulation + security + platform-release). Findings, each reproduced:
+
+- **A future-dated `last_edge_decay` marker froze edge homeostasis
+  forever** (MEDIUM): the max-wins meta merge made a "2099-01-01" marker
+  (clock skew, hand edit, synced graph) permanent, silently disabling
+  synaptic pruning. Markers are now clamped to today at load AND inside
+  the merge; decay resumes the next day with no same-day compounding
+  (regression-tested with the exact 2099 attack).
+- **Meta values hardened**: length-capped (64), printable-only,
+  non-strings dropped — a hand-edited graph can no longer smuggle huge
+  or control-char meta values back to disk.
+- The known, accepted <=26h divergence between present-time checks and a
+  literal `--at <now>` on future-stamped facts is now documented at the
+  code site (present view prefers the synced machines' consensus; --at
+  stays literal history).
+- Mutation kill rate re-measured on this release's file: 42% (the sample
+  is re-drawn whenever the file changes; README wording now says so
+  instead of pinning a number that drifts between releases).
+- Panel verdicts also confirmed clean: 20-way concurrency exact counts,
+  SIGKILL crash-injection (160 kills, zero corruption), full fuzz 420/420,
+  all symlink attack classes contained, py3.9 AST-clean, CI 9/9, live tag
+  checksum match, zero identity leaks. 187 tests.
+
+
 ## 6.2.2 — 2026-07-06
 
 Second-review round on 6.2.1 (same two auditors re-ran everything; one

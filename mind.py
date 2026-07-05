@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.2.2"
+__version__ = "6.2.3"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -789,9 +789,17 @@ class Hippocampus:
         self.nodes = self._repair_nodes(data.get("nodes", {}))
         self.edges = self._repair_edges(data.get("edges", {}), self.nodes)
         meta = data.get("meta", {})
-        self.meta = ({k: v for k, v in meta.items()
-                      if isinstance(k, str) and isinstance(v, str)}
+        self.meta = ({k: v[:64] for k, v in meta.items()
+                      if isinstance(k, str) and isinstance(v, str)
+                      and v.isprintable()}
                      if isinstance(meta, dict) else {})
+        # a FUTURE-dated decay marker (clock skew, hand edit, synced graph)
+        # would freeze edge homeostasis forever under max-wins merging —
+        # clamp it to today so decay resumes tomorrow (auditor finding,
+        # 6.2.3: marker "2099-01-01" disabled synaptic pruning permanently)
+        today = str(_now().date())
+        if self.meta.get("last_edge_decay", "") > today:
+            self.meta["last_edge_decay"] = today
 
     def _save(self):
         """Locked read-merge-write: concurrent agent processes cannot lose
@@ -922,9 +930,15 @@ class Hippocampus:
                                  if isinstance(disk, dict) and
                                  isinstance(disk.get("meta", {}), dict)
                                  else {})
+                    merge_today = str(_now().date())
                     for mk, mv in disk_meta.items():
-                        if isinstance(mk, str) and isinstance(mv, str) and \
-                                mv > self.meta.get(mk, ""):
+                        if not (isinstance(mk, str) and isinstance(mv, str)
+                                and mv.isprintable()):
+                            continue
+                        mv = mv[:64]
+                        if mk == "last_edge_decay" and mv > merge_today:
+                            mv = merge_today    # future marker = skew garbage
+                        if mv > self.meta.get(mk, ""):
                             self.meta[mk] = mv
                 _atomic_write(self.path, json.dumps(
                     {"nodes": self.nodes, "edges": self.edges,
@@ -1670,6 +1684,10 @@ class Hippocampus:
             # superseded there — treating it as still-valid here returned
             # BOTH the old and new fact until local midnight (auditor
             # finding, 6.2.2). Both bounds compare against the horizon.
+            # Known, accepted divergence: within the <=26h skew window a
+            # present-time check and a literal `--at <now>` can disagree
+            # about a future-stamped fact — the present view prefers the
+            # synced machines' consensus, --at stays literal history.
             horizon = (_now() + timedelta(hours=26)).isoformat()
             return vf <= horizon and (vt is None or horizon < vt)
         return vf <= at and (vt is None or at < vt)
