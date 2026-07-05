@@ -17,14 +17,14 @@ that works the way yours does: a weighted concept graph that recalls by
 you sleep through a **deterministic dream cycle** — no LLM calls, no token
 bill, every decision explained in a journal you can read.
 
-It plugs into **every agent at once**: one memory, exported to `AGENTS.md`
+It plugs into **all your agents at once**: one memory, exported to `AGENTS.md`
 (Kimi Code, Codex, Cursor, Zed, ...), `CLAUDE.md` (Claude Code) and `GEMINI.md` — and
 adopted automatically by `.cursorrules`, `.windsurfrules`, `.clinerules`
 and `.roo/rules/mind.md` in projects that already use those tools.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.1/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='faccb80fdb926e3486151fb312b8cccffaf503d48790c1876dd6cd74b55a5c6c',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.2/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='60ddc63f8f5740aac50bafa5e1ccf1e0ade0218b874e9797e24b6119aeecc141',h;print('mind.py: OK')"
 python3 mind.py init
 python3 mind.py remember "the project database is postgres 16"
 python3 mind.py recall "which database do we use"
@@ -109,7 +109,7 @@ Surviving mutants are triaged in the tool's output: unreachable `get()`
 defaults, display-only constants, and ranking-calibration values guarded
 by the CI benchmark gate (recall@1 ≥ 0.9) rather than unit assertions.
 
-Test suite: **180 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **185 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, corrupt-graph recovery, and
 a mutation-kill class where every test pins a behavior the suite
@@ -337,7 +337,7 @@ optional, since auto-dream already covers it.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 180 tests
+python3 -m unittest discover -s tests   # 185 tests
 python3 bench/bench.py                  # reproduce the EN/AR numbers
 python3 bench/multilang.py              # 8 untuned languages
 python3 bench/soak.py                   # 180 simulated days

@@ -1616,10 +1616,10 @@ class TestFourthAudit(TmpDirTest):
     def test_arabic_identity_beats_arabic_noun_distractor(self):
         h = self.hippo()
         h.remember("اسم الملف يجب ان يطابق اسم الصنف")
-        h.remember("اسمي داحم وأعمل من الرياض")
+        h.remember("اسمي سمير وأعمل من الرياض")
         r, _, _ = h.recall("ما اسمي")
         self.assertTrue(r)
-        self.assertIn("داحم", r[0][2]["text"])
+        self.assertIn("سمير", r[0][2]["text"])
 
     def test_stored_fact_with_name_noun_gets_no_identity_keys(self):
         h = self.hippo()
@@ -2368,6 +2368,85 @@ class TestFifthAudit(TmpDirTest):
                                       + timedelta(hours=8)).isoformat()
         self.assertFalse(h._valid_at(h.nodes[nid], at=yesterday),
                          "--at must not apply the skew tolerance")
+
+
+class TestSixthAudit(TmpDirTest):
+    """6.2.2 — second-review remnants (GLM), each reproduced before fixing:
+    order-dependent identity ranking, fragile daily-decay guard, stale
+    supersession edges on reopen, and valid_to clock skew."""
+
+    def hippo(self):
+        return Hippocampus(self.mind_dir / "graph.json")
+
+    def test_third_person_name_beats_filename_any_order(self):
+        # reproduced: with the name fact stored FIRST, co-occurrence
+        # expansion smeared `user` onto the filename fact and it won
+        for order in (0, 1):
+            h = Hippocampus(self.mind_dir / ("g%d.json" % order))
+            facts = ["the user's name is Da7em",
+                     "file name must match the class name"]
+            if order:
+                facts.reverse()
+            for f in facts:
+                h.remember(f)
+            results, _, _ = h.recall("what is my name")
+            self.assertIn("Da7em", results[0][2]["text"],
+                          "order %d: assertion must beat incidental mention"
+                          % order)
+
+    def test_expansion_never_gifts_identity_keys(self):
+        h = self.hippo()
+        h.remember("the user's name is Da7em")
+        nid = h.remember("file name must match the class name")
+        self.assertNotIn("user", h.nodes[nid]["keys"],
+                         "co-occurrence must not import identity keys")
+
+    def test_daily_decay_guard_survives_journal_deletion(self):
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        d = Dreamer(self.mind_dir, h, c)
+        h.remember("alpha module calls beta module")
+        h.remember("beta writes to gamma store")
+        h.link("alpha module calls beta module", "beta writes to gamma store")
+        ida = h._id("alpha module calls beta module")
+        d.dream()
+        w1 = list(h.edges[ida].values())[0]["weight"]
+        for pth in (self.mind_dir / "dreams").glob("*.md"):
+            pth.unlink()                     # the attack
+        d.dream()
+        w2 = list(h.edges[ida].values())[0]["weight"]
+        self.assertEqual(w1, w2, "guard must persist in graph.json, not "
+                         "depend on the journal file existing")
+        h2 = Hippocampus(self.mind_dir / "graph.json")
+        self.assertTrue(h2.meta.get("last_edge_decay"),
+                        "marker must survive a reload")
+
+    def test_reopen_clears_stale_supersession_edges(self):
+        # reproduced: postgres -> sqlite -> postgres left the live postgres
+        # wearing a superseded-by edge (contradictory state in `why`)
+        h = self.hippo()
+        h.remember("the database is postgres")
+        h.correct("postgres", "the database is sqlite")
+        h.correct("sqlite", "the database is postgres")
+        pg = h._id("the database is postgres")
+        self.assertIsNone(h.nodes[pg].get("valid_to"))
+        self.assertIsNone(h.nodes[pg].get("superseded_by"))
+        stale = [e for e in h.edges.get(pg, {}).values()
+                 if e.get("relation") == "superseded-by"]
+        self.assertEqual(stale, [], "live fact must not wear superseded-by")
+        # the CLOSED fact keeps its history edge — that is true history
+        sq = h._id("the database is sqlite")
+        self.assertIsNotNone(h.nodes[sq].get("valid_to"))
+
+    def test_future_valid_to_hides_closed_fact_now(self):
+        # a closing stamped by an eastern machine (vt in our near future)
+        # must count as closed NOW — not "valid until midnight"
+        h = self.hippo()
+        nid = h.remember("the cache is redis")
+        h.nodes[nid]["valid_to"] = (datetime.now()
+                                    + timedelta(hours=8)).isoformat()
+        self.assertFalse(h._valid_at(h.nodes[nid]),
+                         "near-future closing means already closed")
 
 
 if __name__ == "__main__":

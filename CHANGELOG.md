@@ -1,5 +1,34 @@
 # Changelog
 
+## 6.2.2 — 2026-07-06
+
+Second-review round on 6.2.1 (same two auditors re-ran everything; one
+confirmed the 6.2.1 fixes clean, the other found real remnants — each
+reproduced here before fixing, with regression tests; 185 tests):
+
+- **Identity ranking was order-dependent** (reproduced: name fact stored
+  FIRST → the filename convention won "what is my name"). Two causes,
+  both fixed: third-person assertions ("the user's name is X") now earn
+  facet keys like first-person ones, and co-occurrence expansion can no
+  longer GIFT identity keys to non-identity facts (it used to smear
+  `user` onto whatever was stored next to the name).
+- **The daily edge-decay marker is persisted in graph.json**
+  (`meta.last_edge_decay`, max-wins merge under the save lock) — the
+  journal-file-existence heuristic re-decayed when the day's memo was
+  deleted or lost.
+- **Reopening a superseded fact clears its stale supersession edges**:
+  postgres → sqlite → postgres left the LIVE postgres wearing a
+  "superseded-by" edge, so `why` reported it as both current and
+  replaced. The closed fact keeps its history edge — that part is true.
+- **valid_to gets the same 26 h skew tolerance as valid_from** on
+  present-time checks: a closing stamped by an eastern machine meant
+  BOTH the old and new fact were returned until local midnight.
+- `signals.jsonl` append now also checks the parent chain
+  (`_reject_symlinked_parents`), matching every other write path.
+- Fixtures neutralized (no persona names in tests/benches); intro wording
+  scoped to "all your agents".
+
+
 ## 6.2.1 — 2026-07-05
 
 Fifth external audit round (two independent reviews of 6.2.0). Every claim

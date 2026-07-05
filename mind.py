@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.2.1"
+__version__ = "6.2.2"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -623,6 +623,7 @@ class Hippocampus:
         self.nodes = {}   # id -> {text, weight, peak_weight, last_accessed,
         #                          access_count, created, confidence, keys, history}
         self.edges = {}   # id -> {neighbor_id: {relation, weight}}
+        self.meta = {}    # small persisted strings (e.g. last_edge_decay)
         self.related = None
         self.embedder = HashEmbed()
         self._deleted = set()   # node ids deleted this session (see _save merge)
@@ -787,6 +788,10 @@ class Hippocampus:
             data = self._quarantine(e)
         self.nodes = self._repair_nodes(data.get("nodes", {}))
         self.edges = self._repair_edges(data.get("edges", {}), self.nodes)
+        meta = data.get("meta", {})
+        self.meta = ({k: v for k, v in meta.items()
+                      if isinstance(k, str) and isinstance(v, str)}
+                     if isinstance(meta, dict) else {})
 
     def _save(self):
         """Locked read-merge-write: concurrent agent processes cannot lose
@@ -911,8 +916,19 @@ class Hippocampus:
                         # drop node-keys the disk left empty after stripping
                         merged_e = {k: v for k, v in merged_e.items() if v}
                         self.nodes, self.edges = merged_n, merged_e
+                    # meta merge (max-wins: ISO dates compare) — inside
+                    # the same disk-copy scope as nodes/edges
+                    disk_meta = (disk.get("meta", {})
+                                 if isinstance(disk, dict) and
+                                 isinstance(disk.get("meta", {}), dict)
+                                 else {})
+                    for mk, mv in disk_meta.items():
+                        if isinstance(mk, str) and isinstance(mv, str) and \
+                                mv > self.meta.get(mk, ""):
+                            self.meta[mk] = mv
                 _atomic_write(self.path, json.dumps(
-                    {"nodes": self.nodes, "edges": self.edges},
+                    {"nodes": self.nodes, "edges": self.edges,
+                     "meta": self.meta},
                     ensure_ascii=False, indent=2),
                     boundary=self.path.parent)
                 # deletions/prunes are now persisted to disk; clear them so
@@ -1003,8 +1019,14 @@ class Hippocampus:
                           else sorted(IDENTITY_KEYS)):
                     keys.setdefault(k)
         elif (text_tokens & _IDENT_POSSESSIVE) or \
-                (text_tokens & _IDENT_FIRST_PERSON
+                ((text_tokens & _IDENT_FIRST_PERSON
+                  or text_tokens & {"user", "المستخدم"})
                  and text_tokens & _IDENT_NOUNS):
+            # third-person assertions ("the user's name is X") are identity
+            # statements too — requiring a first-person pronoun left them
+            # without facet keys, so an incidental "file NAME must match..."
+            # could outrank them depending on store ORDER (auditor finding,
+            # 6.2.2, reproduced: name fact first -> distractor won)
             # stored facts earn only the facets they actually state —
             # never the whole identity-key set (auditor finding, 6.2.1)
             facets = _facet_keys(text_tokens)
@@ -1021,7 +1043,11 @@ class Hippocampus:
                 if self.related.df.get(stem(w.lower()), 0) >= 2:
                     continue
                 for term, sc in self.related.related(w, top_k=4):
-                    if sc >= 0.15:
+                    # identity keys are EARNED by stating identity, never
+                    # imported by co-occurrence: expansion used to smear
+                    # `user` onto a filename convention stored after the
+                    # name fact (auditor finding, 6.2.2)
+                    if sc >= 0.15 and term not in IDENTITY_KEYS:
                         keys.setdefault(term)
         return list(keys)[:24]
 
@@ -1065,6 +1091,7 @@ class Hippocampus:
             if n.get("valid_to"):
                 n["valid_to"] = None
                 n.pop("superseded_by", None)
+                self._clear_supersession_edges(nid)
                 n["valid_from"] = now
                 self._dirty.add(nid)
         else:
@@ -1131,6 +1158,25 @@ class Hippocampus:
         return {stem(w) for w in _tokenize((text or "").lower())
                 if w not in STOPWORDS}
 
+    def _clear_supersession_edges(self, nid):
+        """A reopened fact is current again: drop the stale superseded-by /
+        supersedes edge pair left over from its closed segment (the
+        transition stays in the journal). Without this, a LIVE fact kept
+        wearing a "superseded-by" edge — `why` reported it as both current
+        and replaced (auditor finding, 6.2.2)."""
+        for nbr, e in list(self.edges.get(nid, {}).items()):
+            if e.get("relation") == "superseded-by":
+                del self.edges[nid][nbr]
+                self._pruned_edges.add((nid, nbr))
+                rev = self.edges.get(nbr, {})
+                if rev.get(nid, {}).get("relation") == "supersedes":
+                    del rev[nid]
+                    self._pruned_edges.add((nbr, nid))
+                    if not rev:
+                        del self.edges[nbr]
+        if nid in self.edges and not self.edges[nid]:
+            del self.edges[nid]
+
     def correct(self, old_hint, new_text):
         """Temporal reconsolidation (fusion, not erasure): find the memory
         best matching `old_hint`, CLOSE its validity (valid_to = now,
@@ -1182,6 +1228,7 @@ class Hippocampus:
             if existing.get("valid_to"):   # re-asserted → new segment
                 existing["valid_to"] = None
                 existing.pop("superseded_by", None)
+                self._clear_supersession_edges(new_nid)
                 existing["valid_from"] = now
         else:
             by, session = self._actor()
@@ -1257,6 +1304,8 @@ class Hippocampus:
                 if self.related.df.get(stem(w.lower()), 0) >= 2:
                     continue                     # same rare-term-only rule
                 for term, _ in self.related.related(w, top_k=4):
+                    if term in IDENTITY_KEYS:
+                        continue
                     expanded.add(term)
         keys = expanded
         alive = {nid for nid, n in self.nodes.items()
@@ -1506,6 +1555,7 @@ class Hippocampus:
         if sig_file.is_symlink():
             return
         try:
+            _reject_symlinked_parents(sig_file, self.path.parent)
             fd = os.open(str(sig_file),
                          os.O_WRONLY | os.O_CREAT | os.O_APPEND |
                          getattr(os, "O_NOFOLLOW", 0), 0o644)
@@ -1516,7 +1566,7 @@ class Hippocampus:
                     ensure_ascii=False) + "\n").encode("utf-8"))
             finally:
                 os.close(fd)
-        except OSError:
+        except (OSError, ValueError):
             pass    # telemetry only — never block the write it rode on
 
     # -- provenance -----------------------------------------------------
@@ -1615,9 +1665,13 @@ class Hippocampus:
         vf = node.get("valid_from") or node.get("created") or ""
         vt = node.get("valid_to")
         if at is None:
-            now = _now()
-            horizon = (now + timedelta(hours=26)).isoformat()
-            return vf <= horizon and (vt is None or now.isoformat() < vt)
+            # symmetric skew handling: a CLOSING stamped by an eastern
+            # machine (vt in our future) means the fact was already
+            # superseded there — treating it as still-valid here returned
+            # BOTH the old and new fact until local midnight (auditor
+            # finding, 6.2.2). Both bounds compare against the horizon.
+            horizon = (_now() + timedelta(hours=26)).isoformat()
+            return vf <= horizon and (vt is None or horizon < vt)
         return vf <= at and (vt is None or at < vt)
 
 
@@ -1705,11 +1759,16 @@ class Dreamer:
         # instead of the documented ~45 nights (auditor finding, 6.2.1).
         # Edges of memories that earn confirmed recalls get restrengthened
         # by bump(), so only genuinely unused connections drift down...
-        first_cycle_today = not (self.dir / ("%s.md" % _now().date())).exists()
+        # the once-a-day marker is persisted INSIDE graph.json — the old
+        # journal-file-existence heuristic re-decayed whenever the day's
+        # memo was deleted or lost (auditor finding, 6.2.2)
+        today = str(_now().date())
+        first_cycle_today = self.hippo.meta.get("last_edge_decay", "") < today
         if not dry_run and first_cycle_today:
             for nbrs in self.hippo.edges.values():
                 for e in nbrs.values():
                     e["weight"] = round(e.get("weight", 1.0) * EDGE_DECAY_PER_DREAM, 4)
+            self.hippo.meta["last_edge_decay"] = today
         # ...and synaptic pruning removes the ones that decayed away
         pruned_edges = 0
         for nid in list(self.hippo.edges.keys()):
