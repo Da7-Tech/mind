@@ -102,7 +102,7 @@ rounds had missed (see CHANGELOG 5.5.0).
 (flipped comparisons, broken arithmetic, nudged constants) and the suite
 must catch them. Its first run exposed 17 behaviors the tests didn't
 actually pin down — each is now locked by a dedicated regression test
-(raw kill rate on the seeded 120-mutant sample: 33% at first run, 42%
+(raw kill rate on the seeded 120-mutant sample: 33% at first run, 48%
 on this release — the sample is re-drawn whenever the file changes, so
 the number moves a few points between releases; it is remeasured and
 republished each time because hiding it would be the exact sin this
