@@ -2301,12 +2301,12 @@ class TestFifthAudit(TmpDirTest):
         # GLM finding (reproduced): "my city is Riyadh" earned ALL identity
         # keys (incl. name/user) and beat the actual name on "what is my name"
         h = self.hippo()
-        h.remember("the user's name is Da7em")
+        h.remember("the user's name is Samir")
         h.remember("my city is Riyadh")
         h.remember("my project is a memory tool")
         results, _, _ = h.recall("what is my name")
         self.assertTrue(results, "name query must return results")
-        self.assertIn("Da7em", results[0][2]["text"],
+        self.assertIn("Samir", results[0][2]["text"],
                       "the name fact must rank first on a name query")
         results, _, _ = h.recall("what is my city")
         self.assertIn("Riyadh", results[0][2]["text"],
@@ -2314,11 +2314,11 @@ class TestFifthAudit(TmpDirTest):
 
     def test_facetless_identity_query_reaches_all_identity_facts(self):
         h = self.hippo()
-        h.remember("the user's name is Da7em")
+        h.remember("the user's name is Samir")
         h.remember("my city is Riyadh")
         results, _, _ = h.recall("who am I")
         texts = " ".join(n["text"] for _, _, n in results)
-        self.assertIn("Da7em", texts)
+        self.assertIn("Samir", texts)
         self.assertIn("Riyadh", texts)
 
     def test_stored_city_fact_has_no_name_keys(self):
@@ -2383,20 +2383,20 @@ class TestSixthAudit(TmpDirTest):
         # expansion smeared `user` onto the filename fact and it won
         for order in (0, 1):
             h = Hippocampus(self.mind_dir / ("g%d.json" % order))
-            facts = ["the user's name is Da7em",
+            facts = ["the user's name is Samir",
                      "file name must match the class name"]
             if order:
                 facts.reverse()
             for f in facts:
                 h.remember(f)
             results, _, _ = h.recall("what is my name")
-            self.assertIn("Da7em", results[0][2]["text"],
+            self.assertIn("Samir", results[0][2]["text"],
                           "order %d: assertion must beat incidental mention"
                           % order)
 
     def test_expansion_never_gifts_identity_keys(self):
         h = self.hippo()
-        h.remember("the user's name is Da7em")
+        h.remember("the user's name is Samir")
         nid = h.remember("file name must match the class name")
         self.assertNotIn("user", h.nodes[nid]["keys"],
                          "co-occurrence must not import identity keys")
@@ -2496,8 +2496,24 @@ class TestSeventhAudit(TmpDirTest):
         h2 = Hippocampus(gpath)
         self.assertNotIn("ansi", h2.meta, "control chars must be dropped")
         self.assertNotIn("num", h2.meta, "non-strings must be dropped")
-        self.assertLessEqual(len(h2.meta.get("huge", "")), 64,
-                             "values must be length-capped")
+        self.assertNotIn("huge", h2.meta,
+                         "non-whitelisted keys must be dropped (6.2.5)")
+        self.assertNotIn("ok", h2.meta, "whitelist is strict")
+
+    def test_meta_key_whitelist_bounds_growth(self):
+        # 1000 injected keys must collapse to the whitelist only
+        gpath = self.mind_dir / "graph.json"
+        h = Hippocampus(gpath)
+        h.remember("seed fact for whitelist test")
+        g = json.loads(gpath.read_text("utf-8"))
+        g["meta"] = {("k%d" % i): "v" for i in range(1000)}
+        g["meta"]["last_edge_decay"] = "2026-01-01"
+        gpath.write_text(json.dumps(g), encoding="utf-8")
+        h2 = Hippocampus(gpath)
+        h2.remember("second fact")
+        g2 = json.loads(gpath.read_text("utf-8"))
+        self.assertEqual(set(g2.get("meta", {})), {"last_edge_decay"},
+                         "meta growth must be bounded by the whitelist")
 
 
 class TestEighthAudit(TmpDirTest):

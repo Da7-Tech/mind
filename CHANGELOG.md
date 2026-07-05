@@ -1,5 +1,33 @@
 # Changelog
 
+## 6.2.5 — 2026-07-06
+
+Distribution-channel closure round (the auditors' remaining findings were
+about the RELEASE VIEW, not the code — this tag exists so the published
+channel carries every correction):
+
+- **The tag now contains the current docs.** 6.2.4's two follow-up doc
+  fixes (DESIGN multilingual figure; mutation kill rate) had landed on
+  main AFTER the tag, so anyone reading the released tree saw stale
+  numbers. From now on doc corrections re-cut the release.
+- **Fixtures are actually persona-free now**: the English alias survived
+  the earlier Arabic-only neutralization in seven test lines; all
+  fixtures use neutral names.
+- **graph.json meta is whitelist-bounded**: only known keys survive
+  load/merge (a hand-edited file could previously grow meta without
+  bound, one 64-char value per arbitrary key; 1000-key injection now
+  collapses to the whitelist — regression-tested).
+- Mutation kill rate measured on THIS file: 45% (the deterministic
+  sample re-draws on every code change; measured as the last step
+  before tagging). 189 tests.
+
+Scope notes, stated plainly: branch protection intentionally has no
+required PR reviews and enforce_admins=false — this is a solo-maintainer
+repo; the required 9-job strict matrix is the guard that matters here.
+PR #56859 referenced in past releases lives in NousResearch/hermes-agent
+(the Hermes skill submission), not in this repository.
+
+
 ## 6.2.4 — 2026-07-06
 
 Panel round 2 (three fresh auditors cross-examining round 1 + re-breaking

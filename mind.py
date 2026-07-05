@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.2.4"
+__version__ = "6.2.5"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -55,6 +55,7 @@ PROMOTION_THRESHOLD = 3     # cluster of >= 3 related nodes -> cortex
 ACTIVE_TOKEN_BUDGET = 800   # working-memory budget in characters (~200 tokens)
 STABILITY_BASE_DAYS = 3.0   # Ebbinghaus: base memory stability
 STABILITY_PER_ACCESS = 14.0  # one confirmed recall buys ~two weeks of stability
+_META_KEYS = frozenset({"last_edge_decay"})  # graph.json meta whitelist
 AUTO_DREAM_SIGNALS = 10     # pending write signals that trigger an auto-dream
 AUTO_DREAM_HOURS = 24       # ...or last dream older than this (with >=1 signal)
 GRACE_DAYS = 45             # no memory dies within 45 days of its last access
@@ -789,8 +790,11 @@ class Hippocampus:
         self.nodes = self._repair_nodes(data.get("nodes", {}))
         self.edges = self._repair_edges(data.get("edges", {}), self.nodes)
         meta = data.get("meta", {})
+        # whitelisted keys only: a hand-edited graph could otherwise grow
+        # meta without bound, one 64-char value per arbitrary key
+        # (auditor finding, 6.2.5)
         self.meta = ({k: v[:64] for k, v in meta.items()
-                      if isinstance(k, str) and isinstance(v, str)
+                      if k in _META_KEYS and isinstance(v, str)
                       and v.isprintable()}
                      if isinstance(meta, dict) else {})
         # a FUTURE-dated decay marker (clock skew, hand edit, synced graph)
@@ -932,8 +936,8 @@ class Hippocampus:
                                  else {})
                     merge_today = str(_now().date())
                     for mk, mv in disk_meta.items():
-                        if not (isinstance(mk, str) and isinstance(mv, str)
-                                and mv.isprintable()):
+                        if mk not in _META_KEYS or not (
+                                isinstance(mv, str) and mv.isprintable()):
                             continue
                         mv = mv[:64]
                         if mk == "last_edge_decay" and mv > merge_today:
