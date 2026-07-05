@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.2.0"
+__version__ = "6.2.1"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -347,6 +347,36 @@ _IDENT_FIRST_PERSON = {"my", "our", "انا", "أنا", "نحن", "اني", "أ�
                        "انني", "إني"}
 _IDENT_NOUNS = {"name", "project", "city", "team", "company", "اسم",
                 "الاسم", "مشروع", "المشروع", "مدينة", "المدينة"}
+# Facet map (6.2.1): an identity noun grants only ITS OWN identity keys —
+# granting the whole IDENTITY_KEYS set gave "my city is Riyadh" the `name`
+# and `user` keys too, so it outranked the user's actual name on
+# "what is my name" (auditor finding, reproduced). Personal facets (name,
+# team, company) also carry the user keys; place facets don't.
+_NAME_FACET = ("name", "الاسم", "user", "المستخدم")
+_CITY_FACET = ("city", "المدينة")
+_PROJ_FACET = ("project", "المشروع")
+_USER_FACET = ("user", "المستخدم")
+_IDENT_FACETS = {
+    "name": _NAME_FACET, "اسم": _NAME_FACET, "الاسم": _NAME_FACET,
+    "اسمي": _NAME_FACET, "اسمنا": _NAME_FACET,
+    "city": _CITY_FACET, "مدينة": _CITY_FACET, "المدينة": _CITY_FACET,
+    "مدينتي": _CITY_FACET, "مدينتنا": _CITY_FACET,
+    "project": _PROJ_FACET, "مشروع": _PROJ_FACET, "المشروع": _PROJ_FACET,
+    "مشروعي": _PROJ_FACET, "مشروعنا": _PROJ_FACET,
+    "team": _USER_FACET, "company": _USER_FACET,
+    "عملي": _USER_FACET, "myself": _USER_FACET,
+}
+
+
+def _facet_keys(tokens):
+    """Identity keys for exactly the facets the text names (deterministic
+    order). Empty when no mapped identity noun is present."""
+    out = []
+    for t in sorted(tokens):
+        for k in _IDENT_FACETS.get(t, ()):
+            if k not in out:
+                out.append(k)
+    return out
 
 _AR_SUFFIXES = ("تها", "تهن", "تنا", "تهم", "ية", "ون", "ين", "ان",
                 "ات", "ها", "هن", "هم", "نا", "ة", "ي", "ت", "ن")
@@ -794,7 +824,7 @@ class Hippocampus:
                     # OSError — so a save contended for >10s would crash the
                     # very scenario the lock exists for. Keep waiting instead,
                     # exactly like the POSIX path.
-                    for _attempt in range(18):   # ~3 min: LK_LOCK waits
+                    for _attempt in range(18):   # up to ~3 min: LK_LOCK waits
                         try:                        # ~10s per call
                             msvcrt.locking(lockf.fileno(), msvcrt.LK_LOCK, 1)
                             break
@@ -964,12 +994,21 @@ class Hippocampus:
                     keys.setdefault(t)
         if is_query:
             if text_tokens & PRONOUN_FALLBACK or not had_content:
-                for k in sorted(IDENTITY_KEYS):
+                # a query that NAMES a facet ("what is my name") gets only
+                # that facet's keys, so place/project identity facts can't
+                # compete; a facet-less query ("who am I") legitimately
+                # wants every identity fact and keeps the full set
+                facets = _facet_keys(text_tokens)
+                for k in (facets if (facets and had_content)
+                          else sorted(IDENTITY_KEYS)):
                     keys.setdefault(k)
         elif (text_tokens & _IDENT_POSSESSIVE) or \
                 (text_tokens & _IDENT_FIRST_PERSON
                  and text_tokens & _IDENT_NOUNS):
-            for k in sorted(IDENTITY_KEYS):
+            # stored facts earn only the facets they actually state —
+            # never the whole identity-key set (auditor finding, 6.2.1)
+            facets = _facet_keys(text_tokens)
+            for k in (facets or sorted(IDENTITY_KEYS)):
                 keys.setdefault(k)
         self._ensure_related()
         if self.related is not None:
@@ -1452,6 +1491,7 @@ class Hippocampus:
             try:
                 os.write(fd, (header + "\n".join(lines) + "\n")
                          .encode("utf-8"))
+                os.fsync(fd)    # archived text is a durability promise
             finally:
                 os.close(fd)
         except (OSError, ValueError):
@@ -1459,13 +1499,25 @@ class Hippocampus:
         return True
 
     def _log_signal(self, kind, content):
+        # same O_NOFOLLOW discipline as every other write path: the
+        # is_symlink() check alone is TOCTOU-raceable (auditor finding,
+        # 6.2.1 — this was the one append still using a plain open())
         sig_file = self.path.parent / SIGNALS_FILE
         if sig_file.is_symlink():
             return
-        with sig_file.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"kind": kind, "content": content,
-                                "ts": _now().isoformat()},
-                               ensure_ascii=False) + "\n")
+        try:
+            fd = os.open(str(sig_file),
+                         os.O_WRONLY | os.O_CREAT | os.O_APPEND |
+                         getattr(os, "O_NOFOLLOW", 0), 0o644)
+            try:
+                os.write(fd, (json.dumps(
+                    {"kind": kind, "content": content,
+                     "ts": _now().isoformat()},
+                    ensure_ascii=False) + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+        except OSError:
+            pass    # telemetry only — never block the write it rode on
 
     # -- provenance -----------------------------------------------------
     @staticmethod
@@ -1511,6 +1563,7 @@ class Hippocampus:
             try:
                 os.write(fd, (json.dumps(entry, ensure_ascii=False)
                               + "\n").encode("utf-8"))
+                os.fsync(fd)    # provenance is permanent — survive power loss
             finally:
                 os.close(fd)
         except OSError as e:
@@ -1550,10 +1603,21 @@ class Hippocampus:
     def _valid_at(node, at=None):
         """Truth validity, distinct from attention (weight): a fact is
         valid from valid_from until valid_to (open = still true). ISO
-        strings compare lexicographically, so no parsing is needed."""
-        at = at or _now().isoformat()
+        strings compare lexicographically, so no parsing is needed.
+
+        Present-time checks tolerate a slightly-future valid_from (26 h —
+        covers every timezone offset plus drift): timestamps are naive
+        local time, so memory synced from a machine east of this one
+        carries "future" stamps. decay() already clamps future elapsed
+        time to zero; without the same tolerance here a fresh synced fact
+        was invisible until local midnight caught up (auditor finding,
+        6.2.1). Explicit --at queries stay literal: history is history."""
         vf = node.get("valid_from") or node.get("created") or ""
         vt = node.get("valid_to")
+        if at is None:
+            now = _now()
+            horizon = (now + timedelta(hours=26)).isoformat()
+            return vf <= horizon and (vt is None or now.isoformat() < vt)
         return vf <= at and (vt is None or at < vt)
 
 
@@ -1634,10 +1698,15 @@ class Dreamer:
         if len(pruned) > 5:
             log.append("  - ... and %d more" % (len(pruned) - 5))
 
-        # synaptic homeostasis: every edge weakens a little each dream;
-        # edges of memories that earn confirmed recalls get restrengthened
+        # synaptic homeostasis: edges weaken a little ONCE PER CALENDAR DAY
+        # (the first dream of the day), not once per cycle — auto-dream can
+        # legitimately run several cycles in a busy day, and per-cycle decay
+        # compounded (0.95^n) fast enough to prune healthy edges in days
+        # instead of the documented ~45 nights (auditor finding, 6.2.1).
+        # Edges of memories that earn confirmed recalls get restrengthened
         # by bump(), so only genuinely unused connections drift down...
-        if not dry_run:
+        first_cycle_today = not (self.dir / ("%s.md" % _now().date())).exists()
+        if not dry_run and first_cycle_today:
             for nbrs in self.hippo.edges.values():
                 for e in nbrs.values():
                     e["weight"] = round(e.get("weight", 1.0) * EDGE_DECAY_PER_DREAM, 4)
@@ -1704,6 +1773,7 @@ class Dreamer:
                          getattr(os, "O_NOFOLLOW", 0), 0o644)
             try:
                 os.write(fd, payload.encode("utf-8"))
+                os.fsync(fd)
             finally:
                 os.close(fd)
         except ValueError:

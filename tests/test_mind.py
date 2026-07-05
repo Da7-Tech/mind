@@ -681,8 +681,13 @@ class TestAuditFindings2(TmpDirTest):
                "postgres sixteen is the primary datastore")
         ida = h._id("the office wifi password rotates each quarter")
         idb = h._id("postgres sixteen is the primary datastore")
-        for _ in range(60):
-            d.dream()
+        base, orig = datetime.now(), M._now
+        try:
+            for i in range(60):
+                M._now = (lambda i=i: base + timedelta(days=i + 1))
+                d.dream()
+        finally:
+            M._now = orig
         reloaded = Hippocampus(self.mind_dir / "graph.json")
         self.assertNotIn(idb, reloaded.edges.get(ida, {}),
                          "pruned edge must stay pruned on disk, not revive")
@@ -919,8 +924,15 @@ class TestAuditFindings2(TmpDirTest):
         d.dream()
         w1 = list(h.edges[ida].values())[0]["weight"]
         self.assertLess(w1, 1.0, "edges must weaken after a dream")
-        for _ in range(50):
-            d.dream()
+        # 6.2.1: edge decay is once per CALENDAR DAY (auto-dream may cycle
+        # many times a day) — simulate nightly dreams by advancing the clock
+        base, orig = datetime.now(), M._now
+        try:
+            for i in range(50):
+                M._now = (lambda i=i: base + timedelta(days=i + 1))
+                d.dream()
+        finally:
+            M._now = orig
         self.assertFalse(h.edges.get(ida),
                          "an unconfirmed edge must eventually prune")
 
@@ -2275,6 +2287,87 @@ class TestAutomatic(unittest.TestCase):
                       "frankfurt", "server is in helsinki")
         self.assertIn("auto-dream", r.stdout,
                       "correct with a stale dream must consolidate")
+
+
+class TestFifthAudit(TmpDirTest):
+    """6.2.1 — external audit findings (Codex + GLM), each reproduced
+    before fixing: identity-facet keys, once-per-day edge decay, and
+    clock-skew tolerance in present-time validity."""
+
+    def hippo(self):
+        return Hippocampus(self.mind_dir / "graph.json")
+
+    def test_city_fact_does_not_outrank_name_query(self):
+        # GLM finding (reproduced): "my city is Riyadh" earned ALL identity
+        # keys (incl. name/user) and beat the actual name on "what is my name"
+        h = self.hippo()
+        h.remember("the user's name is Da7em")
+        h.remember("my city is Riyadh")
+        h.remember("my project is a memory tool")
+        results, _, _ = h.recall("what is my name")
+        self.assertTrue(results, "name query must return results")
+        self.assertIn("Da7em", results[0][2]["text"],
+                      "the name fact must rank first on a name query")
+        results, _, _ = h.recall("what is my city")
+        self.assertIn("Riyadh", results[0][2]["text"],
+                      "the city fact must rank first on a city query")
+
+    def test_facetless_identity_query_reaches_all_identity_facts(self):
+        h = self.hippo()
+        h.remember("the user's name is Da7em")
+        h.remember("my city is Riyadh")
+        results, _, _ = h.recall("who am I")
+        texts = " ".join(n["text"] for _, _, n in results)
+        self.assertIn("Da7em", texts)
+        self.assertIn("Riyadh", texts)
+
+    def test_stored_city_fact_has_no_name_keys(self):
+        h = self.hippo()
+        nid = h.remember("my city is Riyadh")
+        keys = set(h.nodes[nid]["keys"])
+        self.assertNotIn("name", keys)
+        self.assertNotIn("user", keys)
+        self.assertIn("city", keys)
+
+    def test_edge_decay_once_per_day_not_per_cycle(self):
+        # GLM finding: auto-dream can cycle many times a day; per-cycle
+        # 0.95^n pruned healthy edges in days instead of ~45 nights
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        d = Dreamer(self.mind_dir, h, c)
+        h.remember("alpha module calls beta module")
+        h.remember("beta module writes to gamma store")
+        h.link("alpha module calls beta module",
+               "beta module writes to gamma store")
+        ida = h._id("alpha module calls beta module")
+        d.dream()
+        w_after_first = list(h.edges[ida].values())[0]["weight"]
+        self.assertLess(w_after_first, 1.0)
+        for _ in range(5):
+            d.dream()          # same calendar day
+        w_after_five_more = list(h.edges[ida].values())[0]["weight"]
+        self.assertEqual(w_after_first, w_after_five_more,
+                         "same-day cycles must not compound edge decay")
+
+    def test_valid_at_tolerates_clock_skew_now_but_not_at(self):
+        # GLM finding: a fact synced from a machine east of us carries a
+        # "future" naive timestamp and was invisible until midnight
+        h = self.hippo()
+        nid = h.remember("the deploy target is hetzner")
+        future = (datetime.now() + timedelta(hours=8)).isoformat()
+        h.nodes[nid]["valid_from"] = future
+        self.assertTrue(h._valid_at(h.nodes[nid]),
+                        "present check must tolerate timezone skew (<26h)")
+        far = (datetime.now() + timedelta(hours=48)).isoformat()
+        h.nodes[nid]["valid_from"] = far
+        self.assertFalse(h._valid_at(h.nodes[nid]),
+                         "a genuinely future fact stays invisible")
+        # explicit --at stays literal history
+        yesterday = (datetime.now() - timedelta(days=1)).isoformat()
+        h.nodes[nid]["valid_from"] = (datetime.now()
+                                      + timedelta(hours=8)).isoformat()
+        self.assertFalse(h._valid_at(h.nodes[nid], at=yesterday),
+                         "--at must not apply the skew tolerance")
 
 
 if __name__ == "__main__":

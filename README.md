@@ -23,8 +23,8 @@ adopted automatically by `.cursorrules`, `.windsurfrules`, `.clinerules`
 and `.roo/rules/mind.md` in projects that already use those tools.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.0/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='39a2f6e4a832032f97502444fd0f0208c84806e87f6f8d2d6b30794c2ffd2339',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.1/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='faccb80fdb926e3486151fb312b8cccffaf503d48790c1876dd6cd74b55a5c6c',h;print('mind.py: OK')"
 python3 mind.py init
 python3 mind.py remember "the project database is postgres 16"
 python3 mind.py recall "which database do we use"
@@ -102,14 +102,14 @@ rounds had missed (see CHANGELOG 5.5.0).
 (flipped comparisons, broken arithmetic, nudged constants) and the suite
 must catch them. Its first run exposed 17 behaviors the tests didn't
 actually pin down — each is now locked by a dedicated regression test
-(raw kill rate went 33% → 43% on the seeded 120-mutant sample; the raw number is
+(raw kill rate on the seeded 120-mutant sample: 33% at first run, 44% today — remeasured every release; the raw number is
 published because hiding it would be the exact sin this tool exists to
 catch).
 Surviving mutants are triaged in the tool's output: unreachable `get()`
 defaults, display-only constants, and ranking-calibration values guarded
 by the CI benchmark gate (recall@1 ≥ 0.9) rather than unit assertions.
 
-Test suite: **175 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **180 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, corrupt-graph recovery, and
 a mutation-kill class where every test pins a behavior the suite
@@ -288,7 +288,8 @@ and OpenClaw uses for its workspace memory:
 
 1. **The contract rides the always-loaded file.** `mind init` embeds
    *standing orders* into `AGENTS.md`/`CLAUDE.md`/`GEMINI.md` — the files
-   every coding agent auto-injects each session. They tell the agent to save
+   these coding agents auto-load each session (any agent that reads
+   them gets the contract; one that reads none of them gets nothing). They tell the agent to save
    stable facts as it works (with an aggressive never-save list to prevent
    rot), to save 1–3 durable facts before finishing any substantive task,
    and to `recall` before ever claiming ignorance — **never asking the user
@@ -336,7 +337,7 @@ optional, since auto-dream already covers it.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 175 tests
+python3 -m unittest discover -s tests   # 180 tests
 python3 bench/bench.py                  # reproduce the EN/AR numbers
 python3 bench/multilang.py              # 8 untuned languages
 python3 bench/soak.py                   # 180 simulated days

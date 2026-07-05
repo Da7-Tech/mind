@@ -1,5 +1,41 @@
 # Changelog
 
+## 6.2.1 — 2026-07-05
+
+Fifth external audit round (two independent reviews of 6.2.0). Every claim
+was reproduced-or-refuted before acting; each fix carries a regression test
+(180 tests):
+
+- **Identity facets** (reproduced): a stored fact with a first-person
+  identity phrase earned ALL identity keys — "my city is Riyadh" got the
+  `name`/`user` keys too and outranked the user's actual name on
+  "what is my name". Stored facts (and facet-naming queries) now earn only
+  the facets they state: a city fact carries city keys, a name fact
+  carries name+user keys; facet-less queries ("who am I") keep the full
+  set and still reach every identity fact.
+- **Edge decay is once per calendar day** (reproduced): auto-dream can
+  legitimately cycle several times in a busy day, and per-cycle 0.95^n
+  homeostasis pruned healthy edges in days instead of the documented ~45
+  nights. Only the first cycle of a day weakens edges now.
+- **Present-time validity tolerates clock skew** (26 h): naive local
+  timestamps synced from a machine east of this one made a fresh fact
+  invisible until local midnight; `decay()` already clamped future time,
+  `_valid_at` now matches. Explicit `--at` queries stay literal.
+- **The last unhardened append closed**: `signals.jsonl` now uses the same
+  O_NOFOLLOW+O_APPEND discipline as every other write path, and the
+  permanence-bearing appends (provenance journal, archive, dream journal)
+  fsync. SECURITY.md now states the per-path guarantees exactly.
+- **Repo governance**: GitHub private vulnerability reporting is actually
+  enabled now (SECURITY.md described it; the toggle was off), branch
+  protection requires all 9 CI jobs (was 3) with strict up-to-date mode,
+  and a code of conduct + issue/PR templates were added.
+- Docs precision: line count ~2,600 (was "~2,100"), mutation kill rate
+  remeasured at 44% on the current file, "every coding agent" softened to
+  the enumerated list (an agent that reads none of the files gets
+  nothing), SKILL wording covers the first-write dream. One audit claim
+  was REFUTED by measurement: CONCEPT_SEED has 83 entries as documented
+  (the report counted 44).
+
 ## 6.2.0 — 2026-07-05
 
 **Automatic operation.** Field report that motivated it: a real user ran

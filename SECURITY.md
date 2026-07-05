@@ -13,7 +13,10 @@ hardening suggestions. You can expect an initial response within a few days.
 
 ## Security properties (and their tests)
 
-- Atomic, durable writes: O_NOFOLLOW + fsync-before-rename everywhere,
+- Atomic, durable writes: every replace-path write is O_NOFOLLOW +
+  fsync-before-rename; the append-only logs (provenance journal,
+  archive, dream journal, signals) use single O_NOFOLLOW+O_APPEND
+  writes, fsynced on the permanence-bearing ones,
   including the lock file (`tests/test_mind.py` — the audit-regression classes
   `TestAuditFindings2`, `TestThirdAudit`, `TestFourthAudit`).
 - Symlinked agent files, lock files, archive files and export parents are
@@ -33,4 +36,4 @@ hardening suggestions. You can expect an initial response within a few days.
 - Node ids are `md5[:12]` content addresses — no security property is
   derived from them.
 - No network access, no subprocess execution, no eval — the file can be
-  fully audited in one sitting (~2,100 lines).
+  fully audited in one sitting (~2,600 lines).
