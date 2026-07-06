@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.2.5"
+__version__ = "6.2.6"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -2221,7 +2221,8 @@ class Mind:
             raise ValueError("refusing: .mind is a symlink")
         if (self.dir / GRAPH_FILE).exists():
             print("mind memory already exists in %s (nothing changed)." % self.dir)
-            print("  to reset: delete .mind/ first. for a report: python3 mind.py status")
+            print("  to reset: delete .mind/ first. for a report:"
+                  " %s status" % _invocation(self.root))
             return
         self.dir.mkdir(parents=True, exist_ok=True)
         (self.dir / CORTEX_DIR).mkdir(exist_ok=True)
@@ -2260,7 +2261,8 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
         if self.dir.is_symlink():
             raise ValueError("refusing: .mind is a symlink")
         if not self.dir.exists():
-            print("no mind memory here. run: python3 mind.py init", file=sys.stderr)
+            print("no mind memory here. run: %s init"
+                  % _invocation(self.root), file=sys.stderr)
             sys.exit(1)
         self.hippo = Hippocampus(self.dir / GRAPH_FILE)
         self.cortex = Cortex(self.dir / CORTEX_DIR)
@@ -2347,8 +2349,12 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
             print("     (confidence %.1f, recalled %dx, weight %.2f, id %s)"
                   % (n.get("confidence", 1), n.get("access_count", 0),
                      n["weight"], nid))
+        # path-aware like the exported contract: agents copy this hint
+        # literally, and a bare `mind.py` mis-fires outside the project
+        # root — the same field-failure class _invocation() exists to kill
+        # (auditor finding, 6.2.6)
         print("\n  (if a result actually answered you, reinforce it:"
-              " python3 mind.py confirm <id>)")
+              " %s confirm <id>)" % _invocation(self.root))
 
     def confirm(self, node_ids):
         self._ensure()

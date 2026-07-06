@@ -2543,5 +2543,31 @@ class TestEighthAudit(TmpDirTest):
             "the reopened live fact wears no superseded-by edge")
 
 
+class TestNinthAudit(TmpDirTest):
+    """6.2.6 — final panel: every runtime guidance string is path-aware
+    (the recall footer still said bare `python3 mind.py confirm`)."""
+
+    def test_runtime_hints_carry_real_path(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "tools").mkdir()
+            (root / "proj").mkdir()
+            here = Path(__file__).resolve().parents[1] / "mind.py"
+            script = root / "tools" / "mind.py"
+            shutil.copy(str(here), str(script))
+            run = lambda *a, **k: subprocess.run(
+                [sys.executable, str(script)] + list(a),
+                cwd=str(root / "proj"), capture_output=True, text=True, **k)
+            run("init")
+            run("remember", "the database is postgres")
+            r = run("recall", "which database")
+            self.assertIn(str(script.resolve()), r.stdout,
+                          "recall confirm-hint must carry the real path")
+            self.assertNotIn(" python3 mind.py confirm", r.stdout)
+            r2 = run("init")   # already-exists hint
+            self.assertIn(str(script.resolve()), r2.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

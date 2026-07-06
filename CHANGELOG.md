@@ -1,5 +1,26 @@
 # Changelog
 
+## 6.2.6 — 2026-07-06
+
+Final panel round on 6.2.5 (three auditors: release-artifact, behavior +
+backward-compat, real-user journey from the live tag). Two verdicts of
+ZERO; one LOW finding, fixed:
+
+- **Every runtime guidance string is now path-aware**: the recall
+  footer (and the init-already-exists / no-memory-here hints) still
+  printed a bare `python3 mind.py ...` — the exact field-failure class
+  the exported contract was fixed for in 6.2.0. Agents copy those hints
+  literally; outside the project root they mis-fired. All runtime hints
+  now route through the same resolver as the contract
+  (regression-tested from a tools/-dir install). 190 tests, mutation
+  45% measured on this file as the last pre-tag step.
+
+The user-journey auditor's bottom-line on the original field complaint
+("worked all day, memory stayed empty"): would it recur? **No** — the
+absolute-path contract, the self-running dream, and the no-permission
+rule each verified end-to-end from the live tag.
+
+
 ## 6.2.5 — 2026-07-06
 
 Distribution-channel closure round (the auditors' remaining findings were
