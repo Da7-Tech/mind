@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.2.6"
+__version__ = "6.2.7"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -2125,7 +2125,12 @@ Two facts belong together? `%s link "a" "b" "relation"`.
     def export_to_agents(self, project_root):
         """Write the working-memory block into every agent's instruction file,
         preserving any user content outside the guard markers."""
-        src = self.path.read_text("utf-8") if self.path.exists() else ""
+        # _read_text_retry: on Windows a concurrent process os.replace-ing
+        # this file raises a transient sharing-violation PermissionError on
+        # the READER too — the fourth member of the family 6.1.3 fixed for
+        # graph.json (windows-latest 3.9 caught 1/12 parallel writers dying
+        # on CLAUDE.md; auditor finding, 6.2.7)
+        src = _read_text_retry(self.path) if self.path.exists() else ""
         written = []
         for target in self.TARGETS:
             target_path = Path(target)
@@ -2154,7 +2159,10 @@ Two facts belong together? `%s link "a" "b" "relation"`.
             tpath.parent.mkdir(parents=True, exist_ok=True)
             user_content = ""
             if tpath.exists():
-                content = tpath.read_text("utf-8")
+                try:
+                    content = _read_text_retry(tpath)
+                except FileNotFoundError:
+                    content = ""   # vanished mid-race: treat as fresh
                 # OUR block is identified structurally (BEGIN marker whose
                 # body starts with our exact generated header), never by a
                 # bare marker string: users legitimately quote the marker

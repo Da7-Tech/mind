@@ -1,5 +1,17 @@
 # Changelog
 
+## 6.2.7 — 2026-07-06
+
+- **Windows: agent-file reads retry transient sharing violations** — the
+  closing auditor caught windows-latest 3.9 red on the 6.2.6 tag:
+  1 of 12 parallel CLI writers died with Errno 13 on CLAUDE.md. The
+  reader side of `export_to_agents` (ACTIVE.md source + destination
+  agent files) was the fourth and last member of the sharing-violation
+  family 6.1.3 fixed for graph.json — both reads now go through
+  `_read_text_retry`, and a file vanishing mid-race reads as fresh.
+  Mutation on this file: 45%. 190 tests.
+
+
 ## 6.2.6 — 2026-07-06
 
 Final panel round on 6.2.5 (three auditors: release-artifact, behavior +
