@@ -42,5 +42,7 @@ hardening suggestions. You can expect an initial response within a few days.
   store secrets, credentials, private personal data, or untrusted prompt text.
 - Node ids are `md5[:12]` content addresses — no security property is
   derived from them.
-- No network access, subprocess execution, or eval — the file can be fully
-  audited in one sitting (~2,900 lines).
+- No network access, no spawned processes, no eval — the file can be
+  fully audited in one sitting (~3,000 lines). (`subprocess` is imported
+  on Windows solely for its `list2cmdline` quoting helper; nothing is
+  ever executed.)
