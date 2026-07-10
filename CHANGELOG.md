@@ -1,5 +1,51 @@
 # Changelog
 
+## 6.2.9 — 2026-07-10
+
+Independent re-audit of the 6.2.8 hardening release: one line-by-line
+auditor over the whole file, one differential regression hunter that
+first reproduced 6.2.7's defects to validate the 6.2.8 fixes, one
+claims-and-channels auditor, plus a full maintainer read of every file.
+All of 6.2.8's headline numbers reproduced exactly; the fixes below close
+what was still standing. Every fix was proven red with a regression test
+before the change:
+
+- **The last stale-decision races are closed.** The merge keeps a
+  per-node freshness baseline (last_accessed / access_count as of our
+  last disk read) and re-validates stale decisions against the CURRENT
+  disk copy inside the lock: a dream computed on a stale view can no
+  longer prune a memory another process confirmed meanwhile (the
+  GRACE_DAYS promise now holds under concurrency), a stale decayed
+  weight no longer min()s down a fresh confirm, and persisting a
+  duplicate-remember confidence upgrade no longer whole-copies stale
+  counters over a concurrent confirm — confidence merges max-wins as its
+  own field, the same way counters merge as deltas (6.2.8's way of
+  persisting it had traded one loss for another). Prune events are
+  journaled AFTER the save, and only for prunes that actually landed;
+  vetoed prunes are reported.
+- **The contradiction scan flags without clobbering.** An existing user
+  link between a conflicting pair keeps its relation and earned weight;
+  the conflict edge is only created where no user edge exists — "never
+  silently destroys data" covers edge metadata too.
+- **`recall --at` normalizes compact and tz-aware forms.** On 3.11+,
+  `--at 20260101` parsed but compared lexicographically against dashed
+  stamps ('-' < '0'), so every same-year fact looked valid at that past
+  date; all accepted forms now normalize to the naive dashed ISO the
+  graph stores before any comparison (older interpreters keep rejecting
+  compact forms as a usage error).
+- **A hand-deleted END guard no longer costs user content.** Export used
+  to rewrite the file and silently drop everything after BEGIN; the
+  damaged file is now left untouched and reported as skipped with the
+  reason.
+- **The duplicate-remember boost is one number.** The reopen path
+  persisted +0.2 while the plain path's delta replay persisted +0.15;
+  both are BOOST_PER_ACCESS now.
+- Known merge tradeoff, now stated: a long-lived stale process can
+  re-add a node another process pruned meanwhile (additive union favors
+  never losing writes; the next dream re-prunes it).
+- 220 tests. Mutation kill rate: 42% on the seeded 120-mutant sample.
+
+
 ## 6.2.8 — 2026-07-10
 
 Exhaustive line-by-line audit of code, tests, benchmarks, documentation,

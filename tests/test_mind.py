@@ -2954,5 +2954,180 @@ class TestTenthAudit(TmpDirTest):
         self.assertNotIn("\n", origin["by"] + origin["session"])
 
 
+class TestEleventhAudit(TmpDirTest):
+    """6.2.9 — independent re-audit of the 6.2.8 hardening release."""
+
+    def test_confidence_upgrade_does_not_clobber_concurrent_confirm(self):
+        """6.2.8 regression (reproduced): persisting a duplicate-remember
+        confidence upgrade marked the whole node _dirty, so the merge
+        whole-copied this session's stale counters over a concurrent
+        confirm — the third member of the reinforcement-loss family
+        (after whole-graph clobber, 6.1.0, and decay whole-copy, 6.1.2).
+        Confidence must merge as its own field (max-wins), exactly like
+        counters merge as deltas: the concurrent access_count AND the
+        raised confidence must BOTH land."""
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        nid = h0.remember("confidence race target fact", confidence=0.5)
+        stale = Hippocampus(g)          # loads access_count = 0
+        other = Hippocampus(g)
+        other.bump([nid])               # concurrent confirm: disk access = 1
+        stale.remember("confidence race target fact", confidence=1.0)
+        final = Hippocampus(g).nodes[nid]
+        self.assertEqual(final["access_count"], 2,
+                         "the concurrent confirm must not be clobbered")
+        self.assertAlmostEqual(final["confidence"], 1.0,
+                               msg="the confidence upgrade must persist")
+
+    def test_dream_prune_vetoed_by_concurrent_confirm(self):
+        """A decay decision taken on a stale view must be re-validated
+        against the fresh disk copy inside the locked merge: a node another
+        process confirmed after our load must NOT be pruned — GRACE_DAYS
+        promises no memory dies within 45 days of its last access."""
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        nid = h0.remember("stale prune race target")
+        old = (datetime.now() - timedelta(days=200)).isoformat()
+        h0.nodes[nid]["last_accessed"] = old
+        h0.nodes[nid]["created"] = old
+        h0.nodes[nid]["weight"] = 0.05
+        h0.nodes[nid]["peak_weight"] = 0.05
+        h0._dirty.add(nid)
+        h0._save()
+        stale = Hippocampus(g)          # the dreamer's stale view
+        fresh = Hippocampus(g)
+        fresh.bump([nid])               # concurrent confirm: alive again
+        pruned = stale.decay()          # prune decision must be vetoed
+        final = Hippocampus(g)
+        self.assertIn(nid, final.nodes,
+                      "a just-confirmed memory must survive a stale dream")
+        self.assertEqual(final.nodes[nid]["access_count"], 1)
+        self.assertEqual(pruned, [],
+                         "the veto must be reflected in the return value")
+        self.assertNotIn("prune",
+                         [e["op"] for e in final.journal_entries()],
+                         "no prune event may be journaled for a vetoed prune")
+
+    def test_stale_decay_weight_does_not_dip_fresh_confirm(self):
+        """Decay must record the view it computed from; when a concurrent
+        confirm refreshed the node meanwhile, the stale decayed weight must
+        not min() the fresh boost back down."""
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        nid = h0.remember("stale decay dip target")
+        old = (datetime.now() - timedelta(days=40)).isoformat()
+        h0.nodes[nid]["last_accessed"] = old
+        h0.nodes[nid]["created"] = old
+        h0._dirty.add(nid)
+        h0._save()
+        stale = Hippocampus(g)
+        fresh = Hippocampus(g)
+        fresh.bump([nid])               # weight 1.0, last_accessed = now
+        stale.decay()                   # stale view decays 40 d -> ~0.0
+        final = Hippocampus(g).nodes[nid]
+        self.assertGreaterEqual(final["weight"], 1.0 - 1e-9,
+                                "a fresh confirm must win over stale decay")
+
+    def test_conflict_scan_preserves_user_link_edges(self):
+        """The contradiction scan must FLAG without overwriting a user's
+        explicit link: relation and earned weight stay — "never silently
+        destroys data" includes edge metadata."""
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        d = Dreamer(self.mind_dir, h, c)
+        a = "the payment provider is stripe with 2 percent fees"
+        b = "the payment provider is paypal with 3 percent fees"
+        h.remember(a)
+        h.remember(b)
+        h.link(a, b, "environment-pair")
+        ia, ib = h._id(a), h._id(b)
+        _, text = d.dream()
+        self.assertIn("possible conflict", text, "the scan must still flag")
+        reloaded = Hippocampus(self.mind_dir / "graph.json")
+        self.assertEqual(reloaded.edges[ia][ib]["relation"],
+                         "environment-pair",
+                         "a user link must not be overwritten by the scan")
+        self.assertEqual(reloaded.edges[ib][ia]["relation"],
+                         "environment-pair")
+
+    def test_recall_at_compact_date_never_returns_wrong_era(self):
+        """`--at 20260101`: fromisoformat (3.11+) accepts compact dates,
+        but they compare lexicographically against dashed ISO stamps —
+        '-' < '0' made every same-year fact look valid at that past date.
+        The compact form must behave exactly like the dashed form (or be
+        rejected as usage error on interpreters that cannot parse it)."""
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            import io
+            from contextlib import redirect_stdout, redirect_stderr
+            def run(*args):
+                out, err = io.StringIO(), io.StringIO()
+                try:
+                    with redirect_stdout(out), redirect_stderr(err):
+                        code = M.main(list(args))
+                except SystemExit as e:
+                    code = e.code
+                return code, out.getvalue()
+            run("init")
+            run("remember", "the database is postgres sixteen")
+            compact = "%s0101" % datetime.now().year
+            code, out = run("recall", "which database", "--at", compact)
+            if code == 0:               # 3.11+: parsed — must match dashed
+                self.assertIn("no results", out,
+                              "a pre-creation compact date must return "
+                              "nothing, exactly like its dashed form")
+            else:                       # 3.9/3.10: usage error is honest
+                self.assertEqual(code, 2)
+        finally:
+            os.chdir(cwd)
+
+    def test_export_missing_end_marker_preserves_user_tail(self):
+        """A hand-edited agent file whose END guard was deleted must not
+        lose the user content below our block: refuse and skip that file
+        instead of silently truncating everything after BEGIN."""
+        h = self.hippo()
+        c = Cortex(self.mind_dir / "cortex")
+        a = Active(self.mind_dir, h, c)
+        h.remember("missing end marker fact")
+        a.generate(self.tmp)
+        a.export_to_agents(self.tmp)
+        content = (self.tmp / "AGENTS.md").read_text("utf-8")
+        content = content.replace(Active.END, "")     # the hand edit
+        tail = "\n## USER SECTION BELOW\nprecious user rules\n"
+        (self.tmp / "AGENTS.md").write_text(content + tail, "utf-8")
+        before = (self.tmp / "AGENTS.md").read_text("utf-8")
+        written = a.export_to_agents(self.tmp)
+        after = (self.tmp / "AGENTS.md").read_text("utf-8")
+        self.assertIn("precious user rules", after,
+                      "user tail must survive a missing END marker")
+        self.assertEqual(before, after,
+                         "the damaged file must be left untouched")
+        self.assertTrue(any("AGENTS.md" in w and "skipped" in w
+                            for w in written),
+                        "the skip must be reported: %r" % written)
+
+    def test_reopen_dup_boost_matches_persisted_delta(self):
+        """Consistency: the duplicate-remember boost must be the same
+        BOOST_PER_ACCESS the merge replays on disk. The reopen path
+        (_dirty) persisted +0.2 while the plain path persisted +0.15 —
+        one action, two different persisted boosts."""
+        g = self.mind_dir / "graph.json"
+        h = Hippocampus(g)
+        t = "boost alignment target fact"
+        nid = h.remember(t)
+        h.correct("boost alignment", "boost replacement target fact")
+        h.nodes[nid]["weight"] = 0.5
+        h.nodes[nid]["peak_weight"] = 0.5
+        h._dirty.add(nid)
+        h._save()
+        h.remember(t)                   # reopens the closed fact (_dirty)
+        on_disk = Hippocampus(g).nodes[nid]["weight"]
+        self.assertAlmostEqual(
+            on_disk, 0.5 + M.BOOST_PER_ACCESS,
+            msg="the reopen path must persist the same boost as the "
+                "plain duplicate path")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -30,7 +30,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter, defaultdict
 
-__version__ = "6.2.8"
+__version__ = "6.2.9"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -664,15 +664,31 @@ class Hippocampus:
         self.related = None
         self.embedder = HashEmbed()
         self._deleted = set()   # node ids deleted this session (see _save merge)
+        self._loaded_view = {}  # nid -> (last_accessed, access_count) as of
+        #   our last DISK read/write: the merge compares the current disk
+        #   copy against this baseline to detect concurrent refreshes and
+        #   veto stale decay/prune decisions (auditor finding, 6.2.9 — a
+        #   stale dream pruned a just-confirmed memory, breaking the
+        #   GRACE_DAYS promise). In-session mutations deliberately do NOT
+        #   move the baseline: only what we saw on disk counts.
+        self._delete_vetoed = set()  # deletions the last merge refused
         self._decayed = {}      # nid -> decayed weight this session: decay
         #   touches ONLY salience, so it must never whole-copy a node over
         #   a concurrent confirm's fresh counters (auditor finding, wave 2:
-        #   confirm racing dream lost the increment in 20/25 trials)
+        #   confirm racing dream lost the increment in 20/25 trials); a
+        #   disk copy fresher than _loaded_view drops the stale decay
+        #   entirely (auditor finding, 6.2.9)
         self._bumped = {}       # nid -> reinforcement delta this session:
         #   applied ON TOP of the fresh disk copy inside the locked merge,
         #   so two processes confirming the same fact both count (auditor
         #   finding: read-modify-write raced — 20 parallel confirms landed
         #   as 8-14)
+        self._conf_raised = {}  # nid -> raised confidence this session:
+        #   merged max-wins on the fresh disk copy, exactly like _bumped
+        #   merges deltas — marking the node _dirty for a confidence-only
+        #   change whole-copied this session's stale counters over a
+        #   concurrent confirm (auditor finding, 6.2.9: the third
+        #   reinforcement-loss variant)
         self._dirty = set()     # node ids THIS session actually modified:
         #   the merge overwrites the disk only with these — untouched
         #   stale copies used to clobber another process's confirmations
@@ -884,6 +900,16 @@ class Hippocampus:
         today = str(_now().date())
         if self.meta.get("last_edge_decay", "") > today:
             self.meta["last_edge_decay"] = today
+        self._snapshot_view()
+
+    def _snapshot_view(self):
+        """Record (last_accessed, access_count) per node as of the disk
+        state just read or written — the freshness baseline the merge uses
+        to veto stale decay/prune decisions (6.2.9)."""
+        self._loaded_view = {
+            nid: (n.get("last_accessed", ""),
+                  int(self._finite(n.get("access_count", 0), 0, 0)))
+            for nid, n in self.nodes.items()}
 
     def _save(self):
         """Locked read-merge-write: concurrent agent processes cannot lose
@@ -955,7 +981,22 @@ class Hippocampus:
                 de = disk.get("edges", {})
                 # repair the disk copy BEFORE merging: without this the merge
                 # imported raw disk content past _load's validation.
-                merged_n = {k: v for k, v in self._repair_nodes(dn).items()
+                repaired_disk = self._repair_nodes(dn)
+                # Re-validate prune decisions against the FRESH copy: a
+                # confirm from another process after our load vetoes the
+                # deletion — a stale dream must not kill a live memory
+                # (auditor finding, 6.2.9).
+                self._delete_vetoed = set()
+                for k in list(self._deleted):
+                    basis = self._loaded_view.get(k)
+                    fresh = repaired_disk.get(k)
+                    if basis is not None and fresh is not None and (
+                            fresh.get("last_accessed", "") > basis[0] or
+                            int(self._finite(fresh.get("access_count", 0),
+                                             0, 0)) > basis[1]):
+                        self._deleted.discard(k)
+                        self._delete_vetoed.add(k)
+                merged_n = {k: v for k, v in repaired_disk.items()
                             if k not in self._deleted}
                 # Field freshness is per node: untouched disk copies are newer.
                 for k in self._dirty:
@@ -978,13 +1019,28 @@ class Hippocampus:
                         self._finite(n.get("peak_weight", 1.0),
                                      1.0, 0.0, 1.0), n["weight"])
                     n["last_accessed"] = now_iso
-                # Decay touches salience only on the fresh disk copy.
+                # Decay touches salience only on the fresh disk copy — and
+                # only when the disk still matches the view we loaded: a
+                # copy refreshed by a concurrent confirm outranks stale
+                # decay (auditor finding, 6.2.9).
                 for k, w in self._decayed.items():
                     n = merged_n.get(k)
                     if n is None or k in self._dirty or k in self._bumped:
                         continue
+                    basis = self._loaded_view.get(k)
+                    if basis is not None and \
+                            n.get("last_accessed", "") > basis[0]:
+                        continue
                     n["weight"] = min(self._finite(
                         n.get("weight", 1.0), 1.0, 0.0, 1.0), w)
+                # Raised confidence merges max-wins on the fresh copy too:
+                # its own field, never a whole-node overwrite (6.2.9).
+                for k, c in self._conf_raised.items():
+                    n = merged_n.get(k)
+                    if n is None or k in self._dirty:
+                        continue
+                    n["confidence"] = max(self._finite(
+                        n.get("confidence", 1.0), 1.0, 0.0, 1.0), c)
 
                 # Edge freshness is per DIRECTIONAL PAIR. Whole-adjacency
                 # update() lost concurrent links and could leave an asymmetric
@@ -1062,9 +1118,12 @@ class Hippocampus:
                 self._dirty.clear()
                 self._bumped.clear()
                 self._decayed.clear()
+                self._conf_raised.clear()
                 self._edge_updates.clear()
                 self._edge_bumps.clear()
                 self._edge_decay_day = None
+                # what we just wrote IS the new disk baseline (6.2.9)
+                self._snapshot_view()
             finally:
                 if lock_backend is not None:
                     name, module = lock_backend
@@ -1221,7 +1280,11 @@ class Hippocampus:
         is_new = nid not in self.nodes
         if nid in self.nodes:
             n = self.nodes[nid]
-            n["weight"] = min(1.0, n["weight"] + 0.2)
+            # the SAME boost the merge replays as a delta: the reopen
+            # (_dirty) path used to persist +0.2 while the plain path's
+            # replay persisted +0.15 — one action, two persisted boosts
+            # (auditor finding, 6.2.9)
+            n["weight"] = min(1.0, n["weight"] + BOOST_PER_ACCESS)
             n["peak_weight"] = max(n.get("peak_weight", 1.0), n["weight"])
             n["access_count"] = n.get("access_count", 0) + 1
             n["last_accessed"] = now
@@ -1229,7 +1292,11 @@ class Hippocampus:
             n["confidence"] = max(old_confidence, confidence)
             self._bumped[nid] = self._bumped.get(nid, 0) + 1
             if n["confidence"] != old_confidence:
-                self._dirty.add(nid)
+                # field-level merge, NOT _dirty: dirty whole-copies this
+                # session's stale counters over a concurrent confirm
+                # (auditor finding, 6.2.9 — reproduced: B confirms while A
+                # re-remembers with higher confidence; B's increment died)
+                self._conf_raised[nid] = n["confidence"]
             # a re-remembered superseded fact is an explicit re-assertion:
             # the user says it IS true again — reopen a NEW validity
             # segment starting now (the closed segment stays queryable in
@@ -1665,21 +1732,34 @@ class Hippocampus:
         if pruned:
             if self._archive([t for _, t in pruned], now):
                 for nid, _ in pruned:
+                    # the locked merge re-checks the fresh disk copy
+                    # against _loaded_view and vetoes this deletion when a
+                    # concurrent confirm landed after our load (6.2.9)
                     del self.nodes[nid]
                     self._deleted.add(nid)
                     self.edges.pop(nid, None)
                     for other in self.edges.values():
                         other.pop(nid, None)
-                # pruning is a fact-lifecycle event too: the journal keeps
-                # the id→text mapping even after the node leaves the graph
-                self._journal("prune", ids=[nid for nid, _ in pruned],
-                              texts=[t for _, t in pruned])
             else:
                 print("warning: archive.md is not writable (symlink?); "
                       "keeping %d prunable memories." % len(pruned),
                       file=sys.stderr)
                 pruned = []
         self._save()
+        vetoed = self._delete_vetoed
+        pruned = [(nid, t) for nid, t in pruned if nid not in vetoed]
+        if vetoed:
+            # the archive lines written above are additive and harmless;
+            # the memory itself is alive again with the concurrent confirm
+            print("note: kept %d memor%s a concurrent process confirmed "
+                  "during this cycle." % (len(vetoed),
+                  "y" if len(vetoed) == 1 else "ies"), file=sys.stderr)
+        if pruned:
+            # journal AFTER the save, like every other write path: the
+            # provenance log records only prunes that actually landed on
+            # disk (6.2.9); the id→text mapping survives the node
+            self._journal("prune", ids=[nid for nid, _ in pruned],
+                          texts=[t for _, t in pruned])
         return [t for _, t in pruned]
 
     def _archive(self, texts, now):
@@ -2084,15 +2164,26 @@ class Dreamer:
                 if 0.35 <= sim < 0.9:
                     conflicts.append((ida, idb))
                     if not dry_run:
-                        now_iso = _now().isoformat()
-                        self.hippo.edges.setdefault(ida, {})[idb] = {
-                            "relation": "possible-conflict", "weight": 0.5,
-                            "created": now_iso}
-                        self.hippo.edges.setdefault(idb, {})[ida] = {
-                            "relation": "possible-conflict", "weight": 0.5,
-                            "created": now_iso}
-                        self.hippo._edge_updates.update(
-                            ((ida, idb), (idb, ida)))
+                        # flag, never clobber: an existing user link between
+                        # the pair keeps its relation and earned weight —
+                        # "never silently destroys data" covers edge
+                        # metadata too (auditor finding, 6.2.9)
+                        fwd = self.hippo.edges.get(ida, {}).get(idb)
+                        rev = self.hippo.edges.get(idb, {}).get(ida)
+                        user_edge = any(
+                            e is not None and
+                            e.get("relation") != "possible-conflict"
+                            for e in (fwd, rev))
+                        if not user_edge:
+                            now_iso = _now().isoformat()
+                            self.hippo.edges.setdefault(ida, {})[idb] = {
+                                "relation": "possible-conflict",
+                                "weight": 0.5, "created": now_iso}
+                            self.hippo.edges.setdefault(idb, {})[ida] = {
+                                "relation": "possible-conflict",
+                                "weight": 0.5, "created": now_iso}
+                            self.hippo._edge_updates.update(
+                                ((ida, idb), (idb, ida)))
                     log.append("- possible conflict (sim %.2f):" % sim)
                     log.append("    a: %s" % a["text"][:80])
                     log.append("    b: %s" % b["text"][:80])
@@ -2352,8 +2443,17 @@ inside a memory.
                     idx = content.find(self.BEGIN, idx + 1)
                 if ours != -1:
                     j = content.find(self.END, ours)
+                    if j == -1:
+                        # the END guard was hand-deleted: rewriting would
+                        # silently truncate everything after BEGIN — leave
+                        # the file untouched and say so (auditor finding,
+                        # 6.2.9)
+                        written.append("%s (skipped: end marker missing — "
+                                       "restore `%s` or remove the block)"
+                                       % (target, self.END))
+                        continue
                     before = content[:ours]
-                    after = (content[j + len(self.END):] if j != -1 else "")
+                    after = content[j + len(self.END):]
                     user_content = (before + after).strip()
                     # strip our own separator artifacts so re-export is idempotent
                     user_content = re.sub(
@@ -2847,11 +2947,21 @@ def main(argv=None):
                 at = args[i + 1]
                 args = args[:i] + args[i + 2:]
                 try:
-                    datetime.fromisoformat(at)
+                    parsed = datetime.fromisoformat(at)
                 except ValueError:
                     _die("invalid --at date %r (use YYYY-MM-DD)" % at)
-                if len(at) == 10:          # bare date → inclusive end of day
-                    at += "T23:59:59"
+                # normalize BEFORE the lexicographic compare: compact
+                # (20260101) and tz-aware forms parse fine on 3.11+ but
+                # compare wrong against dashed naive stamps — '-' < '0'
+                # made every same-year fact look "valid" at a past compact
+                # date (auditor finding, 6.2.9)
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone().replace(tzinfo=None)
+                if len(at) <= 10 and parsed == datetime(
+                        parsed.year, parsed.month, parsed.day):
+                    at = parsed.date().isoformat() + "T23:59:59"
+                else:                      # bare date → inclusive end of day
+                    at = parsed.isoformat()
             q = " ".join(args).strip()
             if not q:
                 _die('usage: %s recall "question" [--at YYYY-MM-DD]'

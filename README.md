@@ -23,8 +23,8 @@ adopted automatically by `.cursorrules`, `.windsurfrules`, `.clinerules`
 and `.roo/rules/mind.md` in projects that already use those tools.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.8/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='b3e944ce9103bd5e353e09a12f434721cb274bc919326361039104889c6c5e03',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.9/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='6dda66fcdb4352fb215f0f285d356e4a110617ff7714f3bdd1d96ab85f766663',h;print('mind.py: OK')"
 python3 mind.py init
 python3 mind.py remember "the project database is postgres 16"
 python3 mind.py recall "which database do we use"
@@ -105,7 +105,7 @@ rounds had missed (see CHANGELOG 5.5.0).
 must catch them. Its first run exposed 17 behaviors the tests didn't
 actually pin down — each is now locked by a dedicated regression test
 (raw kill rate on the seeded 120-mutant sample: 33% at first run,
-**39%**
+**42%**
 on this release — the sample is re-drawn whenever the file changes, so
 the number moves a few points between releases; it is remeasured and
 republished each time because hiding it would be the exact sin this
@@ -115,7 +115,7 @@ local calculations superseded by the locked merge, platform-only branches,
 boundary/display constants, and ranking calibration guarded by the CI
 benchmark gates rather than exact unit assertions; the tool prints every one.
 
-Test suite: **213 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **220 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, corrupt-graph recovery, and
 a mutation-kill class where every test pins a behavior the suite
@@ -341,7 +341,7 @@ optional, since auto-dream already covers it.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 213 tests
+python3 -m unittest discover -s tests   # 220 tests
 python3 bench/bench.py                  # reproduce the EN/AR numbers
 python3 bench/multilang.py              # 8 untuned languages
 python3 bench/soak.py                   # 180 simulated days
