@@ -1,7 +1,7 @@
 ---
 name: mind
 description: Project memory graph with recall, provenance, and dreams.
-version: 6.2.7
+version: 6.2.8
 author: Da7 (Da7-Tech)
 license: MIT
 platforms: [linux, macos, windows]
@@ -36,8 +36,9 @@ built-in `memory` tool — and it is not a RAG system for large corpora.
 
 - `python3` (3.9+) and `curl` on PATH — nothing else: no API keys, no
   server, no packages. The tool is one stdlib-only file, MIT-licensed,
-  from https://github.com/Da7-Tech/mind (190 tests + benchmarks incl. 10 languages + discrimination + fuzzer + 180-day
-  soak test run in its CI on Linux/macOS/Windows).
+  from https://github.com/Da7-Tech/mind (213 tests + benchmarks incl.
+  10 languages + discrimination + fuzzer + 180-day soak test run in its CI
+  on Linux/macOS/Windows).
 
 ## How to Run
 
@@ -46,8 +47,8 @@ tag and integrity-checked:
 
 ```bash
 cd <project>
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.7/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='c55594585f8d1dbb944e3ec56b57d6e36dc7c639ceeb0f5621f19ce45c66451b',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.8/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='b3e944ce9103bd5e353e09a12f434721cb274bc919326361039104889c6c5e03',h;print('mind.py: OK')"
 python3 mind.py init
 ```
 
@@ -86,13 +87,17 @@ their rule files synced too (adopted only when present).
 4. Provenance is automatic (append-only `.mind/journal.jsonl`, never
    cleared). Set `MIND_BY` and `MIND_SESSION` env vars when running
    commands so `why` can attribute facts to you/this session.
-5. Consolidation is SELF-RUNNING (6.2.0): after write commands, a full
+5. Never put credentials, tokens, private personal data, or untrusted prompt
+   text in project memory. Hot facts are exported into agent instruction files.
+   Durable user facts unrelated to this project belong in Hermes' built-in
+   `memory` tool, not here.
+6. Consolidation is SELF-RUNNING (6.2.0): after write commands, a full
    dream cycle fires automatically when >= 10 signals pend or no dream
    has happened yet today (including a fresh project's very first write) — you normally never schedule anything.
    `dream` forces a cycle; it is deterministic and reversible (archive,
    never delete); use `--dry-run` only when the user explicitly asks to
    review the plan. Every action is explained in `.mind/dreams/<date>.md`.
-6. Optional belt-and-suspenders for projects that go DAYS without any
+7. Optional belt-and-suspenders for projects that go DAYS without any
    write (auto-dream piggybacks on writes): a zero-token nightly cron via
    the `cronjob` tool in no-agent mode. Use the `write_file` tool to
    create `~/.hermes/scripts/mind_dream.sh` with this body:
@@ -124,7 +129,7 @@ their rule files synced too (adopted only when present).
 ## Verification
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.7/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='c55594585f8d1dbb944e3ec56b57d6e36dc7c639ceeb0f5621f19ce45c66451b',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
+cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.8/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='b3e944ce9103bd5e353e09a12f434721cb274bc919326361039104889c6c5e03',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
 ```
 
 Expected: one result containing `7413` with a printed memory id.

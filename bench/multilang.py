@@ -100,20 +100,20 @@ def main():
     total_hits = total_q = 0
     ok = True
     for lang, cases in CASES.items():
-        tmp = Path(tempfile.mkdtemp(prefix="mind-ml-"))
-        h = Hippocampus(tmp / "graph.json")
-        for fact, _, _ in cases:
-            h.remember(fact)
-        for i, d in enumerate(DISTRACTORS * 4):
-            h.remember(d % i)
-        hits = 0
-        misses = []
-        for fact, q, marker in cases:
-            results, _, _ = h.recall(q)
-            if results and marker in results[0][2]["text"]:
-                hits += 1
-            else:
-                misses.append(q)
+        with tempfile.TemporaryDirectory(prefix="mind-ml-") as tmp:
+            h = Hippocampus(Path(tmp) / "graph.json")
+            for fact, _, _ in cases:
+                h.remember(fact)
+            for i, d in enumerate(DISTRACTORS * 4):
+                h.remember(d % i)
+            hits = 0
+            misses = []
+            for fact, q, marker in cases:
+                results, _, _ = h.recall(q)
+                if results and marker in results[0][2]["text"]:
+                    hits += 1
+                else:
+                    misses.append(q)
         total_hits += hits
         total_q += len(cases)
         if hits < 2:                      # per-language gate: >= 2/3

@@ -72,11 +72,12 @@ def main():
     print("=" * 58)
     hits = 0
     for facts, q, marker in CASES:
-        h = Hippocampus(Path(tempfile.mkdtemp(prefix="mind-dx-")) / "g.json")
-        for f in facts:
-            h.remember(f)
-        r, _, _ = h.recall(q)
-        ok = bool(r) and marker in r[0][2]["text"]
+        with tempfile.TemporaryDirectory(prefix="mind-dx-") as tmp:
+            h = Hippocampus(Path(tmp) / "g.json")
+            for f in facts:
+                h.remember(f)
+            r, _, _ = h.recall(q)
+            ok = bool(r) and marker in r[0][2]["text"]
         hits += ok
         print("%s  %s" % ("PASS" if ok else "MISS", q))
         if not ok and r:

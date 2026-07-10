@@ -29,7 +29,8 @@ dreams between sessions, and portable to any agent through one standard file.
    (who/via/session), and every mutation appends to `journal.jsonl`,
    which is never cleared — "where did this fact come from" stays
    answerable after pruning, unlike the session telemetry in
-   `signals.jsonl`. `why`/`entity`/`recall --at` expose it.
+   `signals.jsonl`. Targeted `why` scans the full journal as a stream;
+   unfiltered `status` reads only the last 10 MB to stay bounded.
 6. **One `init` + automatic export** for every agent
    (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`) behind guard markers.
 7. **Writes during the session, dreams between sessions** — the agent
@@ -71,15 +72,15 @@ restrengthens its edges, while every dream weakens all edges slightly
 | deep sleep | slow-wave consolidation + synaptic homeostasis | Ebbinghaus decay; prune weak nodes and weak edges |
 | REM | recombination | deterministic clustering of related memories → promote recurring clusters to cortex; scan for contradictions and *flag* them |
 
-Everything is deterministic (offline hash embeddings, fixed thresholds):
-the same memory state always yields the same plan, `--dry-run` previews it,
-and the journal explains every action. No LLM is consulted — consolidation
-costs zero tokens and can run in cron forever.
+Everything is deterministic (offline hash embeddings, fixed thresholds,
+sorted node traversal, explicit tie-breakers): the same memory state always
+yields the same plan and recall order. `--dry-run` previews it, and the journal
+explains every action. No LLM is consulted — consolidation costs zero tokens.
 
 ## Failure modes we accept (and why)
 
 - **No true semantic embeddings by default.** Cross-domain synonymy with no
-  corpus evidence is missed (the benchmark's one failing query). The
+  concept-seed or corpus evidence can still be missed. The
   alternative — bundling a model or requiring API keys — breaks the
   zero-setup promise that makes the tool spread. Pluggable backends can
   come later without breaking the file format.

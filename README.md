@@ -23,8 +23,8 @@ adopted automatically by `.cursorrules`, `.windsurfrules`, `.clinerules`
 and `.roo/rules/mind.md` in projects that already use those tools.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.7/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='c55594585f8d1dbb944e3ec56b57d6e36dc7c639ceeb0f5621f19ce45c66451b',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.8/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='b3e944ce9103bd5e353e09a12f434721cb274bc919326361039104889c6c5e03',h;print('mind.py: OK')"
 python3 mind.py init
 python3 mind.py remember "the project database is postgres 16"
 python3 mind.py recall "which database do we use"
@@ -39,15 +39,16 @@ No server, no vector store, no embedding model, no configuration file.
 
 ## Measured, not vibes
 
-Every number below comes from `python3 bench/bench.py` — rerun it yourself
+The first table comes from `python3 bench/bench.py`; each later measurement
+names its own reproducible command — rerun them yourself
 (Python 3.14 on Apple M-series — latencies are environment-dependent, rerun
 for your hardware; 20 bilingual queries with known answers against
 distractor-filled graphs):
 
 | graph size | recall@1 | recall@5 | median latency | p95 |
 |---|---|---|---|---|
-| 100 nodes | **1.00** | 1.00 | **~0.5–0.7 ms** | ~2–4 ms |
-| 1,000 nodes | **1.00** | 1.00 | ~2–3 ms | ~11–16 ms |
+| 100 nodes | **1.00** | 1.00 | **~0.8 ms** | ~2.7–3.0 ms |
+| 1,000 nodes | **1.00** | 1.00 | ~3.3–3.9 ms | ~13.7–15.5 ms |
 
 (The long-standing 0.95 miss — a category question, "what css framework",
 against a memory that only said "tailwind" — is closed by the curated
@@ -61,8 +62,8 @@ identical consolidation plan.
 clock with a realistic workload: daily/weekly/monthly facts + 357 junk notes
 + a dream every night): core-fact survival **15/15** across all cadence
 tiers, junk older than the grace window surviving: **0/256**, working
-memory **8/8** hot slots held by core facts, graph size bounded
-(~106 nodes), recall on the aged graph ~0.4 ms. The soak caught two
+memory **7/8** hot slots held by core facts, graph size bounded
+(~106 nodes), recall on the aged graph ~0.4–0.5 ms. The soak caught two
 real calibration bugs before release (facts pruned one day before their
 first monthly recall; decayed weight vetoing exact matches) — both fixed
 with regression tests.
@@ -94,24 +95,27 @@ regress again.
 **Fuzzed** (`bench/fuzz.py`, seeded + deterministic): 420 adversarial
 cases in the full run (CI runs the 160-case quick set on every push) — hostile graph files (NaN/Infinity, wrong-typed fields,
 control characters, truncated JSON, dangling edges) and hostile CLI input.
-Contract: never a traceback, never data loss, the graph always loads clean
-afterwards. Its first run caught a real defect that six earlier audit
+Contract: never a traceback; corrupt input is quarantined or repaired; the
+resulting graph loads clean and accepts a new write. Its first run caught a
+real defect that six earlier audit
 rounds had missed (see CHANGELOG 5.5.0).
 
 **Mutation-tested** (`bench/mutate.py`): first-order defects are injected
 (flipped comparisons, broken arithmetic, nudged constants) and the suite
 must catch them. Its first run exposed 17 behaviors the tests didn't
 actually pin down — each is now locked by a dedicated regression test
-(raw kill rate on the seeded 120-mutant sample: 33% at first run, 45%
+(raw kill rate on the seeded 120-mutant sample: 33% at first run,
+**39%**
 on this release — the sample is re-drawn whenever the file changes, so
 the number moves a few points between releases; it is remeasured and
 republished each time because hiding it would be the exact sin this
 tool exists to catch).
-Surviving mutants are triaged in the tool's output: unreachable `get()`
-defaults, display-only constants, and ranking-calibration values guarded
-by the CI benchmark gate (recall@1 ≥ 0.9) rather than unit assertions.
+The rate is diagnostic, not a quality score. Survivors include equivalent
+local calculations superseded by the locked merge, platform-only branches,
+boundary/display constants, and ranking calibration guarded by the CI
+benchmark gates rather than exact unit assertions; the tool prints every one.
 
-Test suite: **190 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **213 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, corrupt-graph recovery, and
 a mutation-kill class where every test pins a behavior the suite
@@ -121,7 +125,7 @@ previously didn't bite on.
 
 ```
 Layer 1  WORKING MEMORY   .mind/ACTIVE.md  → injected into agent rule files
-         the ~200-300 tokens the agent always sees: hottest memories + cortex index
+         a ~200-token hot-fact payload plus the standing memory contract
 
 Layer 2  HIPPOCAMPUS      .mind/graph.json → weighted concept graph
          recall = spreading activation (≤3 hops) fused with direct keyword
@@ -151,8 +155,9 @@ python3 mind.py correct "database mysql" "the database is postgres 16"
 # returning the old fact — but the graph still knows you migrated.
 # Closed facts stay in the graph through the 45-day grace window, then
 # archive; beyond that the lineage lives in the successor's history
-# entries and the journal (forever), so `--at` answers within the
-# retention window and `why` answers always.
+# entries and the journal, so `--at` answers within the graph-retention
+# window and `why` scans the full journal for that id even after pruning,
+# reporting the full count and latest events.
 ```
 
 ## Provenance & time — "where did this fact come from, and is it still true?"
@@ -189,30 +194,22 @@ same term) — pronouns and free descriptions ("the new hire" = "Sara") are
 not resolved; that needs a model and would break the zero-dependency
 promise.
 
-## Why not just use ___?
+## Positioning — different tools, different jobs
 
-![why not just use](assets/why-not-just-use.jpeg)
+This is not a winner board. The neighboring projects are broader systems with
+different tradeoffs:
 
-| | spreading-activation recall | sleep consolidation | temporal validity | provenance log | works with any agent | zero setup / zero keys | consolidation costs $0 (no LLM) |
-|---|---|---|---|---|---|---|---|
-| mem0 | ✗ | ✗ | ✗ | ~ metadata | ✗ (SDK) | ✗ needs LLM + embedder keys | ✗ |
-| Letta (MemGPT) | ✗ | ✓ sleep-time compute | ✗ | ✗ | ✗ (own server) | ✗ full platform | ✗ burns tokens |
-| Zep / Graphiti | ~ graph traversal | ✗ | ✓ bi-temporal (its core strength) | ✓ | ✗ | ✗ Neo4j + LLM keys | ✗ |
-| HippoRAG 2 | ✓ PageRank | ✗ | ✗ | ✗ | ✗ (batch RAG lib) | ✗ GPU/API | ✗ |
-| OpenClaw dreams | ✗ | ✓ | ✗ | ✗ | ✗ (OpenClaw only) | ✓ inside OpenClaw | ✗ burns tokens |
-| claude-mem | ✗ | ✗ compression | ✗ | ~ session refs | ~ several agents | ✗ Bun + worker + Chroma | ✗ |
-| **mind** | **✓** | **✓ deterministic** | **✓ valid-time + `--at`** | **✓ append-only journal + `why`** | **✓ AGENTS/CLAUDE/GEMINI** | **✓ one file** | **✓** |
+| project | primary scope | `mind`'s narrower choice |
+|---|---|---|
+| [Mem0](https://docs.mem0.ai/open-source/overview) | configurable memory layer, library or self-hosted server | one copied stdlib file; no LLM, embedder, vector store, or service |
+| [Letta](https://docs.letta.com/letta-agent/memory/) | agent runtime with editable memory, MemFS, and sleep-time agents | runtime-agnostic project memory exported through common rule files |
+| [Graphiti](https://help.getzep.com/graphiti/getting-started/overview) | temporal knowledge-graph framework with hybrid retrieval | small local lexical graph with valid-time and a plain JSON format |
+| [HippoRAG 2](https://github.com/OSU-NLP-Group/HippoRAG) | research RAG/memory framework for large knowledge retrieval | operational memory for 10²–10³ project facts |
 
-Credit where due: Graphiti's bi-temporal model is the reference point for
-temporal knowledge graphs — mind's valid-time layer (6.0.0) is the
-zero-dependency, deterministic take on the same idea, not a claim to
-have out-modeled it.
-
-Honest note: [Brain Memory](https://github.com/omelas-tech/brain) is the
-closest project in spirit (files + decay + sleep phases) — credit where due.
-`mind` differs in being a single copy-able file, bilingual EN/AR at the
-tokenizer level, fully deterministic in consolidation, and shipping with a
-reproducible benchmark instead of claims.
+Graphiti's temporal model is the reference point for this class of problem;
+`mind`'s valid-time layer is a deterministic zero-dependency interpretation,
+not a claim to have out-modeled it. [Brain Memory](https://github.com/omelas-tech/brain)
+is the closest project in spirit (files + decay + sleep phases).
 
 ## Commands
 
@@ -237,8 +234,9 @@ so connections that never earn a confirmation decay and prune away.
 
 ## Safety properties
 
-- **Atomic, durable, symlink-refusing writes** everywhere — O_NOFOLLOW +
-  fsync-before-rename (survives power loss), the lock file itself is opened
+- **Atomic, durable, symlink-refusing writes** everywhere — unique O_EXCL
+  temporary files, full-write checks, fsync-before-rename + directory fsync
+  on POSIX (survives power loss), the lock file itself is opened
   symlink-safe, and every internal write also rejects a symlinked *parent*
   directory so nothing can escape the `.mind/` boundary
 - **Never silently destroys data**: corrupt graphs are quarantined, not erased;
@@ -246,7 +244,8 @@ so connections that never earn a confirmation decay and prune away.
   archive cannot be written, nothing is pruned at all;
   user content in `AGENTS.md`/`CLAUDE.md` is preserved outside guard markers
 - **`dream --dry-run`** previews the full plan without touching disk
-- **File-locked saves** — safe under concurrent agent processes
+- **File-locked saves** — nodes merge per field, edges per directional pair,
+  reinforcement as deltas, and daily edge decay is decided inside the lock
 - Memory files are plain JSON + Markdown: `git diff` them, sync them, read them
 
 ## Honest limitations
@@ -269,14 +268,17 @@ so connections that never earn a confirmation decay and prune away.
   overlap between unrelated phrases.
 - Optimized for personal/project agent memory (10²–10³ nodes), not
   enterprise RAG over millions of documents — use a real graph DB for that.
-- Tokens shorter than 3 characters (`db`, `ai`, `os`) are not indexed —
-  write them out once ("database", "openai") and the co-occurrence index
-  bridges the rest.
+- Short-token-only memories (`db ai os`) use a literal fallback and are
+  recallable, but abbreviations carry less semantic evidence than expanded
+  terms and single-character Latin tokens are ignored.
 - Timestamps are naive local time compared lexicographically (ISO). On a
   single machine this is exact; syncing one `.mind/` across machines in
   different time zones can skew validity ordering by the zone offset.
 - Node ids are `md5[:12]` of the text — content addressing only; no
   security property is (or should be) derived from them.
+- Memory and exported hot facts are plain text. Never store credentials,
+  secrets, private personal data, or untrusted prompt text; hot memories are
+  structurally escaped and labeled as data, but they remain agent-visible.
 - A fact recalled fewer than twice and untouched for longer than the 45-day
   grace window decays out of the graph (into the archive). Facts you need
   less often than ~every six weeks should live in cortex notes, not the
@@ -298,15 +300,15 @@ and OpenClaw uses for its workspace memory:
    for permission**. The exported commands carry the real path to your
    `mind.py`, so they work from anywhere.
 2. **Consolidation self-runs.** After write commands, a full dream cycle
-   (decay, dedup, promotion, conflict scan) fires automatically when due —
-   at most once per `MIND_AUTO_DREAM` window (default: daily, or every 10
-   pending write signals). No cron, no server: it works in containers and
+   (decay, synaptic pruning, promotion, conflict scan) fires automatically
+   when due — on the first write without a dream that day, or after every 10
+   pending write signals. No cron, no server: it works in containers and
    CI. Disable with `MIND_AUTO_DREAM=0`; force one with `mind dream`.
 3. **Reinforcement is earned by use.** `recall` prints ids; the contract has
    the agent `confirm` hits that actually answered — so exactly the
    memories that keep proving useful harden, and unused ones fade.
 
-Field-tested end-to-end: six simulated agent-in-project scenarios (an
+During 6.2.0 development, six manual agent-in-project simulations (an
 agent given ONLY the exported `AGENTS.md`, never told about memory)
 saved stated preferences and technical lessons unprompted, corrected a
 migrated fact via `correct` instead of duplicating it, recalled and
@@ -339,7 +341,7 @@ optional, since auto-dream already covers it.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 190 tests
+python3 -m unittest discover -s tests   # 213 tests
 python3 bench/bench.py                  # reproduce the EN/AR numbers
 python3 bench/multilang.py              # 8 untuned languages
 python3 bench/soak.py                   # 180 simulated days
