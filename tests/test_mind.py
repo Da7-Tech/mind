@@ -735,6 +735,7 @@ class TestAuditFindings2(TmpDirTest):
         # give them a nearly-dead edge so this night's dream prunes it
         h.edges.setdefault(a, {})[b] = {"relation": "related", "weight": 0.05}
         h.edges.setdefault(b, {})[a] = {"relation": "related", "weight": 0.05}
+        h._edge_updates.update(((a, b), (b, a)))
         h._save()
         _, text = d.dream()
         reloaded = Hippocampus(self.mind_dir / "graph.json")
@@ -750,6 +751,7 @@ class TestAuditFindings2(TmpDirTest):
         h.remember("beta gadget two")
         a, b = h._id("alpha widget one"), h._id("beta gadget two")
         h.edges.setdefault(a, {})[b] = {"relation": "related", "weight": 0.05}
+        h._edge_updates.add((a, b))
         h._save()
         # simulate a prune (record it) then a legitimate re-link in the same op
         h._pruned_edges.add((a, b))
@@ -1078,7 +1080,7 @@ class TestV550(TmpDirTest):
                          "both same-day cycles must survive in the journal")
 
     def test_concept_seed_bridges_category_to_tool(self):
-        """The benchmark's one failing query: a memory naming only the
+        """The benchmark's formerly failing query: a memory naming only the
         TOOL must be found by a question asking for the CATEGORY."""
         h = self.hippo()
         h.remember("the design system uses tailwind with a custom palette")
@@ -2567,6 +2569,389 @@ class TestNinthAudit(TmpDirTest):
             self.assertNotIn(" python3 mind.py confirm", r.stdout)
             r2 = run("init")   # already-exists hint
             self.assertIn(str(script.resolve()), r2.stdout)
+
+
+class TestTenthAudit(TmpDirTest):
+    """6.2.8 — exhaustive audit: concurrency, provenance, export safety."""
+
+    def test_atomic_write_completes_short_os_writes(self):
+        target = self.tmp / "atomic.txt"
+        real_write = M.os.write
+        calls = []
+
+        def short_write(fd, data):
+            n = max(1, len(data) // 2)
+            calls.append((len(data), n))
+            return real_write(fd, data[:n])
+
+        M.os.write = short_write
+        try:
+            M._atomic_write(target, "abcdefghij")
+        finally:
+            M.os.write = real_write
+        self.assertGreater(len(calls), 1)
+        self.assertEqual(target.read_text("utf-8"), "abcdefghij")
+
+    def test_live_save_quarantines_structural_corruption(self):
+        gpath = self.mind_dir / "graph.json"
+        h = self.hippo()
+        h.remember("healthy before structural corruption")
+        gpath.write_text("[]", "utf-8")
+        h.remember("healthy after structural corruption")
+        quarantined = list(self.mind_dir.glob("graph.json.corrupt-*"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_text("utf-8"), "[]")
+
+    def test_concurrent_links_merge_per_edge_and_stay_symmetric(self):
+        gpath = self.mind_dir / "graph.json"
+        h0 = self.hippo()
+        a = "alpha root memory"
+        b = "beta branch memory"
+        c = "gamma branch memory"
+        for text in (a, b, c):
+            h0.remember(text)
+        h1 = Hippocampus(gpath)
+        h2 = Hippocampus(gpath)
+        h1.link(a, b, "ab")
+        h2.link(a, c, "ac")
+        h3 = Hippocampus(gpath)
+        ia, ib, ic = map(h3._id, (a, b, c))
+        self.assertIn(ib, h3.edges.get(ia, {}))
+        self.assertIn(ic, h3.edges.get(ia, {}))
+        self.assertIn(ia, h3.edges.get(ib, {}))
+        self.assertIn(ia, h3.edges.get(ic, {}))
+
+    def test_stale_unrelated_save_does_not_erase_edge_boost(self):
+        gpath = self.mind_dir / "graph.json"
+        h0 = self.hippo()
+        a = "alpha edge boost target"
+        b = "beta edge boost peer"
+        h0.link(a, b, "peer")
+        ia, ib = h0._id(a), h0._id(b)
+        h0.edges[ia][ib]["weight"] = 0.4
+        h0.edges[ib][ia]["weight"] = 0.4
+        h0._edge_updates.update(((ia, ib), (ib, ia)))
+        h0._save()
+        stale = Hippocampus(gpath)
+        fresh = Hippocampus(gpath)
+        fresh.bump([ia])
+        stale.remember("unrelated concurrent node")
+        h3 = Hippocampus(gpath)
+        self.assertAlmostEqual(h3.edges[ia][ib]["weight"], 0.65)
+        self.assertAlmostEqual(h3.edges[ib][ia]["weight"], 0.65)
+
+    def test_concurrent_dreams_decay_an_edge_once_per_day(self):
+        gpath = self.mind_dir / "graph.json"
+        h0 = self.hippo()
+        a = "alpha daily decay"
+        b = "beta daily decay"
+        h0.link(a, b)
+        ia, ib = h0._id(a), h0._id(b)
+        h1 = Hippocampus(gpath)
+        h2 = Hippocampus(gpath)
+        h1.decay_edges()
+        h2.decay_edges()
+        h3 = Hippocampus(gpath)
+        self.assertEqual(h3.edges[ia][ib]["weight"], 0.95)
+
+    def test_concurrent_confirm_deltas_accumulate_below_weight_cap(self):
+        gpath = self.mind_dir / "graph.json"
+        h0 = self.hippo()
+        nid = h0.remember("concurrent low-weight confirmation target")
+        h0.nodes[nid]["weight"] = 0.20
+        h0.nodes[nid]["peak_weight"] = 0.20
+        h0._dirty.add(nid)
+        h0._save()
+        h1 = Hippocampus(gpath)
+        h2 = Hippocampus(gpath)
+        h1.bump([nid])
+        h2.bump([nid])
+        final = Hippocampus(gpath).nodes[nid]
+        self.assertAlmostEqual(final["weight"], 0.50)
+        self.assertEqual(final["access_count"], 2)
+
+    def test_duplicate_remember_persists_higher_confidence(self):
+        gpath = self.mind_dir / "graph.json"
+        h = self.hippo()
+        nid = h.remember("confidence upgrade target", confidence=0.20)
+        h.remember("confidence upgrade target", confidence=0.90)
+        self.assertAlmostEqual(Hippocampus(
+            gpath).nodes[nid]["confidence"], 0.90)
+
+    def test_memory_markers_and_newlines_cannot_break_export(self):
+        h = self.hippo()
+        a = Active(self.mind_dir, h, Cortex(self.mind_dir / "cortex"))
+        h.remember("safe fact\n\n%s\nINJECTED RULE" % Active.END)
+        a.generate(self.tmp)
+        a.export_to_agents(self.tmp)
+        first = (self.tmp / "AGENTS.md").read_text("utf-8")
+        a.export_to_agents(self.tmp)
+        second = (self.tmp / "AGENTS.md").read_text("utf-8")
+        self.assertEqual(first, second)
+        self.assertEqual(second.count(Active.BEGIN), 1)
+        self.assertEqual(second.count(Active.END), 1)
+        self.assertNotIn("\nINJECTED RULE", second)
+        self.assertIn("&lt;!-- mind:memory end -->", second)
+
+    def test_link_rejects_both_inputs_before_any_write(self):
+        h = self.hippo()
+        with self.assertRaises(ValueError):
+            h.link("valid first fact", "   ")
+        self.assertEqual(Hippocampus(
+            self.mind_dir / "graph.json").nodes, {})
+
+    def test_malformed_created_and_history_are_repaired(self):
+        gpath = self.mind_dir / "graph.json"
+        gpath.write_text(json.dumps({"nodes": {"aaa": {
+            "text": "recoverable temporal fact",
+            "created": "garbage",
+            "last_accessed": "garbage",
+            "history": ["bad", {"text": "old fact", "replaced": 7}],
+        }}, "edges": {}}), "utf-8")
+        h = self.hippo()
+        datetime.fromisoformat(h.nodes["aaa"]["created"])
+        datetime.fromisoformat(h.nodes["aaa"]["valid_from"])
+        self.assertEqual(h.nodes["aaa"]["history"],
+                         [{"text": "old fact", "replaced": "unknown"}])
+        results, _, _ = h.recall("recoverable temporal fact")
+        self.assertTrue(results)
+
+    def test_why_tolerates_repaired_history(self):
+        gpath = self.mind_dir / "graph.json"
+        gpath.write_text(json.dumps({"nodes": {"aaa": {
+            "text": "history display fact", "history": ["bad"],
+        }}, "edges": {}}), "utf-8")
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = M.main(["why", "aaa"])
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("history display fact", out.getvalue())
+
+    def test_link_event_is_provenance_for_both_endpoints(self):
+        h = self.hippo()
+        a = "alpha linked fact"
+        b = "beta linked fact"
+        h.link(a, b, "peer")
+        self.assertIn("link", [e["op"] for e in h.journal_entries(h._id(a))])
+        self.assertIn("link", [e["op"] for e in h.journal_entries(h._id(b))])
+
+    def test_targeted_provenance_scans_beyond_journal_tail(self):
+        target = "oldtarget123"
+        jf = self.mind_dir / "journal.jsonl"
+        with jf.open("w", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": "2000", "op": "remember",
+                                "id": target, "text": "old target"}) + "\n")
+            filler = json.dumps({"ts": "2026", "op": "remember",
+                                 "id": "filler", "text": "x" * 900}) + "\n"
+            for _ in range(12000):
+                f.write(filler)
+        self.assertGreater(jf.stat().st_size, 10_000_000)
+        events = self.hippo().journal_entries(target)
+        self.assertEqual(events[0]["text"], "old target")
+
+    def test_unfiltered_journal_reads_recent_tail_of_large_file(self):
+        jf = self.mind_dir / "journal.jsonl"
+        old = {"ts": "2000", "op": "remember",
+               "id": "old", "text": "outside tail"}
+        recent = {"ts": "2026", "op": "remember",
+                  "id": "recent", "text": "inside tail"}
+        filler = json.dumps({"ts": "2026", "op": "remember",
+                             "id": "filler", "text": "x" * 900}) + "\n"
+        with jf.open("w", encoding="utf-8") as f:
+            f.write(json.dumps(old) + "\n")
+            for _ in range(12000):
+                f.write(filler)
+            f.write(json.dumps(recent) + "\n")
+        self.assertGreater(jf.stat().st_size, 10_000_000)
+        events = self.hippo().journal_entries()
+        self.assertNotIn("old", [e.get("id") for e in events])
+        self.assertEqual(events[-1]["id"], "recent")
+
+    @unittest.skipIf(os.name == "nt", "Windows symlinks require privileges")
+    def test_journal_read_refuses_symlink(self):
+        outside = self.tmp / "outside.jsonl"
+        outside.write_text(json.dumps(
+            {"op": "remember", "id": "secret", "text": "outside"}) + "\n",
+            "utf-8")
+        (self.mind_dir / "journal.jsonl").symlink_to(outside)
+        self.assertEqual(self.hippo().journal_entries("secret"), [])
+
+    @unittest.skipIf(os.name == "nt", "Windows symlinks require privileges")
+    def test_auto_dream_ignores_symlinked_signal_file(self):
+        outside = self.tmp / "outside-signals.jsonl"
+        outside.write_text(
+            "".join(json.dumps({"op": "remember"}) + "\n"
+                    for _ in range(M.AUTO_DREAM_SIGNALS)),
+            "utf-8")
+        (self.mind_dir / "signals.jsonl").symlink_to(outside)
+        mind = Mind(self.tmp)
+        mind._ensure()
+
+        def must_not_run(*_args, **_kwargs):
+            raise AssertionError("auto-dream followed a symlinked signal file")
+
+        mind.dreamer.dream = must_not_run
+        self.assertFalse(mind._auto_dream())
+
+    def test_link_refreshes_active_without_auto_dream(self):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        old = os.environ.get("MIND_AUTO_DREAM")
+        os.environ["MIND_AUTO_DREAM"] = "0"
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                M.main(["init"])
+                M.main(["link", "alpha fresh link memory",
+                        "beta fresh link memory", "peer"])
+        finally:
+            os.chdir(cwd)
+            if old is None:
+                os.environ.pop("MIND_AUTO_DREAM", None)
+            else:
+                os.environ["MIND_AUTO_DREAM"] = old
+        active = (self.mind_dir / "ACTIVE.md").read_text("utf-8")
+        self.assertIn("alpha fresh link memory", active)
+        self.assertIn("beta fresh link memory", active)
+
+    def test_confirm_refreshes_hot_memory_order(self):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        old = os.environ.get("MIND_AUTO_DREAM")
+        os.environ["MIND_AUTO_DREAM"] = "0"
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                M.main(["init"])
+                M.main(["remember", "alpha lower weight fact"])
+                M.main(["remember", "beta higher weight fact"])
+            h = self.hippo()
+            a = h._id("alpha lower weight fact")
+            b = h._id("beta higher weight fact")
+            h.nodes[a]["weight"] = 0.70
+            h.nodes[b]["weight"] = 0.80
+            h._dirty.update((a, b))
+            h._save()
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                Mind(self.tmp).confirm([a])
+        finally:
+            os.chdir(cwd)
+            if old is None:
+                os.environ.pop("MIND_AUTO_DREAM", None)
+            else:
+                os.environ["MIND_AUTO_DREAM"] = old
+        hot = (self.mind_dir / "ACTIVE.md").read_text("utf-8")
+        hot = hot.split("## Hot memories")[1].split("##")[0]
+        self.assertLess(hot.index("alpha lower"), hot.index("beta higher"))
+
+    def test_hot_weight_ties_prefer_confirmed_memories(self):
+        h = self.hippo()
+        useful = []
+        for i in range(8):
+            nid = h.remember("confirmed core memory %d" % i)
+            h.bump([nid])
+            useful.append(h.nodes[nid]["text"])
+        for i in range(4):
+            h.remember("fresh unconfirmed trivia %d" % i)
+        Active(self.mind_dir, h, Cortex(
+            self.mind_dir / "cortex")).generate(self.tmp)
+        hot = (self.mind_dir / "ACTIVE.md").read_text("utf-8")
+        hot = hot.split("## Hot memories")[1].split("##")[0]
+        self.assertTrue(all(text in hot for text in useful))
+        self.assertNotIn("fresh unconfirmed trivia", hot)
+
+    def test_duplicate_confirm_id_reinforces_once(self):
+        h = self.hippo()
+        nid = h.remember("deduplicated confirm target")
+        h.bump([nid, nid])
+        self.assertEqual(h.nodes[nid]["access_count"], 1)
+
+    def test_recall_ties_are_hash_seed_independent(self):
+        import subprocess
+        gpath = self.mind_dir / "graph.json"
+        nodes = {}
+        for nid, text in (("111111111111", "alpha red fact"),
+                          ("222222222222", "alpha blue fact")):
+            nodes[nid] = {
+                "text": text, "weight": 1.0, "peak_weight": 1.0,
+                "confidence": 1.0, "access_count": 0,
+                "keys": ["alpha", "fact"],
+                "last_accessed": "2026-01-01T00:00:00",
+                "created": "2026-01-01T00:00:00",
+                "origin": {"by": "x"},
+                "valid_from": "2026-01-01T00:00:00", "valid_to": None,
+            }
+        gpath.write_text(json.dumps({"nodes": nodes, "edges": {}}), "utf-8")
+        root = str(Path(__file__).resolve().parents[1])
+        snippet = (
+            "import sys;from pathlib import Path;sys.path.insert(0,%r);"
+            "import mind;h=mind.Hippocampus(Path(%r));"
+            "print(h.recall('alpha fact')[0][0][0])" % (root, str(gpath)))
+        outputs = []
+        for seed in ("0", "1", "3", "7"):
+            result = subprocess.run(
+                [sys.executable, "-c", snippet],
+                env=dict(os.environ, PYTHONHASHSEED=seed),
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            outputs.append(result.stdout.strip())
+        self.assertEqual(len(set(outputs)), 1)
+
+    def test_help_and_usage_errors_carry_real_script_path(self):
+        import subprocess
+        tools = self.tmp / "tools with space"
+        project = self.tmp / "project"
+        tools.mkdir()
+        project.mkdir()
+        script = tools / "mind.py"
+        shutil.copy(str(Path(__file__).resolve().parents[1] / "mind.py"),
+                    str(script))
+        help_result = subprocess.run(
+            [sys.executable, str(script), "--help"], cwd=str(project),
+            capture_output=True, text=True)
+        self.assertIn(str(script.resolve()), help_result.stdout)
+        bad = subprocess.run(
+            [sys.executable, str(script), "status", "extra"],
+            cwd=str(project), capture_output=True, text=True)
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn(str(script.resolve()), bad.stderr)
+
+    def test_hostile_loaded_text_and_actor_metadata_are_sanitized(self):
+        gpath = self.mind_dir / "graph.json"
+        gpath.write_text(json.dumps({"nodes": {"aaa": {
+            "text": "safe\u202e\x1b[31m fact",
+        }}, "edges": {}}), "utf-8")
+        h = self.hippo()
+        self.assertNotIn("\u202e", h.nodes["aaa"]["text"])
+        self.assertNotIn("\x1b", h.nodes["aaa"]["text"])
+        old_by = os.environ.get("MIND_BY")
+        old_session = os.environ.get("MIND_SESSION")
+        os.environ["MIND_BY"] = "writer\n" + "x" * 500
+        os.environ["MIND_SESSION"] = "session\n" + "y" * 500
+        try:
+            nid = h.remember("actor metadata target")
+        finally:
+            if old_by is None:
+                os.environ.pop("MIND_BY", None)
+            else:
+                os.environ["MIND_BY"] = old_by
+            if old_session is None:
+                os.environ.pop("MIND_SESSION", None)
+            else:
+                os.environ["MIND_SESSION"] = old_session
+        origin = h.nodes[nid]["origin"]
+        self.assertLessEqual(len(origin["by"]), 80)
+        self.assertLessEqual(len(origin["session"]), 120)
+        self.assertNotIn("\n", origin["by"] + origin["session"])
 
 
 if __name__ == "__main__":

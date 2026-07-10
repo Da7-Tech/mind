@@ -159,6 +159,8 @@ def main():
     hot_core = sum(1 for ln in hot_lines if any(m in ln for m in core_markers))
     print("working memory: %d/%d hot slots are core facts"
           % (hot_core, len(hot_lines)))
+    if hot_core < 7:
+        all_ok = False
 
     lat = []
     for tier, facts in CORE.items():

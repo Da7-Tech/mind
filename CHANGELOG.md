@@ -1,5 +1,45 @@
 # Changelog
 
+## 6.2.8 — 2026-07-10
+
+Exhaustive line-by-line audit of code, tests, benchmarks, documentation,
+release metadata, and the rendered presentation. Every item below was
+reproduced against 6.2.7 before the fix:
+
+- **Concurrent edges no longer lose data.** Save merging is now per
+  directional edge pair instead of whole adjacency maps; concurrent links
+  remain symmetric, stale unrelated writers cannot erase a fresh edge boost,
+  reinforcement merges as a delta, and daily edge decay is decided inside the
+  graph lock so concurrent dreams decay only once.
+- **Atomic writes reject truncation.** Unique O_EXCL temporary files replace
+  predictable per-pid names, short `os.write` calls are completed instead of
+  silently replacing the graph with partial JSON, failed writes clean up their
+  temporary file, and append records reject partial syscalls.
+- **Agent export treats memories as data.** Multiline memories are collapsed,
+  guard markers are escaped, and the hot section explicitly forbids executing
+  directives found inside remembered text. The standing contract now forbids
+  secrets, credentials, private personal data, and untrusted prompt text.
+- **Provenance is complete for the queried id.** `link` belongs to both
+  endpoints, `why <id>` streams the full journal beyond the 10 MB status tail,
+  and journal reads refuse symlinks.
+- **Hostile live/on-disk state is repaired consistently.** Structurally invalid
+  live graphs are quarantined before save; malformed created/access timestamps,
+  history entries, loaded control characters, edge metadata, and oversized
+  actor/session environment values are repaired or bounded.
+- **Determinism and command behavior tightened.** Recall ties have explicit
+  id tie-breakers; hot-memory weight ties prefer confirmed and recently used
+  facts; duplicate confirm ids count once; `link` validates both endpoints
+  before either can persist; `link`/`confirm` refresh agent files; help and
+  usage errors carry the real script path and reject extra args.
+- **Presentation made defensible.** The stale competitor screenshot/checklist
+  is replaced by a neutral scope comparison based on current official docs;
+  soak output is reported as the measured 7/8 hot slots and gated at >=7;
+  short-token, working-memory-size, fuzz, privacy, and dream-phase wording now
+  match the implementation. Benchmark temp directories are cleaned.
+- GitHub Actions pins updated to checkout v7.0.0 and setup-python v6.3.0.
+  213 tests. Mutation kill rate: 39% on the seeded 120-mutant sample.
+
+
 ## 6.2.7 — 2026-07-06
 
 - **Windows: agent-file reads retry transient sharing violations** — the
