@@ -51,14 +51,15 @@ test/fuzz/benchmark/mutation gates).
   safe removal cannot unlink a swapped or multiply-linked object.
 - **The advertised Python floor is exercised.** Python 3.9 compatibility
   paths avoid newer `pathlib` arguments, and simultaneous cortex-directory
-  and lock creation is retried and validated under contention.
+  and lock creation is retried and validated under contention. File-open
+  mode detection also uses a portable mask available on Windows.
 - **Claims now match the implementation.** Removed “reversible,” “all stale
   races,” “per-field merge,” and sub-millisecond-at-1,000 wording; documented
   local-filesystem durability assumptions, resource limits, bounded journal
   history, skipped exports, and the absence of rollback.
-- 265 tests. Full fuzz: 420/420. Recall@1/5: 1.00/1.00 at 100 and 1,000
+- 266 tests. Full fuzz: 420/420. Recall@1/5: 1.00/1.00 at 100 and 1,000
   nodes; multilingual 24/24; discrimination 12/12; 180-day soak 15/15,
-  0/256 stale noise, 8/8 hot slots. Mutation rate: 38% on the
+  0/256 stale noise, 8/8 hot slots. Mutation rate: 37% on the
   seeded 120-mutant sample.
 
 ## 6.2.9 — 2026-07-10

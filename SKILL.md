@@ -36,7 +36,7 @@ built-in `memory` tool — and it is not a RAG system for large corpora.
 
 - `python3` (3.9+) and `curl` on PATH — nothing else: no API keys, no
   server, no packages. The tool is one stdlib-only file, MIT-licensed,
-  from https://github.com/Da7-Tech/mind (265 tests + benchmarks incl.
+  from https://github.com/Da7-Tech/mind (266 tests + benchmarks incl.
   10 languages + discrimination + fuzzer + 180-day soak test run in its CI
   on Linux/macOS/Windows).
 
@@ -48,7 +48,7 @@ tag and integrity-checked:
 ```bash
 cd <project>
 curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.10/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='5c37046c27fe8b4a0d1e8d27a4ecd8a5d5e2cafd73c2239979659dc7d0b1153b',h;print('mind.py: OK')"
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='7cb7dbe501917ab40c986162746a7452fa0316fb7a0a47edd401fc12d2dd420e',h;print('mind.py: OK')"
 python3 mind.py init
 ```
 
@@ -134,7 +134,7 @@ their rule files synced too (adopted only when present).
 ## Verification
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.10/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='5c37046c27fe8b4a0d1e8d27a4ecd8a5d5e2cafd73c2239979659dc7d0b1153b',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
+cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.10/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='7cb7dbe501917ab40c986162746a7452fa0316fb7a0a47edd401fc12d2dd420e',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
 ```
 
 Expected: one result containing `7413` with a printed memory id.

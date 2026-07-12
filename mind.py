@@ -206,7 +206,7 @@ def _open_regular(path, flags, mode=0o600, boundary=None):
             os.close(parent_fd)
     try:
         info = os.fstat(fd)
-        read_only = (flags & os.O_ACCMODE) == os.O_RDONLY
+        read_only = (flags & getattr(os, "O_ACCMODE", 3)) == os.O_RDONLY
         valid_links = info.st_nlink in ((0, 1) if read_only else (1,))
         if not stat.S_ISREG(info.st_mode) or not valid_links:
             raise UnsafePathError(

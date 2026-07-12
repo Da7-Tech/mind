@@ -3471,6 +3471,7 @@ class TestThirteenthAudit(TmpDirTest):
         h.remember("hard link append must be refused")
         self.assertEqual(peer.read_text("utf-8"), "untouched\n")
 
+    @unittest.skipIf(os.name == "nt", "POSIX permission bits")
     def test_atomic_write_preserves_private_mode(self):
         target = self.tmp / "private.txt"
         target.write_text("old", "utf-8")
@@ -3481,6 +3482,22 @@ class TestThirteenthAudit(TmpDirTest):
         _atomic_write(target, "new", boundary=self.tmp)
         self.assertEqual(target.read_text("utf-8"), "new")
         self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_regular_open_does_not_require_posix_access_mode_constant(self):
+        target = self.tmp / "portable-open.txt"
+        target.write_text("portable", "utf-8")
+        marker = getattr(os, "O_ACCMODE", None)
+        if marker is not None:
+            delattr(os, "O_ACCMODE")
+        try:
+            fd = M._open_regular(target, os.O_RDONLY, boundary=self.tmp)
+            try:
+                self.assertEqual(os.read(fd, 8), b"portable")
+            finally:
+                os.close(fd)
+        finally:
+            if marker is not None:
+                os.O_ACCMODE = marker
 
     @unittest.skipIf(os.name == "nt", "POSIX dir-fd race control")
     def test_atomic_write_parent_swap_cannot_escape_boundary(self):
