@@ -24,5 +24,6 @@ jobs:
       - run: python3 bench/bench.py
       - run: python3 bench/multilang.py
       - run: python3 bench/discrim.py
+      - run: python3 bench/longmemeval.py --data tests/fixtures/longmemeval_tiny.json --limit 2
       - run: python3 bench/soak.py
       - run: python3 bench/fuzz.py --quick

@@ -1,0 +1,38 @@
+[
+  {
+    "question_id": "tiny_1",
+    "question_type": "single-session-user",
+    "question": "What city does Alice want to visit?",
+    "answer": "Kyoto",
+    "question_date": "2026-01-03",
+    "haystack_session_ids": ["s1", "s2"],
+    "haystack_dates": ["2026-01-01", "2026-01-02"],
+    "haystack_sessions": [
+      [
+        {"role": "user", "content": "Alice is planning a spring trip to Kyoto.", "has_answer": true},
+        {"role": "assistant", "content": "I will remember that Kyoto is the target city."}
+      ],
+      [
+        {"role": "user", "content": "Alice also likes quiet tea houses."},
+        {"role": "assistant", "content": "Noted."}
+      ]
+    ],
+    "answer_session_ids": ["s1"]
+  },
+  {
+    "question_id": "tiny_2_abs",
+    "question_type": "abstention",
+    "question": "Which concert did Alice attend?",
+    "answer": "Not mentioned",
+    "question_date": "2026-01-04",
+    "haystack_session_ids": ["s3"],
+    "haystack_dates": ["2026-01-03"],
+    "haystack_sessions": [
+      [
+        {"role": "user", "content": "Alice stayed home and cooked pasta."},
+        {"role": "assistant", "content": "No concert was discussed."}
+      ]
+    ],
+    "answer_session_ids": []
+  }
+]

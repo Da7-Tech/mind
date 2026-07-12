@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
 .mind/
+.bench-cache/
 *.tmp
 .DS_Store
