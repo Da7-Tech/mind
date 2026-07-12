@@ -450,7 +450,8 @@ class TestDreamer(TmpDirTest):
         h.remember("a fact")           # writes a signal
         self.assertTrue((self.mind_dir / "signals.jsonl").exists())
         d.dream()
-        self.assertFalse((self.mind_dir / "signals.jsonl").exists())
+        self.assertEqual(
+            (self.mind_dir / "signals.jsonl").read_text("utf-8"), "")
 
 
 # ─────────────────────────────── cortex ───────────────────────────────
@@ -841,8 +842,10 @@ class TestAuditFindings2(TmpDirTest):
         finally:
             builtins.__import__ = real_import
 
+        # One lock covers the fresh read, decision, and commit. Two denied
+        # attempts are followed by one successful acquisition and release.
         self.assertEqual(calls, [(ContendedMsvcrt.LK_LOCK, 1)] * 3 +
-                                [(ContendedMsvcrt.LK_UNLCK, 1)])
+                         [(ContendedMsvcrt.LK_UNLCK, 1)])
         reloaded = Hippocampus(self.mind_dir / "graph.json")
         self.assertTrue(any("contention" in n["text"]
                             for n in reloaded.nodes.values()),
@@ -1231,8 +1234,9 @@ class TestProvenance(TmpDirTest):
         d = Dreamer(self.mind_dir, h, Cortex(self.mind_dir / "cortex"))
         d.dream()
         d.dream()
-        self.assertFalse((self.mind_dir / "signals.jsonl").exists(),
-                         "signals are telemetry and ARE cleared")
+        self.assertEqual(
+            (self.mind_dir / "signals.jsonl").read_text("utf-8"), "",
+            "signals are telemetry and ARE consumed")
         self.assertTrue(len(h.journal_entries()) >= 1,
                         "the journal must survive every dream")
 
@@ -3127,6 +3131,852 @@ class TestEleventhAudit(TmpDirTest):
             on_disk, 0.5 + M.BOOST_PER_ACCESS,
             msg="the reopen path must persist the same boost as the "
                 "plain duplicate path")
+
+
+class TestTwelfthAudit(TmpDirTest):
+    """6.2.10 -- close the remaining stale-view and prune-accounting races."""
+
+    def _weaken(self, h, nid):
+        old = (datetime.now() - timedelta(days=200)).isoformat()
+        h.nodes[nid]["last_accessed"] = old
+        h.nodes[nid]["created"] = old
+        h.nodes[nid]["weight"] = 0.05
+        h.nodes[nid]["peak_weight"] = 0.05
+        h.nodes[nid]["access_count"] = 0
+        h._dirty.add(nid)
+        h._save()
+
+    def test_stale_dream_preserves_concurrent_link_and_endpoint(self):
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        a_text = "legacy migration context fact"
+        b_text = "fresh migration peer fact"
+        a = h0.remember(a_text)
+        b = h0.remember(b_text)
+        self._weaken(h0, a)
+
+        stale = Hippocampus(g)
+        fresh = Hippocampus(g)
+        fresh.link(a_text, b_text, "migration-context")
+        self.assertEqual(stale.decay(), [])
+
+        final = Hippocampus(g)
+        self.assertIn(a, final.nodes)
+        self.assertEqual(final.edges[a][b]["relation"], "migration-context")
+
+    def test_link_then_same_process_dream_preserves_weak_endpoint(self):
+        g = self.mind_dir / "graph.json"
+        h = Hippocampus(g)
+        a_text = "same process old weak endpoint"
+        b_text = "same process fresh peer"
+        a = h.remember(a_text)
+        b = h.remember(b_text)
+        self._weaken(h, a)
+
+        h.link(a_text, b_text, "peer")
+        Dreamer(self.mind_dir, h, Cortex(
+            self.mind_dir / "cortex")).dream()
+
+        final = Hippocampus(g)
+        self.assertIn(a, final.nodes)
+        self.assertIn(b, final.edges.get(a, {}))
+
+    def test_stale_dream_preserves_fresh_correction_grace_and_lineage(self):
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        old_text = "database engine is mysql legacy"
+        new_text = "database engine is postgres current"
+        old = h0.remember(old_text)
+        self._weaken(h0, old)
+
+        stale = Hippocampus(g)
+        fresh = Hippocampus(g)
+        fresh.correct("database engine mysql", new_text)
+        self.assertEqual(stale.decay(), [])
+
+        final = Hippocampus(g)
+        new = final._id(new_text)
+        self.assertIn(old, final.nodes)
+        self.assertIn(new, final.nodes)
+        self.assertEqual(final.edges[old][new]["relation"], "superseded-by")
+
+    def test_correct_preserves_concurrent_confirm_on_old_node(self):
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        old = h0.remember("service database uses mysql")
+        stale = Hippocampus(g)
+        fresh = Hippocampus(g)
+
+        fresh.bump([old])
+        stale.correct("service database mysql",
+                      "service database uses postgres")
+
+        self.assertEqual(Hippocampus(g).nodes[old]["access_count"], 1)
+
+    def test_correct_to_existing_preserves_target_confirm(self):
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        old = h0.remember("service database uses mysql")
+        target_text = "service database uses postgres"
+        target = h0.remember(target_text)
+        stale = Hippocampus(g)
+        fresh = Hippocampus(g)
+
+        fresh.bump([target])
+        stale.correct("service database mysql", target_text)
+
+        final = Hippocampus(g)
+        self.assertEqual(final.nodes[target]["access_count"], 1)
+        self.assertEqual(final.nodes[old]["superseded_by"], target)
+
+    def test_parallel_corrections_form_one_lineage_not_two_current_branches(self):
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        old = h0.remember("deployment region is old zone")
+        first = Hippocampus(g)
+        second = Hippocampus(g)
+        alpha_text = "deployment region is zone alpha"
+        beta_text = "deployment region is zone beta"
+
+        first.correct("deployment region old", alpha_text)
+        second.correct("deployment region old", beta_text)
+
+        final = Hippocampus(g)
+        alpha = final._id(alpha_text)
+        beta = final._id(beta_text)
+        current = [nid for nid in (alpha, beta)
+                   if nid in final.nodes and final.nodes[nid].get("valid_to") is None]
+        self.assertEqual(current, [beta])
+        self.assertEqual(final.nodes[old]["superseded_by"], alpha)
+        self.assertEqual(final.nodes[alpha]["superseded_by"], beta)
+        old_successors = [
+            nid for nid, edge in final.edges.get(old, {}).items()
+            if edge.get("relation") == "superseded-by"
+        ]
+        self.assertEqual(old_successors, [alpha])
+
+    def test_stale_duplicate_remember_reopens_freshly_closed_fact(self):
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        old_text = "cache backend is redis stable"
+        old = h0.remember(old_text)
+        stale = Hippocampus(g)
+        fresh = Hippocampus(g)
+
+        fresh.correct("cache backend redis",
+                      "cache backend is memcached current")
+        stale.remember(old_text)
+
+        final = Hippocampus(g)
+        self.assertIsNone(final.nodes[old].get("valid_to"))
+        self.assertIsNone(final.nodes[old].get("superseded_by"))
+        self.assertFalse(any(
+            edge.get("relation") == "superseded-by"
+            for edge in final.edges.get(old, {}).values()))
+
+    def test_vetoed_prune_does_not_create_false_archive_entry(self):
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        text = "archive veto target old"
+        nid = h0.remember(text)
+        self._weaken(h0, nid)
+        stale = Hippocampus(g)
+        fresh = Hippocampus(g)
+
+        fresh.bump([nid])
+        self.assertEqual(stale.decay(), [])
+
+        archive = self.mind_dir / "archive.md"
+        self.assertFalse(archive.exists() and
+                         text in archive.read_text("utf-8"))
+        self.assertNotIn("prune", [
+            event.get("op") for event in Hippocampus(g).journal_entries()
+        ])
+
+    def test_two_stale_dreams_archive_and_journal_one_landed_prune(self):
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        text = "duplicate dream prune target"
+        nid = h0.remember(text)
+        self._weaken(h0, nid)
+        first = Hippocampus(g)
+        second = Hippocampus(g)
+
+        self.assertEqual(first.decay(), [text])
+        self.assertEqual(second.decay(), [])
+
+        archive = (self.mind_dir / "archive.md").read_text("utf-8")
+        self.assertEqual(archive.count(text), 1)
+        events = Hippocampus(g).journal_entries()
+        self.assertEqual(sum(e.get("op") == "prune" for e in events), 1)
+
+    def test_correct_inherits_a_link_that_landed_after_its_initial_load(self):
+        g = self.mind_dir / "graph.json"
+        h0 = Hippocampus(g)
+        old_text = "legacy database is mysql"
+        new_text = "current database is postgres"
+        peer_text = "backend service uses the database"
+        old = h0.remember(old_text)
+        peer = h0.remember(peer_text)
+        stale = Hippocampus(g)
+        fresh = Hippocampus(g)
+
+        fresh.link(old_text, peer_text, "used-by")
+        stale.correct("legacy database mysql", new_text)
+
+        final = Hippocampus(g)
+        new = final._id(new_text)
+        self.assertEqual(final.edges[new][peer]["relation"], "used-by")
+        self.assertEqual(final.edges[peer][new]["relation"], "used-by")
+        self.assertEqual(final.nodes[old]["superseded_by"], new)
+
+    def test_link_commits_graph_once(self):
+        g = self.mind_dir / "graph.json"
+        h = Hippocampus(g)
+        writes = []
+        original = M._atomic_write
+
+        def counted(path, data, boundary=None):
+            if Path(path) == g:
+                writes.append(path)
+            return original(path, data, boundary=boundary)
+
+        M._atomic_write = counted
+        try:
+            h.link("single commit endpoint one",
+                   "single commit endpoint two", "peer")
+        finally:
+            M._atomic_write = original
+        self.assertEqual(len(writes), 1)
+
+    def test_prune_outbox_cancels_when_graph_commit_fails(self):
+        g = self.mind_dir / "graph.json"
+        h = Hippocampus(g)
+        text = "commit failure prune target"
+        nid = h.remember(text)
+        self._weaken(h, nid)
+        original = h._commit_current
+
+        def fail_commit():
+            raise OSError("injected graph commit failure")
+
+        h._commit_current = fail_commit
+        with self.assertRaises(OSError):
+            h.decay()
+        h._commit_current = original
+
+        self.assertIn(nid, Hippocampus(g).nodes)
+        archive = self.mind_dir / "archive.md"
+        self.assertFalse(archive.exists() and
+                         text in archive.read_text("utf-8"))
+        Hippocampus(g).remember("trigger outbox cancellation")
+        self.assertFalse((self.mind_dir / M.PRUNE_OUTBOX_FILE).exists())
+
+    def test_prune_outbox_recovers_after_graph_commit(self):
+        g = self.mind_dir / "graph.json"
+        h = Hippocampus(g)
+        text = "post commit recovery target"
+        nid = h.remember(text)
+        self._weaken(h, nid)
+        original = h._recover_prune_outbox
+        calls = [0]
+
+        def fail_after_commit():
+            calls[0] += 1
+            if calls[0] == 1:
+                return original()
+            raise OSError("injected crash after graph commit")
+
+        h._recover_prune_outbox = fail_after_commit
+        with self.assertRaises(OSError):
+            h.decay()
+        self.assertNotIn(nid, Hippocampus(g).nodes)
+        self.assertTrue((self.mind_dir / M.PRUNE_OUTBOX_FILE).exists())
+
+        Hippocampus(g).remember("trigger outbox recovery")
+        archive = (self.mind_dir / "archive.md").read_text("utf-8")
+        self.assertEqual(archive.count(text), 1)
+        events = Hippocampus(g).journal_entries()
+        self.assertEqual(sum(e.get("op") == "prune" and
+                             text in e.get("texts", [])
+                             for e in events), 1)
+        self.assertFalse((self.mind_dir / M.PRUNE_OUTBOX_FILE).exists())
+
+    def test_prune_recovery_is_idempotent_after_archive_only(self):
+        g = self.mind_dir / "graph.json"
+        h = Hippocampus(g)
+        text = "archive only recovery target"
+        nid = h.remember(text)
+        self._weaken(h, nid)
+        original = h._journal_immediate
+
+        def fail_prune_journal(op, **fields):
+            if op == "prune":
+                return False
+            return original(op, **fields)
+
+        h._journal_immediate = fail_prune_journal
+        self.assertEqual(h.decay(), [text])
+        archive = (self.mind_dir / "archive.md").read_text("utf-8")
+        self.assertEqual(archive.count(text), 1)
+        self.assertTrue((self.mind_dir / M.PRUNE_OUTBOX_FILE).exists())
+
+        Hippocampus(g).remember("trigger journal recovery")
+        archive = (self.mind_dir / "archive.md").read_text("utf-8")
+        self.assertEqual(archive.count(text), 1)
+        events = Hippocampus(g).journal_entries()
+        self.assertEqual(sum(e.get("op") == "prune" and
+                             text in e.get("texts", [])
+                             for e in events), 1)
+        self.assertFalse((self.mind_dir / M.PRUNE_OUTBOX_FILE).exists())
+
+
+class TestThirteenthAudit(TmpDirTest):
+    """6.2.10 -- hostile project files, bounded input, and safe rendering."""
+
+    @unittest.skipIf(os.name == "nt", "POSIX special files and links")
+    def test_symlinked_graph_is_rejected_without_disclosing_target(self):
+        outside = self.tmp / "outside.json"
+        secret = "other project private memory"
+        outside.write_text(json.dumps({
+            "nodes": {"abc": {"text": secret}}, "edges": {}
+        }), "utf-8")
+        graph = self.mind_dir / "graph.json"
+        graph.symlink_to(outside)
+        with self.assertRaises(M.UnsafePathError):
+            Hippocampus(graph)
+        self.assertEqual(outside.read_text("utf-8").count(secret), 1)
+
+    @unittest.skipIf(os.name == "nt", "POSIX FIFO")
+    def test_fifo_graph_and_journal_are_rejected_without_blocking(self):
+        graph = self.mind_dir / "graph.json"
+        os.mkfifo(graph)
+        with self.assertRaises(M.UnsafePathError):
+            Hippocampus(graph)
+        graph.unlink()
+
+        h = Hippocampus(graph)
+        journal = self.mind_dir / "journal.jsonl"
+        os.mkfifo(journal)
+        nid = h.remember("fifo journal must not block graph commit")
+        self.assertIn(nid, Hippocampus(graph).nodes)
+
+    @unittest.skipIf(os.name == "nt", "POSIX hard links")
+    def test_hard_linked_journal_cannot_modify_its_peer(self):
+        graph = self.mind_dir / "graph.json"
+        h = Hippocampus(graph)
+        peer = self.tmp / "peer.log"
+        peer.write_text("untouched\n", "utf-8")
+        os.link(peer, self.mind_dir / "journal.jsonl")
+        h.remember("hard link append must be refused")
+        self.assertEqual(peer.read_text("utf-8"), "untouched\n")
+
+    def test_atomic_write_preserves_private_mode(self):
+        target = self.tmp / "private.txt"
+        target.write_text("old", "utf-8")
+        try:
+            target.chmod(0o600)
+        except OSError:
+            self.skipTest("permissions unavailable")
+        _atomic_write(target, "new", boundary=self.tmp)
+        self.assertEqual(target.read_text("utf-8"), "new")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    @unittest.skipIf(os.name == "nt", "POSIX dir-fd race control")
+    def test_atomic_write_parent_swap_cannot_escape_boundary(self):
+        parent = self.tmp / "rules"
+        parent.mkdir()
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        moved = self.tmp / "rules-original"
+        target = parent / "AGENTS.md"
+        original = os.replace
+        swapped = [False]
+
+        def swap_then_replace(src, dst, *args, **kwargs):
+            if not swapped[0]:
+                swapped[0] = True
+                parent.rename(moved)
+                parent.symlink_to(outside, target_is_directory=True)
+            return original(src, dst, *args, **kwargs)
+
+        os.replace = swap_then_replace
+        try:
+            _atomic_write(target, "safe", boundary=self.tmp)
+        finally:
+            os.replace = original
+        self.assertFalse((outside / "AGENTS.md").exists())
+        self.assertEqual((moved / "AGENTS.md").read_text("utf-8"), "safe")
+
+    @unittest.skipIf(os.name == "nt", "POSIX dir-fd race control")
+    def test_append_parent_swap_cannot_escape_boundary(self):
+        parent = self.tmp / "logs"
+        parent.mkdir()
+        outside = self.tmp / "outside-logs"
+        outside.mkdir()
+        moved = self.tmp / "logs-original"
+        target = parent / "journal.jsonl"
+        original = os.open
+        swapped = [False]
+
+        def swap_then_open(path, flags, *args, **kwargs):
+            if path == target.name and kwargs.get("dir_fd") is not None \
+                    and not swapped[0]:
+                swapped[0] = True
+                parent.rename(moved)
+                parent.symlink_to(outside, target_is_directory=True)
+            return original(path, flags, *args, **kwargs)
+
+        os.open = swap_then_open
+        os.supports_dir_fd.add(swap_then_open)
+        try:
+            M._append_regular(
+                target, b"safe\n", boundary=self.tmp, durable=True)
+        finally:
+            os.supports_dir_fd.discard(swap_then_open)
+            os.open = original
+        self.assertFalse((outside / "journal.jsonl").exists())
+        self.assertEqual(
+            (moved / "journal.jsonl").read_bytes(), b"safe\n")
+
+    @unittest.skipIf(os.name == "nt", "POSIX dir-fd race control")
+    def test_read_parent_swap_cannot_escape_boundary(self):
+        parent = self.tmp / "memory"
+        parent.mkdir()
+        outside = self.tmp / "outside-memory"
+        outside.mkdir()
+        moved = self.tmp / "memory-original"
+        target = parent / "graph.json"
+        target.write_text("safe graph", "utf-8")
+        (outside / "graph.json").write_text("outside secret", "utf-8")
+        original = os.open
+        swapped = [False]
+
+        def swap_then_open(path, flags, *args, **kwargs):
+            if path == target.name and kwargs.get("dir_fd") is not None \
+                    and not swapped[0]:
+                swapped[0] = True
+                parent.rename(moved)
+                parent.symlink_to(outside, target_is_directory=True)
+            return original(path, flags, *args, **kwargs)
+
+        os.open = swap_then_open
+        os.supports_dir_fd.add(swap_then_open)
+        try:
+            content = M._read_text_retry(target, boundary=self.tmp)
+        finally:
+            os.supports_dir_fd.discard(swap_then_open)
+            os.open = original
+        self.assertEqual(content, "safe graph")
+
+    def test_extreme_number_and_bad_history_are_repaired(self):
+        graph = self.mind_dir / "graph.json"
+        graph.write_text(json.dumps({
+            "nodes": {
+                "aaa": {
+                    "text": "repair numeric and history",
+                    "weight": 10 ** 400,
+                    "history": [{"text": 7}, {"text": "older"}],
+                }
+            },
+            "edges": {},
+        }), "utf-8")
+        h = Hippocampus(graph)
+        self.assertEqual(h.nodes["aaa"]["weight"], 1.0)
+        self.assertEqual(h.nodes["aaa"]["history"][0]["text"], "older")
+
+    def test_deeply_nested_json_is_quarantined_without_traceback(self):
+        graph = self.mind_dir / "graph.json"
+        graph.write_text("[" * 2000 + "0" + "]" * 2000, "utf-8")
+        h = Hippocampus(graph)
+        self.assertEqual(h.nodes, {})
+        self.assertTrue(list(self.mind_dir.glob("graph.json.corrupt-*")))
+
+    def test_surrogates_and_c1_controls_are_removed_on_load(self):
+        graph = self.mind_dir / "graph.json"
+        graph.write_text(
+            '{"nodes":{"aaa":{"text":"safe\\ud800\\u009btext"}},'
+            '"edges":{}}', "utf-8")
+        h = Hippocampus(graph)
+        self.assertEqual(h.nodes["aaa"]["text"], "safetext")
+        h._dirty.add("aaa")
+        h._save()
+        self.assertIn("safetext", graph.read_text("utf-8"))
+
+    def test_markerless_generated_header_is_preserved_and_skipped(self):
+        h = self.hippo()
+        a = Active(self.mind_dir, h, Cortex(self.mind_dir / "cortex"))
+        a.generate(self.tmp)
+        target = self.tmp / "AGENTS.md"
+        legacy = "# ACTIVE.md — mind working memory\n\nold block\nUSER POLICY"
+        target.write_text(legacy, "utf-8")
+        written = a.export_to_agents(self.tmp)
+        self.assertEqual(target.read_text("utf-8"), legacy)
+        self.assertTrue(any("without markers" in item for item in written))
+
+    def test_malformed_journal_event_is_bounded_and_terminal_safe(self):
+        h = self.hippo()
+        nid = h.remember("journal rendering target")
+        journal = self.mind_dir / "journal.jsonl"
+        with journal.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "op": "evil\u009b31m",
+                "id": nid,
+                "ts": 7,
+                "by": ["bad"],
+                "text": "line\u001b[31mred",
+            }) + "\n")
+        events = h.journal_entries(nid)
+        self.assertTrue(events)
+        self.assertNotIn("\u009b", json.dumps(events, ensure_ascii=False))
+        self.assertNotIn("\u001b", json.dumps(events, ensure_ascii=False))
+
+    def test_recall_rejects_unbounded_query(self):
+        h = self.hippo()
+        h.remember("bounded query fact")
+        with self.assertRaises(ValueError):
+            h.recall("q" * (M.MAX_QUERY_CHARS + 1))
+
+    def test_stale_duplicate_remembers_all_reinforce(self):
+        graph = self.mind_dir / "graph.json"
+        writers = [Hippocampus(graph) for _ in range(8)]
+        text = "all duplicate writers reinforce this fact"
+        for writer in writers:
+            writer.remember(text)
+        node = Hippocampus(graph).nodes[Hippocampus._id(text)]
+        self.assertEqual(node["access_count"], 7)
+
+    def test_threads_sharing_one_hippocampus_are_serialized(self):
+        import threading
+        h = self.hippo()
+        barrier = threading.Barrier(16)
+        errors = []
+
+        def write(index):
+            try:
+                barrier.wait()
+                h.remember("shared object thread fact %02d" % index)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=write, args=(i,))
+                   for i in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(
+            node["text"].startswith("shared object thread fact")
+            for node in Hippocampus(
+                self.mind_dir / "graph.json").nodes.values()), 16)
+
+    def test_stale_export_reloads_latest_graph(self):
+        first = Mind(self.tmp)
+        second = Mind(self.tmp)
+        first.init()
+        first._ensure()
+        second._ensure()
+        first.hippo.remember("alpha concurrent export fact")
+        second.hippo.remember("beta concurrent export fact")
+        first._refresh_exports()
+        agents = (self.tmp / "AGENTS.md").read_text("utf-8")
+        self.assertIn("alpha concurrent export fact", agents)
+        self.assertIn("beta concurrent export fact", agents)
+
+    def test_stored_keys_do_not_depend_on_insertion_order(self):
+        texts = [
+            "frontend service uses react typescript",
+            "backend service uses flask python",
+            "database service uses sqlite storage",
+        ]
+        snapshots = []
+        for order in (texts, list(reversed(texts))):
+            root = Path(tempfile.mkdtemp(prefix="mind-order-"))
+            try:
+                md = root / ".mind"
+                md.mkdir()
+                h = Hippocampus(md / "graph.json")
+                for text in order:
+                    h.remember(text)
+                snapshots.append({
+                    n["text"]: n["keys"] for n in h.nodes.values()
+                })
+            finally:
+                shutil.rmtree(root, ignore_errors=True)
+        self.assertEqual(snapshots[0], snapshots[1])
+
+    def test_ambiguous_one_word_correction_is_refused(self):
+        h = self.hippo()
+        h.remember("primary database backup is nightly")
+        h.remember("analytics database backup is weekly")
+        self.assertIsNone(
+            h.correct("database", "database backup is hourly"))
+        self.assertEqual(
+            sum(n.get("valid_to") is None for n in h.nodes.values()), 2)
+
+    def test_init_repairs_partial_layout(self):
+        graph = self.mind_dir / "graph.json"
+        graph.write_text('{"nodes":{},"edges":{},"meta":{}}', "utf-8")
+        Mind(self.tmp).init()
+        for path in (
+                self.mind_dir / "ACTIVE.md",
+                self.mind_dir / "cortex",
+                self.mind_dir / "dreams",
+                self.tmp / "AGENTS.md",
+                self.tmp / "CLAUDE.md",
+                self.tmp / "GEMINI.md"):
+            self.assertTrue(path.exists(), str(path))
+
+    def test_dream_dry_run_does_not_create_missing_directories(self):
+        shutil.rmtree(self.mind_dir / "cortex")
+        shutil.rmtree(self.mind_dir / "dreams")
+        (self.mind_dir / "graph.json").write_text(
+            '{"nodes":{},"edges":{},"meta":{}}', "utf-8")
+        Mind(self.tmp).dream(dry_run=True)
+        self.assertFalse((self.mind_dir / "cortex").exists())
+        self.assertFalse((self.mind_dir / "dreams").exists())
+
+    def test_failed_graph_commit_emits_no_dream_artifacts(self):
+        graph = self.mind_dir / "graph.json"
+        h = Hippocampus(graph)
+        for text in (
+                "deploy pipeline uses github actions",
+                "deploy pipeline runs tests",
+                "deploy pipeline publishes releases"):
+            h.remember(text)
+        signals = self.mind_dir / "signals.jsonl"
+        self.assertTrue(signals.exists())
+        original = h._commit_current
+
+        def fail_commit():
+            raise OSError("injected dream graph failure")
+
+        h._commit_current = fail_commit
+        dreamer = Dreamer(
+            self.mind_dir, h, Cortex(self.mind_dir / "cortex"))
+        with self.assertRaises(OSError):
+            dreamer.dream()
+        h._commit_current = original
+        self.assertTrue(signals.exists())
+        self.assertFalse(any((self.mind_dir / "dreams").glob("*.md")))
+        self.assertFalse(any((self.mind_dir / "cortex").glob("*.md")))
+
+    def test_dream_preserves_signal_appended_after_snapshot(self):
+        h = self.hippo()
+        h.remember("signal snapshot seed")
+        dreamer = Dreamer(
+            self.mind_dir, h, Cortex(self.mind_dir / "cortex"))
+        original = dreamer._write_journal
+        late = json.dumps(
+            {"kind": "remember", "content": "late signal", "ts": "late"})
+
+        def append_late(memo_text):
+            with (self.mind_dir / "signals.jsonl").open(
+                    "a", encoding="utf-8") as f:
+                f.write(late + "\n")
+            return original(memo_text)
+
+        dreamer._write_journal = append_late
+        dreamer.dream()
+        remaining = (self.mind_dir / "signals.jsonl").read_text("utf-8")
+        self.assertEqual(remaining, late + "\n")
+
+    def test_invalid_utf8_agent_file_is_skipped_after_memory_commit(self):
+        mind = Mind(self.tmp)
+        mind.init()
+        (self.tmp / "AGENTS.md").write_bytes(b"\xff")
+        mind.remember("memory survives unreadable agent target")
+        graph = Hippocampus(self.mind_dir / "graph.json")
+        self.assertIn(Hippocampus._id(
+            "memory survives unreadable agent target"), graph.nodes)
+        self.assertIn("memory survives unreadable agent target",
+                      (self.tmp / "CLAUDE.md").read_text("utf-8"))
+        self.assertEqual((self.tmp / "AGENTS.md").read_bytes(), b"\xff")
+
+    def test_fenced_marker_example_is_preserved(self):
+        h = self.hippo()
+        active = Active(
+            self.mind_dir, h, Cortex(self.mind_dir / "cortex"))
+        active.generate(self.tmp)
+        target = self.tmp / "AGENTS.md"
+        example = (
+            "Project policy\n\n```markdown\n"
+            + Active.BEGIN + "\n"
+            "# ACTIVE.md — mind working memory\nquoted example\n"
+            + Active.END + "\n```\n")
+        target.write_text(example, "utf-8")
+        active.export_to_agents(self.tmp)
+        self.assertIn(example.strip(), target.read_text("utf-8"))
+
+    def test_export_skips_target_changed_after_read(self):
+        h = self.hippo()
+        active = Active(
+            self.mind_dir, h, Cortex(self.mind_dir / "cortex"))
+        active.generate(self.tmp)
+        target = self.tmp / "AGENTS.md"
+        target.write_text("initial human policy", "utf-8")
+        original = M._atomic_write
+        changed = [False]
+
+        def race(path, data, boundary=None,
+                 expected_identity=M._NO_EXPECTATION):
+            if Path(path) == target and not changed[0]:
+                changed[0] = True
+                target.write_text("new concurrent human policy", "utf-8")
+            return original(
+                path, data, boundary=boundary,
+                expected_identity=expected_identity)
+
+        M._atomic_write = race
+        try:
+            written = active.export_to_agents(self.tmp)
+        finally:
+            M._atomic_write = original
+        self.assertEqual(target.read_text("utf-8"),
+                         "new concurrent human policy")
+        self.assertTrue(any("changed concurrently" in item
+                            for item in written))
+
+    @unittest.skipIf(os.name == "nt", "POSIX flock timeout")
+    def test_posix_graph_lock_has_a_bounded_wait(self):
+        import fcntl
+        import subprocess
+        graph = self.mind_dir / "graph.json"
+        Hippocampus(graph).remember("lock timeout seed")
+        lock = self.mind_dir / "graph.json.lock"
+        with lock.open("r+b") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            code = (
+                "import sys;"
+                "sys.path.insert(0,%r);"
+                "from pathlib import Path;"
+                "from mind import Hippocampus;"
+                "Hippocampus(Path(%r)).remember('blocked write')"
+                % (str(Path(M.__file__).parent), str(graph))
+            )
+            env = os.environ.copy()
+            env["MIND_LOCK_TIMEOUT_SECONDS"] = "0.2"
+            result = subprocess.run(
+                [sys.executable, "-c", code], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"within 0.2 seconds", result.stderr)
+
+    def test_short_journal_write_does_not_poison_next_event(self):
+        h = self.hippo()
+        original = os.write
+        injected = [False]
+
+        def short_once(fd, data):
+            if not injected[0] and data != b"\n":
+                injected[0] = True
+                amount = max(1, len(data) // 2)
+                original(fd, data[:amount])
+                return amount
+            return original(fd, data)
+
+        os.write = short_once
+        try:
+            self.assertFalse(h._journal_immediate(
+                "broken", id="broken"))
+        finally:
+            os.write = original
+        self.assertTrue(h._journal_immediate(
+            "remember", id="good", text="good event"))
+        events = h.journal_entries()
+        self.assertTrue(any(event.get("id") == "good"
+                            for event in events))
+
+    def test_concurrent_cortex_promotions_merge_without_loss(self):
+        import threading
+        cortex = Cortex(self.mind_dir / "cortex")
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def promote(content):
+            try:
+                barrier.wait()
+                cortex.promote("shared deploy pipeline", content)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=promote, args=("- fact alpha",)),
+            threading.Thread(target=promote, args=("- fact beta",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        files = list(cortex.files())
+        self.assertEqual(len(files), 1)
+        content = files[0].read_text("utf-8")
+        self.assertIn("- fact alpha", content)
+        self.assertIn("- fact beta", content)
+
+    def test_prune_batch_limit_keeps_remainder_for_next_cycle(self):
+        graph = self.mind_dir / "graph.json"
+        h = Hippocampus(graph)
+        ids = [h.remember("bounded prune fact %d" % i)
+               for i in range(3)]
+        old = (datetime.now() - timedelta(days=200)).isoformat()
+        for nid in ids:
+            h.nodes[nid]["last_accessed"] = old
+            h.nodes[nid]["created"] = old
+            h.nodes[nid]["weight"] = 0.05
+            h.nodes[nid]["peak_weight"] = 0.05
+            h.nodes[nid]["access_count"] = 0
+            h._dirty.add(nid)
+        h._save()
+        original = M.MAX_PRUNES_PER_CYCLE
+        M.MAX_PRUNES_PER_CYCLE = 2
+        try:
+            first = h.decay()
+            second = h.decay()
+        finally:
+            M.MAX_PRUNES_PER_CYCLE = original
+        self.assertEqual(len(first), 2)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(Hippocampus(graph).nodes, {})
+
+    def test_corrupt_prune_outbox_is_quarantined_without_bricking_writes(self):
+        graph = self.mind_dir / "graph.json"
+        Hippocampus(graph)._save()
+        outbox = self.mind_dir / M.PRUNE_OUTBOX_FILE
+        outbox.write_text("{broken", "utf-8")
+
+        nid = Hippocampus(graph).remember(
+            "memory survives a corrupt prune recovery outbox")
+
+        self.assertIn(nid, Hippocampus(graph).nodes)
+        self.assertFalse(outbox.exists())
+        quarantined = list(self.mind_dir.glob(
+            M.PRUNE_OUTBOX_FILE + ".corrupt-*"))
+        self.assertEqual(len(quarantined), 1)
+        self.assertEqual(quarantined[0].read_text("utf-8"), "{broken")
+
+    def test_why_pruned_memory_displays_only_latest_eight_events(self):
+        import io
+        from contextlib import redirect_stdout
+        graph = self.mind_dir / "graph.json"
+        h = Hippocampus(graph)
+        nid = h.remember("bounded pruned provenance display")
+        for index in range(12):
+            h._journal_immediate("confirm", ids=[nid], sequence=str(index))
+        del h.nodes[nid]
+        h._deleted.add(nid)
+        h._save()
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            Mind(self.tmp).why(nid)
+        rendered = output.getvalue()
+
+        self.assertIn("journal lineage (13 events; last 8 shown)", rendered)
+        self.assertEqual(rendered.count(" by="), 8)
 
 
 if __name__ == "__main__":
