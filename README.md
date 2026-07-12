@@ -23,8 +23,8 @@ adopted automatically by `.cursorrules`, `.windsurfrules`, `.clinerules`
 and `.roo/rules/mind.md` in projects that already use those tools.
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.9/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='6dda66fcdb4352fb215f0f285d356e4a110617ff7714f3bdd1d96ab85f766663',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.10/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c',h;print('mind.py: OK')"
 python3 mind.py init
 python3 mind.py remember "the project database is postgres 16"
 python3 mind.py recall "which database do we use"
@@ -47,8 +47,8 @@ distractor-filled graphs):
 
 | graph size | recall@1 | recall@5 | median latency | p95 |
 |---|---|---|---|---|
-| 100 nodes | **1.00** | 1.00 | **~0.8 ms** | ~2.7–3.0 ms |
-| 1,000 nodes | **1.00** | 1.00 | ~3.3–3.9 ms | ~13.7–15.5 ms |
+| 100 nodes | **1.00** | 1.00 | **~0.6 ms** | ~2.6 ms |
+| 1,000 nodes | **1.00** | 1.00 | ~2.9 ms | ~13.6 ms |
 
 (The long-standing 0.95 miss — a category question, "what css framework",
 against a memory that only said "tailwind" — is closed by the curated
@@ -62,8 +62,8 @@ identical consolidation plan.
 clock with a realistic workload: daily/weekly/monthly facts + 357 junk notes
 + a dream every night): core-fact survival **15/15** across all cadence
 tiers, junk older than the grace window surviving: **0/256**, working
-memory **7/8** hot slots held by core facts, graph size bounded
-(~106 nodes), recall on the aged graph ~0.4–0.5 ms. The soak caught two
+memory **8/8** hot slots held by core facts, graph size bounded
+(~106 nodes), recall on the aged graph ~0.5–0.6 ms. The soak caught two
 real calibration bugs before release (facts pruned one day before their
 first monthly recall; decayed weight vetoing exact matches) — both fixed
 with regression tests.
@@ -105,7 +105,7 @@ rounds had missed (see CHANGELOG 5.5.0).
 must catch them. Its first run exposed 17 behaviors the tests didn't
 actually pin down — each is now locked by a dedicated regression test
 (raw kill rate on the seeded 120-mutant sample: 33% at first run,
-**42%**
+**38%**
 on this release — the sample is re-drawn whenever the file changes, so
 the number moves a few points between releases; it is remeasured and
 republished each time because hiding it would be the exact sin this
@@ -115,7 +115,7 @@ local calculations superseded by the locked merge, platform-only branches,
 boundary/display constants, and ranking calibration guarded by the CI
 benchmark gates rather than exact unit assertions; the tool prints every one.
 
-Test suite: **220 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **267 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, corrupt-graph recovery, and
 a mutation-kill class where every test pins a behavior the suite
@@ -138,7 +138,8 @@ Layer 3  CORTEX           .mind/cortex/*.md → consolidated durable knowledge
          fed by the dreamer when a cluster of related memories recurs
 
 DREAMER  between sessions  python3 mind.py dream [--dry-run]
-         light sleep  count + clear session signals (telemetry, reported in the journal)
+         light sleep  count + consume the observed session-signal prefix
+                      (telemetry; concurrent suffixes remain for the next cycle)
          deep sleep   Ebbinghaus decay  R = e^(−t/S)  — stability S grows
                       with each confirmed recall; weak unused nodes pruned;
                       weak edges pruned (synaptic pruning)
@@ -156,8 +157,8 @@ python3 mind.py correct "database mysql" "the database is postgres 16"
 # Closed facts stay in the graph through the 45-day grace window, then
 # archive; beyond that the lineage lives in the successor's history
 # entries and the journal, so `--at` answers within the graph-retention
-# window and `why` scans the full journal for that id even after pruning,
-# reporting the full count and latest events.
+# window and `why` scans up to the latest 100 MB for that id even after
+# pruning, reporting the matching count and latest events within that bound.
 ```
 
 ## Provenance & time — "where did this fact come from, and is it still true?"
@@ -171,7 +172,8 @@ Every fact answers both questions, from the moment it is learned:
   rotated and never cleared** (unlike `signals.jsonl`, which is session
   telemetry). Even after a fact is pruned, the journal keeps its lineage.
   Journal appends are single `O_APPEND` writes (safe under concurrent
-  writers on local filesystems); if the journal is unwritable the memory
+  writers on local filesystems); a short append is isolated so it cannot
+  swallow the next event. If the journal is unwritable the memory
   write still succeeds with a warning — availability over completeness,
   and `why` says plainly when provenance is missing.
 - **Truth validity, separate from attention**: `weight` says how *salient*
@@ -234,9 +236,10 @@ so connections that never earn a confirmation decay and prune away.
 
 ## Safety properties
 
-- **Atomic, durable, symlink-refusing writes** everywhere — unique O_EXCL
+- **Atomic, durable, symlink-refusing writes** everywhere — directory-handle
+  traversal on POSIX, unique O_EXCL
   temporary files, full-write checks, fsync-before-rename + directory fsync
-  on POSIX (survives power loss), the lock file itself is opened
+  on local POSIX filesystems, the lock file itself is opened
   symlink-safe, and every internal write also rejects a symlinked *parent*
   directory so nothing can escape the `.mind/` boundary
 - **Never silently destroys data**: corrupt graphs are quarantined, not erased;
@@ -244,8 +247,11 @@ so connections that never earn a confirmation decay and prune away.
   archive cannot be written, nothing is pruned at all;
   user content in `AGENTS.md`/`CLAUDE.md` is preserved outside guard markers
 - **`dream --dry-run`** previews the full plan without touching disk
-- **File-locked saves** — nodes merge per field, edges per directional pair,
-  reinforcement as deltas, and daily edge decay is decided inside the lock
+- **Serializable graph operations** — one graph lock covers the fresh read,
+  semantic decision, and one commit; stale correction, linking, reopening,
+  pruning, and export decisions cannot overwrite a newer graph state.
+  Prunes use a recoverable outbox so graph, archive, and provenance converge
+  after an interrupted write
 - Memory files are plain JSON + Markdown: `git diff` them, sync them, read them
 
 ## Honest limitations
@@ -268,6 +274,13 @@ so connections that never earn a confirmation decay and prune away.
   overlap between unrelated phrases.
 - Optimized for personal/project agent memory (10²–10³ nodes), not
   enterprise RAG over millions of documents — use a real graph DB for that.
+- Explicit resource bounds: 10,000 nodes, 100,000 directional edges,
+  50 MB for `graph.json`, 10,000 characters per memory or query, 100 history
+  entries per node, 256 prunes / 4 MB of prune payload per dream, and a
+  30-second graph-lock wait.
+  Cortex listings inspect at most 1,000 files and dream-history scans 10,000.
+  `why` scans at most the
+  latest 100 MB and retains at most 10,000 matching events in memory.
 - Short-token-only memories (`db ai os`) use a literal fallback and are
   recallable, but abbreviations carry less semantic evidence than expanded
   terms and single-character Latin tokens are ignored.
@@ -341,7 +354,7 @@ optional, since auto-dream already covers it.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 220 tests
+python3 -m unittest discover -s tests   # 267 tests
 python3 bench/bench.py                  # reproduce the EN/AR numbers
 python3 bench/multilang.py              # 8 untuned languages
 python3 bench/soak.py                   # 180 simulated days

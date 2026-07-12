@@ -1,7 +1,7 @@
 ---
 name: mind
 description: Project memory graph with recall, provenance, and dreams.
-version: 6.2.9
+version: 6.2.10
 author: Da7 (Da7-Tech)
 license: MIT
 platforms: [linux, macos, windows]
@@ -36,7 +36,7 @@ built-in `memory` tool — and it is not a RAG system for large corpora.
 
 - `python3` (3.9+) and `curl` on PATH — nothing else: no API keys, no
   server, no packages. The tool is one stdlib-only file, MIT-licensed,
-  from https://github.com/Da7-Tech/mind (220 tests + benchmarks incl.
+  from https://github.com/Da7-Tech/mind (267 tests + benchmarks incl.
   10 languages + discrimination + fuzzer + 180-day soak test run in its CI
   on Linux/macOS/Windows).
 
@@ -47,8 +47,8 @@ tag and integrity-checked:
 
 ```bash
 cd <project>
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.9/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='6dda66fcdb4352fb215f0f285d356e4a110617ff7714f3bdd1d96ab85f766663',h;print('mind.py: OK')"
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.10/mind.py
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c',h;print('mind.py: OK')"
 python3 mind.py init
 ```
 
@@ -94,8 +94,9 @@ their rule files synced too (adopted only when present).
 6. Consolidation is SELF-RUNNING (6.2.0): after write commands, a full
    dream cycle fires automatically when >= 10 signals pend or no dream
    has happened yet today (including a fresh project's very first write) — you normally never schedule anything.
-   `dream` forces a cycle; it is deterministic and reversible (archive,
-   never delete); use `--dry-run` only when the user explicitly asks to
+   `dream` forces a cycle; it is deterministic and archives pruned node
+   text, but it is not a rollback system and pruned edges are not restored.
+   Use `--dry-run` only when the user explicitly asks to
    review the plan. Every action is explained in `.mind/dreams/<date>.md`.
 7. Optional belt-and-suspenders for projects that go DAYS without any
    write (auto-dream piggybacks on writes): a zero-token nightly cron via
@@ -125,11 +126,15 @@ their rule files synced too (adopted only when present).
 - Corrupt `graph.json` is quarantined as `graph.json.corrupt-*` and memory
   restarts empty — tell the user where the quarantined file is.
 - The tool refuses to write through symlinked agent/lock/archive files.
+- Operational limits are deliberate: 10,000 nodes, 100,000 directional
+  edges, 50 MB graph, 10,000-character memories/queries, 100 history entries
+  per node, 256 prunes / 4 MB of prune payload per dream, and a 30-second
+  graph-lock wait.
 
 ## Verification
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.9/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='6dda66fcdb4352fb215f0f285d356e4a110617ff7714f3bdd1d96ab85f766663',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
+cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.10/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
 ```
 
 Expected: one result containing `7413` with a printed memory id.

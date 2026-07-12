@@ -29,8 +29,9 @@ dreams between sessions, and portable to any agent through one standard file.
    (who/via/session), and every mutation appends to `journal.jsonl`,
    which is never cleared — "where did this fact come from" stays
    answerable after pruning, unlike the session telemetry in
-   `signals.jsonl`. Targeted `why` scans the full journal as a stream;
-   unfiltered `status` reads only the last 10 MB to stay bounded.
+   `signals.jsonl`. Targeted `why` scans up to the latest 100 MB as a
+   stream and retains at most 10,000 matches; unfiltered `status` reads
+   only the last 10 MB.
 6. **One `init` + automatic export** for every agent
    (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`) behind guard markers.
 7. **Writes during the session, dreams between sessions** — the agent
@@ -68,7 +69,7 @@ restrengthens its edges, while every dream weakens all edges slightly
 
 | phase | biological analogue | what it does |
 |---|---|---|
-| light sleep | session telemetry | count and clear the session's write signals (remember/link/correct) — currently telemetry the journal reports, not a replay that feeds consolidation; the consolidation inputs are the node/edge weights themselves |
+| light sleep | session telemetry | count and consume the observed prefix of session write signals (remember/link/correct), preserving concurrent suffixes — telemetry the journal reports, not a replay that feeds consolidation; consolidation inputs are the node/edge weights themselves |
 | deep sleep | slow-wave consolidation + synaptic homeostasis | Ebbinghaus decay; prune weak nodes and weak edges |
 | REM | recombination | deterministic clustering of related memories → promote recurring clusters to cortex; scan for contradictions and *flag* them |
 
@@ -88,5 +89,5 @@ explains every action. No LLM is consulted — consolidation costs zero tokens.
   dependency; the seed dictionary covers the frequent broken plurals and
   the co-occurrence index absorbs the rest.
 - **Not for millions of documents.** The graph is JSON on disk; the target
-  is personal/project agent memory (10²–10³ nodes) where it is measured at
-  sub-millisecond recall.
+  is personal/project agent memory (10²–10³ nodes) where recall is measured
+  from sub-millisecond at 100 nodes to low-single-digit milliseconds at 1,000.

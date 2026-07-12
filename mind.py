@@ -17,7 +17,7 @@ Usage: python3 mind.py <command> [args]
   recall "question"    spreading-activation recall (RRF + IDF fusion)
   confirm <id> [...]   reinforce memories that actually answered you
   correct "old" "new"  supersede a wrong fact (transition kept, provenance logged)
-  why <id>             provenance: origin, validity, full event history
+  why <id>             provenance: origin, validity, bounded recent history
   entity "term"        every fact about a term, current and superseded
   dream [--dry-run]    run the sleep cycle (light -> deep -> REM)
   export               regenerate agent rule files
@@ -25,12 +25,13 @@ Usage: python3 mind.py <command> [args]
 
 Design: docs/DESIGN.md  |  License: MIT  |  https://github.com/Da7-Tech/mind
 """
-import sys, os, json, re, time, math, hashlib, tempfile, shlex
+import sys, os, json, re, time, math, hashlib, tempfile, shlex, stat, threading
 from datetime import datetime, timedelta
 from pathlib import Path
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
+from contextlib import contextmanager
 
-__version__ = "6.2.9"
+__version__ = "6.2.10"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -42,7 +43,9 @@ CORTEX_DIR = "cortex"
 DREAMS_DIR = "dreams"
 SIGNALS_FILE = "signals.jsonl"
 JOURNAL_FILE = "journal.jsonl"  # append-only provenance log — NEVER cleared
-#   (signals.jsonl is session telemetry and is cleared by dream; the
+PRUNE_OUTBOX_FILE = "prune-outbox.json"
+#   (signals.jsonl is session telemetry and its observed prefix is consumed
+#    by dream without deleting concurrent suffixes; the
 #    journal is the permanent answer to "where did this fact come from")
 
 BOOST_PER_ACCESS = 0.15     # weight boost on confirmed recall (bump)
@@ -77,6 +80,37 @@ FUZZY_ACTIVATION = 0.5      # activation given to pattern-completion matches
 MAX_TEXT_CHARS = 10000      # one memory is a fact, not a document: a cap
 #   keeps graph.json / journal / ACTIVE processing sane (auditor finding:
 #   nothing protected the tool from a single multi-megabyte "memory")
+MAX_GRAPH_BYTES = 50_000_000
+MAX_AUX_BYTES = 10_000_000
+MAX_QUERY_CHARS = 10_000
+MAX_NODES = 10_000
+MAX_EDGES = 100_000
+MAX_HISTORY_PER_NODE = 100
+MAX_JOURNAL_SCAN_BYTES = 100_000_000
+MAX_JOURNAL_MATCHES = 10_000
+MAX_DREAM_COMPARISONS = 200_000
+MAX_PRUNES_PER_CYCLE = 256
+MAX_PRUNE_OUTBOX_BYTES = 5_000_000
+MAX_PRUNE_BATCH_BYTES = 4_000_000
+MAX_CORTEX_FILES = 1_000
+MAX_DREAM_FILES = 10_000
+LOCK_TIMEOUT_SECONDS = 30.0
+
+
+class UnsafePathError(ValueError):
+    """A project path is not a private regular file."""
+
+
+class FileLimitError(ValueError):
+    """A project file exceeds its documented resource bound."""
+
+
+class StaleTargetError(ValueError):
+    """A file changed after it was read for a preserving rewrite."""
+
+
+_NO_EXPECTATION = object()
+_EXPECTED_MISSING = object()
 
 
 def _now():
@@ -108,18 +142,303 @@ def _reject_symlinked_parents(path, boundary):
         p = parent
 
 
-def _read_text_retry(path):
+def _open_regular(path, flags, mode=0o600, boundary=None):
+    """Open one private regular file without following or blocking on it."""
+    path = Path(os.path.abspath(str(path)))
+    boundary = (Path(os.path.abspath(str(boundary)))
+                if boundary is not None else None)
+    before = None
+    if os.name == "nt":
+        if boundary is not None:
+            _reject_symlinked_parents(path, boundary)
+        if path.is_symlink():
+            raise UnsafePathError("refusing symlink file %s" % path)
+        try:
+            before = os.lstat(str(path))
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise UnsafePathError(
+                    "refusing unsafe file %s" % path)
+        except FileNotFoundError:
+            before = None
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    parent_fd = None
+    try:
+        if os.name != "nt" and boundary is not None and \
+                os.open in getattr(os, "supports_dir_fd", set()):
+            try:
+                relative = path.relative_to(boundary)
+            except ValueError:
+                raise UnsafePathError(
+                    "file %s escapes boundary %s" % (path, boundary))
+            dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | \
+                getattr(os, "O_NOFOLLOW", 0)
+            parent_fd = os.open(str(boundary), dir_flags)
+            for part in relative.parent.parts:
+                next_fd = os.open(part, dir_flags, dir_fd=parent_fd)
+                os.close(parent_fd)
+                parent_fd = next_fd
+            for attempt in range(20):
+                try:
+                    fd = os.open(
+                        path.name, flags, mode, dir_fd=parent_fd)
+                    break
+                except FileNotFoundError:
+                    # Older macOS/Python combinations can report a transient
+                    # ENOENT when two threads O_CREAT the same dir-fd-relative
+                    # lock file. Retry only create paths; plain reads preserve
+                    # their normal missing-file contract.
+                    if not (flags & os.O_CREAT) or attempt == 19:
+                        raise
+                    time.sleep(0.005)
+        else:
+            if boundary is not None:
+                _reject_symlinked_parents(path, boundary)
+            if path.is_symlink():
+                raise UnsafePathError("refusing symlink file %s" % path)
+            fd = os.open(str(path), flags, mode)
+    except OSError as e:
+        if isinstance(e, (FileNotFoundError, PermissionError)):
+            raise
+        raise UnsafePathError("refusing unsafe file %s: %s" % (path, e))
+    finally:
+        if parent_fd is not None:
+            os.close(parent_fd)
+    try:
+        info = os.fstat(fd)
+        read_only = (flags & getattr(os, "O_ACCMODE", 3)) == os.O_RDONLY
+        valid_links = info.st_nlink in ((0, 1) if read_only else (1,))
+        if not stat.S_ISREG(info.st_mode) or not valid_links:
+            raise UnsafePathError(
+                "refusing %s: regular, single-link file required" % path)
+        if os.name == "nt":
+            try:
+                after = os.lstat(str(path))
+            except FileNotFoundError:
+                raise StaleTargetError(
+                    "file changed during open: %s" % path)
+            if (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
+                raise StaleTargetError(
+                    "file changed during open: %s" % path)
+            if before is not None and (
+                    before.st_dev, before.st_ino) != (
+                    after.st_dev, after.st_ino):
+                raise StaleTargetError(
+                    "file changed during open: %s" % path)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_text_retry(path, max_bytes=MAX_AUX_BYTES, with_identity=False,
+                     boundary=None):
     """Read a file that a concurrent writer may be os.replace-ing this
     very instant: Windows raises transient PermissionError to readers
     during the swap (CI finding — third member of the same sharing
     family, after the write and lock paths). POSIX never retries."""
     for attempt in range(200):
         try:
-            return Path(path).read_text("utf-8")
+            fd = _open_regular(
+                path, os.O_RDONLY,
+                boundary=boundary or Path(path).parent)
+            try:
+                before = os.fstat(fd)
+                size = before.st_size
+                if size > max_bytes:
+                    raise FileLimitError(
+                        "%s exceeds the %d-byte limit" % (path, max_bytes))
+                chunks = []
+                remaining = max_bytes + 1
+                while remaining:
+                    chunk = os.read(fd, min(1_048_576, remaining))
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    remaining -= len(chunk)
+                payload = b"".join(chunks)
+                if len(payload) > max_bytes:
+                    raise FileLimitError(
+                        "%s exceeds the %d-byte limit" % (path, max_bytes))
+                after = os.fstat(fd)
+                if (before.st_dev, before.st_ino, before.st_mtime_ns,
+                        before.st_size) != (
+                        after.st_dev, after.st_ino, after.st_mtime_ns,
+                        after.st_size):
+                    if attempt == 199:
+                        raise StaleTargetError(
+                            "%s changed while it was being read" % path)
+                    continue
+                text = payload.decode("utf-8")
+                if with_identity:
+                    return text, (
+                        after.st_dev, after.st_ino,
+                        after.st_mtime_ns, after.st_size)
+                return text
+            finally:
+                os.close(fd)
         except PermissionError:
             if os.name != "nt" or attempt == 199:
                 raise
             time.sleep(0.05)
+        except StaleTargetError:
+            if attempt == 199:
+                raise
+            time.sleep(0.005)
+
+
+def _append_regular(path, payload, boundary, mode=0o600, durable=False):
+    """Append one record to a private regular file, never a FIFO or hard link."""
+    fd = _open_regular(
+        path, os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+        mode=mode, boundary=boundary)
+    try:
+        _write_once(fd, payload)
+        if durable:
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _secure_mkdirs(path, boundary, mode=0o700):
+    """Create a directory chain without following a swapped parent."""
+    path = Path(os.path.abspath(str(path)))
+    boundary = Path(os.path.abspath(str(boundary)))
+    try:
+        relative = path.relative_to(boundary)
+    except ValueError:
+        raise UnsafePathError(
+            "directory %s escapes boundary %s" % (path, boundary))
+    if os.name != "nt" and os.mkdir in getattr(
+            os, "supports_dir_fd", set()):
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | \
+            getattr(os, "O_NOFOLLOW", 0)
+        try:
+            current = os.open(str(boundary), flags)
+        except OSError as e:
+            raise UnsafePathError(
+                "refusing unsafe boundary %s: %s" % (boundary, e))
+        try:
+            for part in relative.parts:
+                try:
+                    next_fd = os.open(part, flags, dir_fd=current)
+                except FileNotFoundError:
+                    try:
+                        os.mkdir(part, mode, dir_fd=current)
+                    except FileExistsError:
+                        # Another process/thread created the same directory
+                        # after our failed open. Re-open and validate it
+                        # through the held parent descriptor.
+                        pass
+                    next_fd = os.open(part, flags, dir_fd=current)
+                except OSError as e:
+                    raise UnsafePathError(
+                        "refusing unsafe directory %s: %s" % (path, e))
+                os.close(current)
+                current = next_fd
+        finally:
+            os.close(current)
+        return
+    _reject_symlinked_parents(path / "_", boundary)
+    if path.is_symlink():
+        raise UnsafePathError("refusing symlink directory %s" % path)
+    path.mkdir(parents=True, exist_ok=True, mode=mode)
+
+
+@contextmanager
+def _exclusive_file_lock(path, boundary, timeout=LOCK_TIMEOUT_SECONDS):
+    """Portable advisory lock for non-graph read/modify/write artifacts."""
+    fd = _open_regular(
+        path, os.O_RDWR | os.O_CREAT, boundary=boundary)
+    lockf = os.fdopen(fd, "r+b", buffering=0)
+    backend = None
+    try:
+        if os.fstat(lockf.fileno()).st_size == 0:
+            lockf.write(b"\0")
+            lockf.flush()
+            os.fsync(lockf.fileno())
+        try:
+            import fcntl
+        except ImportError:
+            try:
+                import msvcrt
+            except ImportError:
+                raise RuntimeError("no supported file-lock backend")
+            deadline = time.monotonic() + timeout
+            mode = getattr(msvcrt, "LK_NBLCK", msvcrt.LK_LOCK)
+            while True:
+                lockf.seek(0)
+                try:
+                    msvcrt.locking(lockf.fileno(), mode, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError(
+                            "could not acquire %s within %.1f seconds"
+                            % (path, timeout))
+                    time.sleep(0.05)
+            backend = ("msvcrt", msvcrt)
+        else:
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(
+                        lockf.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError(
+                            "could not acquire %s within %.1f seconds"
+                            % (path, timeout))
+                    time.sleep(0.05)
+            backend = ("fcntl", fcntl)
+        yield
+    finally:
+        if backend is not None:
+            name, module = backend
+            if name == "fcntl":
+                module.flock(lockf.fileno(), module.LOCK_UN)
+            else:
+                lockf.seek(0)
+                module.locking(lockf.fileno(), module.LK_UNLCK, 1)
+        lockf.close()
+
+
+def _display_text(value, cap=1000):
+    """One-line, terminal-safe rendering of project-controlled data."""
+    if not isinstance(value, str):
+        value = str(value)
+    value = re.sub(
+        u"[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069\ud800-\udfff]",
+        "", value)
+    return " ".join(value.split())[:cap]
+
+
+class JournalEntries(list):
+    def __init__(self, values=(), total_count=None):
+        super().__init__(values)
+        self.total_count = len(self) if total_count is None else total_count
+
+
+def _latest_dream_stem(path):
+    if path.is_symlink() or not path.is_dir():
+        return None
+    latest = None
+    seen = 0
+    try:
+        with os.scandir(str(path)) as entries:
+            for entry in entries:
+                if seen >= MAX_DREAM_FILES:
+                    break
+                seen += 1
+                if entry.is_symlink() or not re.fullmatch(
+                        r"\d{4}-\d{2}-\d{2}\.md", entry.name):
+                    continue
+                if latest is None or entry.name > latest:
+                    latest = entry.name
+    except OSError:
+        return None
+    return latest[:-3] if latest else None
 
 
 def _write_all(fd, data):
@@ -136,11 +455,19 @@ def _write_once(fd, data):
     """One append syscall; reject a short record instead of hiding it."""
     written = os.write(fd, data)
     if written != len(data):
+        # Isolate the damaged fragment so it cannot swallow the next JSONL
+        # record. The current record is reported lost; later provenance stays
+        # parseable even under an injected short write or a full filesystem.
+        try:
+            os.write(fd, b"\n")
+        except OSError:
+            pass
         raise OSError("partial append: wrote %d of %d bytes" % (
             written, len(data)))
 
 
-def _atomic_write(path, data, boundary=None):
+def _atomic_write(path, data, boundary=None,
+                  expected_identity=_NO_EXPECTATION, mode=0o600):
     """Atomic, symlink-safe, durable write: O_NOFOLLOW + fsync + os.replace.
 
     O_NOFOLLOW + the is_symlink check block TOCTOU symlink attacks on the
@@ -150,34 +477,147 @@ def _atomic_write(path, data, boundary=None):
     file, never a torn one; fsync before the rename makes the new content
     survive power loss (without it the rename can land while the data is
     still in page cache)."""
-    path = Path(path)
+    path = Path(os.path.abspath(str(path)))
+    boundary = Path(os.path.abspath(str(boundary or path.parent)))
+    payload = data.encode("utf-8") if isinstance(data, str) else data
+
+    # POSIX dir-fd traversal makes the checked directory chain the exact
+    # chain used by create and replace. Renaming a parent between a
+    # path-based check and os.replace can no longer redirect the write.
+    if os.name != "nt" and os.rename in getattr(
+            os, "supports_dir_fd", set()):
+        try:
+            relative = path.relative_to(boundary)
+        except ValueError:
+            raise ValueError("path %s escapes the trust boundary %s"
+                             % (path, boundary))
+        parts = relative.parent.parts
+        dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | \
+            getattr(os, "O_NOFOLLOW", 0)
+        try:
+            parent_fd = os.open(str(boundary), dir_flags)
+        except OSError as e:
+            raise UnsafePathError(
+                "refusing unsafe boundary %s: %s" % (boundary, e))
+        try:
+            for part in parts:
+                try:
+                    next_fd = os.open(part, dir_flags, dir_fd=parent_fd)
+                except OSError as e:
+                    raise UnsafePathError(
+                        "refusing unsafe parent for %s: %s" % (path, e))
+                os.close(parent_fd)
+                parent_fd = next_fd
+            target_mode = mode
+            try:
+                current = os.stat(
+                    path.name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                current = None
+            identity = (
+                current.st_dev, current.st_ino,
+                current.st_mtime_ns, current.st_size
+            ) if current is not None else _EXPECTED_MISSING
+            if expected_identity is not _NO_EXPECTATION and \
+                    identity != expected_identity:
+                raise StaleTargetError(
+                    "%s changed after it was read" % path)
+            if current is not None:
+                if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+                    raise UnsafePathError(
+                        "refusing unsafe atomic-write target: %s" % path)
+                target_mode = stat.S_IMODE(current.st_mode)
+            tmp_name = ".%s.%d.%d.%d.tmp" % (
+                path.name, os.getpid(), threading.get_ident(), time.time_ns())
+            fd = os.open(
+                tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                getattr(os, "O_NOFOLLOW", 0), target_mode, dir_fd=parent_fd)
+            replaced = False
+            try:
+                try:
+                    try:
+                        os.fchmod(fd, target_mode)
+                    except (AttributeError, OSError):
+                        pass
+                    _write_all(fd, payload)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                    fd = None
+                if expected_identity is not _NO_EXPECTATION:
+                    try:
+                        latest = os.stat(
+                            path.name, dir_fd=parent_fd,
+                            follow_symlinks=False)
+                        latest_identity = (
+                            latest.st_dev, latest.st_ino,
+                            latest.st_mtime_ns, latest.st_size)
+                    except FileNotFoundError:
+                        latest_identity = _EXPECTED_MISSING
+                    if latest_identity != expected_identity:
+                        raise StaleTargetError(
+                            "%s changed during rewrite" % path)
+                os.replace(tmp_name, path.name, src_dir_fd=parent_fd,
+                           dst_dir_fd=parent_fd)
+                replaced = True
+                os.fsync(parent_fd)
+            finally:
+                if fd is not None:
+                    os.close(fd)
+                if not replaced:
+                    try:
+                        os.unlink(tmp_name, dir_fd=parent_fd)
+                    except OSError:
+                        pass
+        finally:
+            os.close(parent_fd)
+        return
+
+    # Windows fallback: no dir-fd APIs, but target and every parent are
+    # checked immediately before an unpredictable O_EXCL temporary is
+    # replaced. Existing private permissions are preserved.
     if path.is_symlink():
-        raise ValueError(f"refusing to write through a symlink: {path}")
-    if boundary is not None:
-        _reject_symlinked_parents(path, boundary)
-    # mkstemp is O_EXCL and unpredictable: no same-process collision and no
-    # pre-created hard-link/symlink can be truncated through a predictable
-    # `<path>.<pid>.tmp` name.
+        raise ValueError("refusing to write through a symlink: %s" % path)
+    _reject_symlinked_parents(path, boundary)
+    target_mode = mode
+    if path.exists():
+        current = os.lstat(str(path))
+        if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            raise UnsafePathError(
+                "refusing unsafe atomic-write target: %s" % path)
+        target_mode = stat.S_IMODE(current.st_mode)
+        identity = (current.st_dev, current.st_ino,
+                    current.st_mtime_ns, current.st_size)
+    else:
+        identity = _EXPECTED_MISSING
+    if expected_identity is not _NO_EXPECTATION and \
+            identity != expected_identity:
+        raise StaleTargetError("%s changed after it was read" % path)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp",
                                dir=str(path.parent))
     replaced = False
     try:
         try:
             try:
-                os.fchmod(fd, 0o644)
+                os.fchmod(fd, target_mode)
             except (AttributeError, OSError):
                 pass
-            payload = data.encode("utf-8") if isinstance(data, str) else data
             _write_all(fd, payload)
             os.fsync(fd)
         finally:
             os.close(fd)
             fd = None
-        # Windows: os.replace raises PermissionError while another process
-        # momentarily holds the destination open (Python's open() does not
-        # grant FILE_SHARE_DELETE). Readers are short-lived — retry briefly
-        # (CI finding: 1/12 parallel writers lost this race on
-        # windows-latest; POSIX never enters the loop).
+        if expected_identity is not _NO_EXPECTATION:
+            if path.exists():
+                latest = os.lstat(str(path))
+                latest_identity = (
+                    latest.st_dev, latest.st_ino,
+                    latest.st_mtime_ns, latest.st_size)
+            else:
+                latest_identity = _EXPECTED_MISSING
+            if latest_identity != expected_identity:
+                raise StaleTargetError(
+                    "%s changed during rewrite" % path)
         for attempt in range(200):
             try:
                 os.replace(tmp, str(path))
@@ -195,18 +635,6 @@ def _atomic_write(path, data, boundary=None):
                 os.unlink(tmp)
             except OSError:
                 pass
-    # full durability: fsync the DIRECTORY too, or the rename itself can
-    # be lost on power failure (auditor finding — the docs promised more
-    # than fsync-the-file delivers). Windows has no dir-fsync; skip.
-    if os.name != "nt":
-        try:
-            dfd = os.open(str(path.parent.resolve()), os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-        except OSError:
-            pass
 
 
 # ────────────────────────────────────────────────────────────────
@@ -656,51 +1084,27 @@ class Hippocampus:
     with direct keyword matches via Reciprocal Rank Fusion + IDF."""
 
     def __init__(self, path):
-        self.path = path
+        self.path = Path(path)
         self.nodes = {}   # id -> {text, weight, peak_weight, last_accessed,
         #                          access_count, created, confidence, keys, history}
         self.edges = {}   # id -> {neighbor_id: {relation, weight}}
         self.meta = {}    # small persisted strings (e.g. last_edge_decay)
         self.related = None
         self.embedder = HashEmbed()
-        self._deleted = set()   # node ids deleted this session (see _save merge)
-        self._loaded_view = {}  # nid -> (last_accessed, access_count) as of
-        #   our last DISK read/write: the merge compares the current disk
-        #   copy against this baseline to detect concurrent refreshes and
-        #   veto stale decay/prune decisions (auditor finding, 6.2.9 — a
-        #   stale dream pruned a just-confirmed memory, breaking the
-        #   GRACE_DAYS promise). In-session mutations deliberately do NOT
-        #   move the baseline: only what we saw on disk counts.
-        self._delete_vetoed = set()  # deletions the last merge refused
-        self._decayed = {}      # nid -> decayed weight this session: decay
-        #   touches ONLY salience, so it must never whole-copy a node over
-        #   a concurrent confirm's fresh counters (auditor finding, wave 2:
-        #   confirm racing dream lost the increment in 20/25 trials); a
-        #   disk copy fresher than _loaded_view drops the stale decay
-        #   entirely (auditor finding, 6.2.9)
-        self._bumped = {}       # nid -> reinforcement delta this session:
-        #   applied ON TOP of the fresh disk copy inside the locked merge,
-        #   so two processes confirming the same fact both count (auditor
-        #   finding: read-modify-write raced — 20 parallel confirms landed
-        #   as 8-14)
-        self._conf_raised = {}  # nid -> raised confidence this session:
-        #   merged max-wins on the fresh disk copy, exactly like _bumped
-        #   merges deltas — marking the node _dirty for a confidence-only
-        #   change whole-copied this session's stale counters over a
-        #   concurrent confirm (auditor finding, 6.2.9: the third
-        #   reinforcement-loss variant)
-        self._dirty = set()     # node ids THIS session actually modified:
-        #   the merge overwrites the disk only with these — untouched
-        #   stale copies used to clobber another process's confirmations
-        #   (auditor finding: bump in process A, unrelated remember in
-        #   process B → A's access_count silently reset)
-        self._pruned_edges = set()  # (a, b) edge pairs pruned this session:
-        #   without this, an edge decayed to empty and removed from
-        #   self.edges is silently REVIVED from disk by the read-merge-write
-        #   (edge deletions, unlike node deletions, weren't tracked)
-        self._edge_updates = set()  # directional edges created/replaced here
-        self._edge_bumps = Counter()  # directional reinforcement deltas
-        self._edge_decay_day = None  # daily homeostasis request, applied in lock
+        self._thread_lock = threading.RLock()
+        self._transaction_state = threading.local()
+        self._deleted = set()
+        self._loaded_state_digest = None
+        # Mutation markers avoid hashing the whole graph on normal writes.
+        # Direct embedders that edit in-memory state without a marker are
+        # still detected by the state digest at transaction entry.
+        self._decayed = {}
+        self._bumped = {}
+        self._conf_raised = {}
+        self._dirty = set()
+        self._pruned_edges = set()
+        self._edge_updates = set()
+        self._edge_bumps = Counter()
         self._last_edge_pruned = 0
         self._load()
 
@@ -711,7 +1115,29 @@ class Hippocampus:
             ".json.corrupt-%s-%d" % (_now().strftime("%H%M%S%f"),
                                      os.getpid()))
         try:
-            self.path.rename(bak)
+            if os.name != "nt" and os.rename in getattr(
+                    os, "supports_dir_fd", set()):
+                flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | \
+                    getattr(os, "O_NOFOLLOW", 0)
+                parent_fd = os.open(str(self.path.parent), flags)
+                try:
+                    info = os.stat(
+                        self.path.name, dir_fd=parent_fd,
+                        follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        raise UnsafePathError(
+                            "refusing to quarantine an unsafe graph")
+                    os.rename(
+                        self.path.name, bak.name,
+                        src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+            else:
+                if self.path.is_symlink() or not self.path.is_file():
+                    raise UnsafePathError(
+                        "refusing to quarantine an unsafe graph")
+                self.path.rename(bak)
             print("warning: could not read %s (%s).\n"
                   "  corrupt copy saved as %s; starting with empty memory."
                   % (self.path.name, reason, bak.name), file=sys.stderr)
@@ -727,7 +1153,7 @@ class Hippocampus:
         float() alone happily accepts it)."""
         try:
             f = float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default
         if not math.isfinite(f):
             return default
@@ -765,7 +1191,7 @@ class Hippocampus:
         on its next save (fuzzer finding)."""
         out = {}
         now_iso = _now().isoformat()
-        for nid, n in raw.items():
+        for nid, n in list(raw.items())[:MAX_NODES]:
             if not isinstance(n, dict) or not isinstance(n.get("text", ""), str):
                 continue
             n["text"] = self._clean_text(n.get("text", ""))
@@ -800,7 +1226,10 @@ class Hippocampus:
             for h in raw_history:
                 if not isinstance(h, dict):
                     continue
-                old_text = self._clean_text(h.get("text", ""))
+                raw_old_text = h.get("text", "")
+                if not isinstance(raw_old_text, str):
+                    continue
+                old_text = self._clean_text(raw_old_text)
                 if not old_text:
                     continue
                 history.append({
@@ -808,6 +1237,8 @@ class Hippocampus:
                     "replaced": self._iso_timestamp(
                         h.get("replaced"), "unknown"),
                 })
+                if len(history) >= MAX_HISTORY_PER_NODE:
+                    break
             n["history"] = history
             # provenance + validity (6.0.0): older graphs get honest
             # defaults — origin "unknown", validity open since creation
@@ -850,11 +1281,14 @@ class Hippocampus:
         (fuzzer finding: a null/list edge weight crashed the dream's edge
         decay; orphan edges crashed recall with KeyError)."""
         out = {}
+        edge_count = 0
         for nid, nbrs in raw.items():
             if nid not in nodes or not isinstance(nbrs, dict):
                 continue
             clean = {}
             for nbr, e in nbrs.items():
+                if edge_count >= MAX_EDGES:
+                    break
                 if nbr not in nodes or not isinstance(e, dict):
                     continue
                 e["weight"] = self._finite(e.get("weight", 1.0), 1.0, 0.0, 1.0)
@@ -867,21 +1301,42 @@ class Hippocampus:
                     else:
                         e["created"] = created
                 clean[nbr] = e
+                edge_count += 1
             if clean:
                 out[nid] = clean
         return out
 
     def _load(self):
         if not self.path.exists():
+            self.nodes = {}
+            self.edges = {}
+            self.meta = {}
+            self._snapshot_view()
             return
         try:
-            data = json.loads(_read_text_retry(self.path))
+            data = json.loads(_read_text_retry(
+                self.path, max_bytes=MAX_GRAPH_BYTES,
+                boundary=self.path.parent))
             if not isinstance(data, dict):
                 raise ValueError("graph.json is not a JSON object")
             if not isinstance(data.get("nodes", {}), dict) or \
                     not isinstance(data.get("edges", {}), dict):
                 raise ValueError("nodes/edges have the wrong structure")
-        except (json.JSONDecodeError, ValueError) as e:
+            if len(data.get("nodes", {})) > MAX_NODES:
+                raise FileLimitError(
+                    "graph exceeds %d nodes" % MAX_NODES)
+            raw_edge_count = 0
+            for raw_neighbors in data.get("edges", {}).values():
+                if isinstance(raw_neighbors, dict):
+                    raw_edge_count += len(raw_neighbors)
+                    if raw_edge_count > MAX_EDGES:
+                        raise FileLimitError(
+                            "graph exceeds %d directional edges"
+                            % MAX_EDGES)
+        except UnsafePathError:
+            raise
+        except (json.JSONDecodeError, UnicodeError, FileLimitError,
+                ValueError, RecursionError) as e:
             data = self._quarantine(e)
         self.nodes = self._repair_nodes(data.get("nodes", {}))
         self.edges = self._repair_edges(data.get("edges", {}), self.nodes)
@@ -903,227 +1358,117 @@ class Hippocampus:
         self._snapshot_view()
 
     def _snapshot_view(self):
-        """Record (last_accessed, access_count) per node as of the disk
-        state just read or written — the freshness baseline the merge uses
-        to veto stale decay/prune decisions (6.2.9)."""
-        self._loaded_view = {
-            nid: (n.get("last_accessed", ""),
-                  int(self._finite(n.get("access_count", 0), 0, 0)))
-            for nid, n in self.nodes.items()}
+        """Record the exact semantic state last read from or written to disk."""
+        self._loaded_state_digest = self._state_digest()
 
-    def _save(self):
-        """Locked read-merge-write: concurrent agent processes cannot lose
-        each other's writes. Inside the lock we re-read the graph from disk
-        and merge nodes/edges written by other processes since our load
-        (our changes win per node; our deletions stay deleted)."""
+    def _state_digest(self):
+        payload = json.dumps(
+            {"nodes": self.nodes, "edges": self.edges, "meta": self.meta},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _has_local_changes(self):
+        trackers = (
+            self._deleted, self._decayed, self._bumped, self._conf_raised,
+            self._dirty, self._pruned_edges, self._edge_updates,
+            self._edge_bumps,
+        )
+        return any(trackers) or \
+            self._loaded_state_digest != self._state_digest()
+
+    @contextmanager
+    def _graph_lock(self):
+        """Hold the one graph lock understood by every mind release.
+
+        The lock covers the fresh read, the semantic decision, and the single
+        graph commit. A per-object RLock serializes threads sharing one
+        Hippocampus; the file lock serializes processes and older releases.
+        """
         lock_path = self.path.with_suffix(".json.lock")
-        # open the lock with O_NOFOLLOW: a symlinked lock file must never
-        # truncate its target (auditor finding — plain open(..., "w") did).
-        # And check the PARENT chain before creating it: through a symlinked
-        # .mind root the lock file itself used to be created outside the
-        # trust boundary — the one write that escaped (test-suite finding)
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        _reject_symlinked_parents(lock_path, self.path.parent)
         try:
-            lock_fd = os.open(str(lock_path),
-                              os.O_WRONLY | os.O_CREAT | nofollow, 0o644)
+            lock_fd = _open_regular(
+                lock_path, os.O_RDWR | os.O_CREAT,
+                boundary=self.path.parent)
         except OSError as e:
-            raise ValueError("refusing unsafe lock file %s: %s" % (lock_path, e))
-        with os.fdopen(lock_fd, "w") as lockf:
+            raise ValueError("refusing unsafe graph lock %s: %s"
+                             % (lock_path, e))
+        with os.fdopen(lock_fd, "r+b", buffering=0) as lockf:
+            info = os.fstat(lockf.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("refusing unsafe graph lock: regular, "
+                                 "single-link file required")
+            if info.st_size == 0:
+                lockf.write(b"\0")
+                lockf.flush()
+                os.fsync(lockf.fileno())
             lock_backend = None
             try:
-                import fcntl
-                fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
-                lock_backend = ("fcntl", fcntl)
-            except ImportError:
                 try:
-                    import msvcrt
-                except ImportError:            # neither fcntl nor msvcrt:
-                    lock_backend = None        # degrade to atomic-write-only
-                else:
-                    lockf.seek(0)
-                    # LK_LOCK is not an indefinite blocking lock like flock:
-                    # the CRT retries once per second, 10 times, then raises
-                    # OSError — so a save contended for >10s would crash the
-                    # very scenario the lock exists for. Keep waiting instead,
-                    # exactly like the POSIX path.
-                    for _attempt in range(18):   # up to ~3 min: LK_LOCK waits
-                        try:                        # ~10s per call
-                            msvcrt.locking(lockf.fileno(), msvcrt.LK_LOCK, 1)
+                    import fcntl
+                    timeout = self._finite(
+                        os.environ.get("MIND_LOCK_TIMEOUT_SECONDS",
+                                       LOCK_TIMEOUT_SECONDS),
+                        LOCK_TIMEOUT_SECONDS, 0.1, 300.0)
+                    deadline = time.monotonic() + timeout
+                    while True:
+                        try:
+                            fcntl.flock(
+                                lockf.fileno(),
+                                fcntl.LOCK_EX | fcntl.LOCK_NB)
                             break
-                        except OSError:
-                            continue                # keep waiting, bounded
-                    else:
-                        # a hung (alive but frozen) holder must not
-                        # livelock us forever (auditor finding)
-                        raise ValueError("could not acquire the graph lock "
-                                         "after ~3 minutes — is another "
-                                         "process hung?")
-                    lock_backend = ("msvcrt", msvcrt)
-            try:
-                disk = {}
-                if self.path.exists():
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                raise ValueError(
+                                    "could not acquire the graph lock within "
+                                    "%.1f seconds" % timeout)
+                            time.sleep(0.05)
+                    lock_backend = ("fcntl", fcntl)
+                except ImportError:
                     try:
-                        disk = json.loads(_read_text_retry(self.path))
-                        if not isinstance(disk, dict):
-                            raise ValueError("graph.json is not a JSON object")
-                        if not isinstance(disk.get("nodes", {}), dict) or \
-                                not isinstance(disk.get("edges", {}), dict):
-                            raise ValueError("nodes/edges have the wrong structure")
-                    except (json.JSONDecodeError, ValueError) as e:
-                        # never silently overwrite a corrupt graph during a
-                        # live save: quarantine it exactly like _load does
-                        # (auditor finding — the README promise held only
-                        # on the load path)
-                        self._quarantine(e)
-                        disk = {}
-                dn = disk.get("nodes", {})
-                de = disk.get("edges", {})
-                # repair the disk copy BEFORE merging: without this the merge
-                # imported raw disk content past _load's validation.
-                repaired_disk = self._repair_nodes(dn)
-                # Re-validate prune decisions against the FRESH copy: a
-                # confirm from another process after our load vetoes the
-                # deletion — a stale dream must not kill a live memory
-                # (auditor finding, 6.2.9).
-                self._delete_vetoed = set()
-                for k in list(self._deleted):
-                    basis = self._loaded_view.get(k)
-                    fresh = repaired_disk.get(k)
-                    if basis is not None and fresh is not None and (
-                            fresh.get("last_accessed", "") > basis[0] or
-                            int(self._finite(fresh.get("access_count", 0),
-                                             0, 0)) > basis[1]):
-                        self._deleted.discard(k)
-                        self._delete_vetoed.add(k)
-                merged_n = {k: v for k, v in repaired_disk.items()
-                            if k not in self._deleted}
-                # Field freshness is per node: untouched disk copies are newer.
-                for k in self._dirty:
-                    if k in self.nodes:
-                        merged_n[k] = self.nodes[k]
-                for k, v in self.nodes.items():
-                    merged_n.setdefault(k, v)
-                # Reinforcement deltas apply on top of the freshest disk copy.
-                now_iso = _now().isoformat()
-                for k, d in self._bumped.items():
-                    n = merged_n.get(k)
-                    if n is None or k in self._dirty:
-                        continue
-                    n["access_count"] = int(self._finite(
-                        n.get("access_count", 0), 0, 0)) + d
-                    n["weight"] = min(1.0, self._finite(
-                        n.get("weight", 1.0), 1.0, 0.0, 1.0)
-                        + BOOST_PER_ACCESS * d)
-                    n["peak_weight"] = max(
-                        self._finite(n.get("peak_weight", 1.0),
-                                     1.0, 0.0, 1.0), n["weight"])
-                    n["last_accessed"] = now_iso
-                # Decay touches salience only on the fresh disk copy — and
-                # only when the disk still matches the view we loaded: a
-                # copy refreshed by a concurrent confirm outranks stale
-                # decay (auditor finding, 6.2.9).
-                for k, w in self._decayed.items():
-                    n = merged_n.get(k)
-                    if n is None or k in self._dirty or k in self._bumped:
-                        continue
-                    basis = self._loaded_view.get(k)
-                    if basis is not None and \
-                            n.get("last_accessed", "") > basis[0]:
-                        continue
-                    n["weight"] = min(self._finite(
-                        n.get("weight", 1.0), 1.0, 0.0, 1.0), w)
-                # Raised confidence merges max-wins on the fresh copy too:
-                # its own field, never a whole-node overwrite (6.2.9).
-                for k, c in self._conf_raised.items():
-                    n = merged_n.get(k)
-                    if n is None or k in self._dirty:
-                        continue
-                    n["confidence"] = max(self._finite(
-                        n.get("confidence", 1.0), 1.0, 0.0, 1.0), c)
-
-                # Edge freshness is per DIRECTIONAL PAIR. Whole-adjacency
-                # update() lost concurrent links and could leave an asymmetric
-                # graph (A->B gone while B->A survived).
-                merged_e = {}
-                for k, v in self._repair_edges(de, merged_n).items():
-                    if k in self._deleted:
-                        continue
-                    kept = {nbr: e for nbr, e in v.items()
-                            if nbr not in self._deleted
-                            and (k, nbr) not in self._pruned_edges}
-                    if kept:
-                        merged_e[k] = kept
-                for a, b in self._edge_updates:
-                    edge = self.edges.get(a, {}).get(b)
-                    if edge is not None and a in merged_n and b in merged_n:
-                        merged_e.setdefault(a, {})[b] = dict(edge)
-                for (a, b), count in self._edge_bumps.items():
-                    edge = merged_e.get(a, {}).get(b)
-                    if edge is None:
-                        continue
-                    edge["weight"] = min(
-                        1.0, self._finite(edge.get("weight", 1.0),
-                                          1.0, 0.0, 1.0)
-                        + EDGE_BOOST * count)
-
-                # Meta merge happens before daily edge decay so the decision
-                # is made under the lock against the freshest marker. Two
-                # concurrent dreams can therefore decay a day only once.
-                disk_meta = disk.get("meta", {})
-                if not isinstance(disk_meta, dict):
-                    disk_meta = {}
-                merge_today = str(_now().date())
-                for mk, mv in disk_meta.items():
-                    if mk not in _META_KEYS or not (
-                            isinstance(mv, str) and mv.isprintable()):
-                        continue
-                    mv = mv[:64]
-                    if mk == "last_edge_decay" and mv > merge_today:
-                        mv = merge_today
-                    if mv > self.meta.get(mk, ""):
-                        self.meta[mk] = mv
-
-                self._last_edge_pruned = 0
-                decay_day = self._edge_decay_day
-                if decay_day is not None:
-                    decay_day = min(decay_day, merge_today)
-                if decay_day and self.meta.get(
-                        "last_edge_decay", "") < decay_day:
-                    for a in list(merged_e):
-                        for b in list(merged_e[a]):
-                            edge = merged_e[a][b]
-                            edge["weight"] = round(self._finite(
-                                edge.get("weight", 1.0), 1.0, 0.0, 1.0)
-                                * EDGE_DECAY_PER_DREAM, 4)
-                            if edge["weight"] < EDGE_PRUNE_THRESHOLD:
-                                del merged_e[a][b]
-                                self._last_edge_pruned += 1
-                        if not merged_e[a]:
-                            del merged_e[a]
-                    self.meta["last_edge_decay"] = decay_day
-
-                self.nodes, self.edges = merged_n, merged_e
-                _atomic_write(self.path, json.dumps(
-                    {"nodes": self.nodes, "edges": self.edges,
-                     "meta": self.meta},
-                    ensure_ascii=False, indent=2),
-                    boundary=self.path.parent)
-                # deletions/prunes are now persisted to disk; clear them so
-                # they can't poison a later _save in the same process (auditor
-                # finding: a stale _pruned_edges entry deleted a live edge a
-                # subsequent op had recreated)
-                self._deleted.clear()
-                self._pruned_edges.clear()
-                self._dirty.clear()
-                self._bumped.clear()
-                self._decayed.clear()
-                self._conf_raised.clear()
-                self._edge_updates.clear()
-                self._edge_bumps.clear()
-                self._edge_decay_day = None
-                # what we just wrote IS the new disk baseline (6.2.9)
-                self._snapshot_view()
+                        import msvcrt
+                    except ImportError:
+                        raise RuntimeError(
+                            "no supported graph-lock backend is available")
+                    else:
+                        lockf.seek(0)
+                        timeout = self._finite(
+                            os.environ.get(
+                                "MIND_LOCK_TIMEOUT_SECONDS",
+                                LOCK_TIMEOUT_SECONDS),
+                            LOCK_TIMEOUT_SECONDS, 0.1, 300.0)
+                        nonblocking = getattr(msvcrt, "LK_NBLCK", None)
+                        if nonblocking is not None:
+                            deadline = time.monotonic() + timeout
+                            while True:
+                                try:
+                                    msvcrt.locking(
+                                        lockf.fileno(), nonblocking, 1)
+                                    break
+                                except OSError:
+                                    if time.monotonic() >= deadline:
+                                        raise ValueError(
+                                            "could not acquire the graph "
+                                            "lock within %.1f seconds"
+                                            % timeout)
+                                    time.sleep(0.05)
+                        else:
+                            # Older CRTs expose only the ~10-second blocking
+                            # call. Bound the number of retries by the same
+                            # configured timeout.
+                            attempts = max(1, int(math.ceil(timeout / 10.0)))
+                            for _attempt in range(attempts):
+                                try:
+                                    msvcrt.locking(
+                                        lockf.fileno(), msvcrt.LK_LOCK, 1)
+                                    break
+                                except OSError:
+                                    continue
+                            else:
+                                raise ValueError(
+                                    "could not acquire the graph lock within "
+                                    "%.1f seconds" % timeout)
+                        lock_backend = ("msvcrt", msvcrt)
+                yield
             finally:
                 if lock_backend is not None:
                     name, module = lock_backend
@@ -1133,7 +1478,120 @@ class Hippocampus:
                         lockf.seek(0)
                         module.locking(lockf.fileno(), module.LK_UNLCK, 1)
 
+    def _transaction_active(self):
+        return bool(getattr(self._transaction_state, "depth", 0))
+
+    @contextmanager
+    def _transaction(self):
+        """Run one semantic operation from a fresh snapshot to one commit."""
+        with self._thread_lock:
+            state = self._transaction_state
+            if getattr(state, "depth", 0):
+                state.depth += 1
+                try:
+                    yield
+                finally:
+                    state.depth -= 1
+                return
+
+            with self._graph_lock():
+                state.depth = 1
+                state.save_requested = False
+                state.journal = []
+                state.signals = []
+                state.prunes = []
+                try:
+                    # Tests and embedders may deliberately mutate the loaded
+                    # graph before invoking a method. Preserve those explicit
+                    # local decisions; ordinary stale objects always reload.
+                    if not self._has_local_changes():
+                        self._load()
+                        self.related = None
+                    self._recover_prune_outbox()
+                    yield
+                    self._flush_transaction()
+                    for op, fields in state.journal:
+                        self._journal_immediate(op, **fields)
+                    for kind, content in state.signals:
+                        self._log_signal_immediate(kind, content)
+                except BaseException:
+                    # Do not let a failed operation poison reuse of this
+                    # object with an uncommitted in-memory graph.
+                    try:
+                        self._load()
+                        self.related = None
+                    except Exception:
+                        pass
+                    raise
+                finally:
+                    state.depth = 0
+                    state.save_requested = False
+                    state.journal = []
+                    state.signals = []
+                    state.prunes = []
+
+    def _flush_transaction(self):
+        """Commit queued graph work while retaining the outer graph lock."""
+        state = self._transaction_state
+        if not self._transaction_active() or not state.save_requested:
+            return
+        if state.prunes:
+            self._stage_prunes(state.prunes)
+            state.prunes = []
+        self._commit_current()
+        self._recover_prune_outbox()
+        state.save_requested = False
+
+    def _clear_trackers(self):
+        self._deleted.clear()
+        self._pruned_edges.clear()
+        self._dirty.clear()
+        self._bumped.clear()
+        self._decayed.clear()
+        self._conf_raised.clear()
+        self._edge_updates.clear()
+        self._edge_bumps.clear()
+
+    def _commit_current(self):
+        """Persist the transaction's already-fresh graph exactly once."""
+        if len(self.nodes) > MAX_NODES:
+            raise FileLimitError("graph exceeds %d nodes" % MAX_NODES)
+        edge_count = sum(len(nbrs) for nbrs in self.edges.values())
+        if edge_count > MAX_EDGES:
+            raise FileLimitError("graph exceeds %d directional edges"
+                                 % MAX_EDGES)
+        for node in self.nodes.values():
+            history = node.get("history", [])
+            if isinstance(history, list) and \
+                    len(history) > MAX_HISTORY_PER_NODE:
+                del history[:-MAX_HISTORY_PER_NODE]
+        serialized = json.dumps(
+            {"nodes": self.nodes, "edges": self.edges, "meta": self.meta},
+            ensure_ascii=False, indent=2)
+        if len(serialized.encode("utf-8")) > MAX_GRAPH_BYTES:
+            raise FileLimitError("graph exceeds the %d-byte limit"
+                                 % MAX_GRAPH_BYTES)
+        _atomic_write(self.path, serialized, boundary=self.path.parent)
+        self._clear_trackers()
+        self._snapshot_view()
+
+    def _save(self):
+        """Request the transaction's single graph commit.
+
+        Direct callers are wrapped in the same fresh-read graph transaction;
+        there is no second lock path and no atomic-only fallback.
+        """
+        if self._transaction_active():
+            self._transaction_state.save_requested = True
+            return
+        with self._transaction():
+            self._transaction_state.save_requested = True
+
     def decay_edges(self, dry_run=False):
+        with self._transaction():
+            return self._decay_edges(dry_run=dry_run)
+
+    def _decay_edges(self, dry_run=False):
         """Apply synaptic homeostasis once per day, decided under the lock."""
         today = str(_now().date())
         if self.meta.get("last_edge_decay", "") >= today:
@@ -1143,9 +1601,22 @@ class Hippocampus:
                 1 for nbrs in self.edges.values() for e in nbrs.values()
                 if self._finite(e.get("weight", 1.0), 1.0, 0.0, 1.0)
                 * EDGE_DECAY_PER_DREAM < EDGE_PRUNE_THRESHOLD)
-        self._edge_decay_day = today
+        pruned = 0
+        for a in list(self.edges):
+            for b in list(self.edges[a]):
+                edge = self.edges[a][b]
+                edge["weight"] = round(self._finite(
+                    edge.get("weight", 1.0), 1.0, 0.0, 1.0)
+                    * EDGE_DECAY_PER_DREAM, 4)
+                if edge["weight"] < EDGE_PRUNE_THRESHOLD:
+                    del self.edges[a][b]
+                    pruned += 1
+            if not self.edges[a]:
+                del self.edges[a]
+        self.meta["last_edge_decay"] = today
+        self._last_edge_pruned = pruned
         self._save()
-        return self._last_edge_pruned
+        return pruned
 
     @staticmethod
     def _id(text):
@@ -1231,7 +1702,7 @@ class Hippocampus:
             for k in (facets or sorted(IDENTITY_KEYS)):
                 keys.setdefault(k)
         self._ensure_related()
-        if self.related is not None:
+        if is_query and self.related is not None:
             for w in list(keys):
                 # expand RARE terms only: a term already frequent in the
                 # corpus has direct hits, and expanding it just smears its
@@ -1256,8 +1727,13 @@ class Hippocampus:
         remember and link so their node ids agree (auditor finding: link
         hashed the raw text while remember hashed the cleaned text, creating
         a phantom edge that the dangling-edge filter then silently dropped)."""
-        return re.sub(u"[\x00-\x08\x0b-\x1f\x7f\u202a-\u202e\u2066-\u2069]",
-                      "", text or "").strip()
+        cleaned = re.sub(
+            u"[\x00-\x08\x0b-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]",
+            "", text or "")
+        # Lone surrogates cannot be encoded as UTF-8 and otherwise survive
+        # JSON repair until a later save/export crashes.
+        cleaned = re.sub(u"[\ud800-\udfff]", "", cleaned)
+        return cleaned.strip()
 
     @classmethod
     def _validated_text(cls, text, label="memory"):
@@ -1271,8 +1747,24 @@ class Hippocampus:
                 label, MAX_TEXT_CHARS))
         return cleaned
 
+    @classmethod
+    def _validated_query(cls, query, label="query"):
+        if not isinstance(query, str):
+            raise ValueError("%s must be a string" % label)
+        cleaned = cls._clean_text(query)
+        if not cleaned:
+            raise ValueError("%s must not be empty" % label)
+        if len(cleaned) > MAX_QUERY_CHARS:
+            raise ValueError("%s exceeds %d chars" % (
+                label, MAX_QUERY_CHARS))
+        return cleaned
+
     # -- write path ---------------------------------------------------
     def remember(self, text, confidence=1.0):
+        with self._transaction():
+            return self._remember(text, confidence)
+
+    def _remember(self, text, confidence=1.0):
         text = self._validated_text(text)
         confidence = self._finite(confidence, 1.0, 0.0, 1.0)
         nid = self._id(text)
@@ -1319,6 +1811,7 @@ class Hippocampus:
                 "access_count": 0,
                 "confidence": confidence,
                 "keys": self._extract_keys(text),
+                "history": [],
                 # provenance + truth validity, written the moment the
                 # fact is learned (structure at write time)
                 "origin": {"by": by, "session": session, "via": "remember"},
@@ -1339,9 +1832,15 @@ class Hippocampus:
         return nid
 
     def link(self, text_a, text_b, relation="related"):
+        with self._transaction():
+            return self._link(text_a, text_b, relation)
+
+    def _link(self, text_a, text_b, relation="related"):
         # relations end up in graph.json and journals — same control-char
         # hygiene as memory texts (auditor finding), plus a sane length cap
-        relation = re.sub(r"[\x00-\x1f\x7f]", "", relation).strip()[:60] or "related"
+        if not isinstance(relation, str):
+            raise ValueError("relation must be a string")
+        relation = " ".join(self._clean_text(relation).split())[:60] or "related"
         # hash the CLEANED text, exactly as remember() does, so the edge is
         # stored under the same id the node gets — otherwise the edge points
         # at a phantom id and is dropped on next load (auditor finding)
@@ -1359,6 +1858,11 @@ class Hippocampus:
         if id_b not in self.nodes:
             self.remember(text_b)
         now = _now().isoformat()
+        # Linking is a real use of both memories. Refresh their grace window
+        # without pretending they were recalled/confirmed.
+        for nid in (id_a, id_b):
+            self.nodes[nid]["last_accessed"] = now
+            self._dirty.add(nid)
         self.edges.setdefault(id_a, {})[id_b] = {"relation": relation,
                                                  "weight": 1.0, "created": now}
         self.edges.setdefault(id_b, {})[id_a] = {"relation": relation,
@@ -1396,6 +1900,10 @@ class Hippocampus:
             del self.edges[nid]
 
     def correct(self, old_hint, new_text):
+        with self._transaction():
+            return self._correct(old_hint, new_text)
+
+    def _correct(self, old_hint, new_text):
         """Temporal reconsolidation (fusion, not erasure): find the memory
         best matching `old_hint`, CLOSE its validity (valid_to = now,
         superseded_by = new id) and create the corrected fact as a new
@@ -1407,12 +1915,13 @@ class Hippocampus:
         simply stops returning the closed fact either way.
 
         Destructive-op gate: the match must share at least two content
-        tokens with the hint (or cover half of a short hint) — a one-word
-        coincidence must never rewrite an unrelated memory."""
+        tokens with the hint. A one-token hint is accepted only when it
+        identifies exactly one current fact."""
         # same control-char hygiene and hashing as remember(): correct is a
         # write path too, and an uncleaned new_text would store text under
         # an id remember() would never produce (auditor finding). An empty
         # replacement would silently blank a memory — refuse it.
+        old_hint = self._validated_query(old_hint, "correction hint")
         new_text = self._validated_text(new_text, "corrected")
         if not self.nodes:
             return None
@@ -1422,9 +1931,20 @@ class Hippocampus:
         nid, _, node = results[0]
         hint_toks = self._content_tokens(old_hint)
         shared = hint_toks & self._content_tokens(node["text"])
-        if not (len(shared) >= 2 or
-                (hint_toks and len(shared) / len(hint_toks) >= 0.5)):
-            return None
+        exact_hint = " ".join(old_hint.lower().split()) == \
+            " ".join(node["text"].lower().split())
+        if not (exact_hint or len(shared) >= 2):
+            unique_short = False
+            if len(hint_toks) == 1 and len(shared) == 1:
+                matching = [
+                    candidate_id for candidate_id, candidate in
+                    self.nodes.items()
+                    if self._valid_at(candidate) and
+                    hint_toks <= self._content_tokens(candidate["text"])
+                ]
+                unique_short = matching == [nid]
+            if not unique_short:
+                return None
         old_text = node["text"]
         now = _now().isoformat()
         new_nid = self._id(new_text)
@@ -1486,8 +2006,9 @@ class Hippocampus:
         self.edges.setdefault(nid, {})[new_nid] = {
             "relation": "superseded-by", "weight": 0.5, "created": now}
         self._edge_updates.update(((new_nid, nid), (nid, new_nid)))
-        # close the old fact — invalidation is explicit and reversible,
-        # never conflated with attention decay
+        # close the old fact explicitly; this preserves lineage but is not
+        # a general rollback mechanism and is distinct from attention decay
+        node["last_accessed"] = now
         node["valid_to"] = now
         node["superseded_by"] = new_nid
         self._dirty.add(nid)
@@ -1512,6 +2033,11 @@ class Hippocampus:
         are candidates. Superseded facts stay in the graph for lineage
         (`why`, `entity`, `recall --at <date>`) but are never returned
         as current answers."""
+        query = self._validated_query(query)
+        top_k = max(1, min(50, int(self._finite(top_k, RECALL_TOP_K, 1, 50))))
+        max_hops = max(0, min(10, int(self._finite(
+            max_hops, RECALL_RADIUS, 0, 10))))
+        rrf_k = max(1, min(10_000, int(self._finite(rrf_k, 60, 1, 10_000))))
         t0 = time.perf_counter()
         q_tokens = set(re.findall(r"[\w؀-ۿ]+", query.lower()))
         # a PURE identity question ("what is my name") carries a pronoun
@@ -1643,6 +2169,10 @@ class Hippocampus:
         return results, (time.perf_counter() - t0) * 1000, kinds
 
     def bump(self, node_ids):
+        with self._transaction():
+            return self._bump(node_ids)
+
+    def _bump(self, node_ids):
         """Reinforce nodes after a confirmed recall (kept separate from
         recall() so reads stay pure; the `confirm` CLI command is the
         agent-facing path here). Tracks peak_weight for Ebbinghaus, and
@@ -1674,6 +2204,10 @@ class Hippocampus:
         return changed
 
     def decay(self, dry_run=False):
+        with self._transaction():
+            return self._decay(dry_run=dry_run)
+
+    def _decay(self, dry_run=False):
         """Ebbinghaus forgetting curve: R = e^(-t/S).
 
         Stability S grows with each confirmed recall, so frequently used
@@ -1723,74 +2257,271 @@ class Hippocampus:
                 self._decayed[nid] = new_weight
             if new_weight < WEIGHT_THRESHOLD and access < 2 and days > GRACE_DAYS:
                 pruned.append((nid, n["text"]))
+        bounded = []
+        batch_bytes = 0
+        for item in pruned[:MAX_PRUNES_PER_CYCLE]:
+            item_bytes = len(json.dumps(
+                item, ensure_ascii=False).encode("utf-8"))
+            if bounded and batch_bytes + item_bytes > MAX_PRUNE_BATCH_BYTES:
+                break
+            bounded.append(item)
+            batch_bytes += item_bytes
         if dry_run:
-            return [t for _, t in pruned]
-        # archive FIRST, delete only what was durably archived: if the
-        # archive cannot be written (e.g. someone symlinked archive.md),
-        # nothing is pruned — "archived, not destroyed" is a guarantee,
-        # not a best effort (auditor finding).
+            return [t for _, t in bounded]
+        pruned = bounded
         if pruned:
-            if self._archive([t for _, t in pruned], now):
+            if self._archive_preflight():
                 for nid, _ in pruned:
-                    # the locked merge re-checks the fresh disk copy
-                    # against _loaded_view and vetoes this deletion when a
-                    # concurrent confirm landed after our load (6.2.9)
                     del self.nodes[nid]
                     self._deleted.add(nid)
                     self.edges.pop(nid, None)
                     for other in self.edges.values():
                         other.pop(nid, None)
+                self._queue_prune(pruned, now)
             else:
-                print("warning: archive.md is not writable (symlink?); "
+                print("warning: archive.md is unsafe or not writable; "
                       "keeping %d prunable memories." % len(pruned),
                       file=sys.stderr)
                 pruned = []
         self._save()
-        vetoed = self._delete_vetoed
-        pruned = [(nid, t) for nid, t in pruned if nid not in vetoed]
-        if vetoed:
-            # the archive lines written above are additive and harmless;
-            # the memory itself is alive again with the concurrent confirm
-            print("note: kept %d memor%s a concurrent process confirmed "
-                  "during this cycle." % (len(vetoed),
-                  "y" if len(vetoed) == 1 else "ies"), file=sys.stderr)
-        if pruned:
-            # journal AFTER the save, like every other write path: the
-            # provenance log records only prunes that actually landed on
-            # disk (6.2.9); the id→text mapping survives the node
-            self._journal("prune", ids=[nid for nid, _ in pruned],
-                          texts=[t for _, t in pruned])
         return [t for _, t in pruned]
 
-    def _archive(self, texts, now):
+    def _archive_preflight(self):
+        """Refuse pruning when the archive path is already unsafe."""
+        arch = self.path.parent / "archive.md"
+        try:
+            _reject_symlinked_parents(arch, self.path.parent)
+            if arch.is_symlink():
+                return False
+            if arch.exists():
+                info = os.lstat(str(arch))
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    return False
+            return True
+        except OSError:
+            return False
+
+    def _queue_prune(self, pruned, now):
+        state = self._transaction_state
+        payload = json.dumps(
+            {"ids": [nid for nid, _ in pruned],
+             "texts": [text for _, text in pruned],
+             "date": str(now.date()), "pid": os.getpid(),
+             "clock": time.time_ns()},
+            ensure_ascii=False, sort_keys=True)
+        state.prunes.append({
+            "tx": hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24],
+            "ids": [nid for nid, _ in pruned],
+            "texts": [text for _, text in pruned],
+            "date": str(now.date()),
+        })
+
+    @property
+    def _prune_outbox_path(self):
+        return self.path.parent / PRUNE_OUTBOX_FILE
+
+    def _quarantine_prune_outbox(self, reason):
+        """Preserve a damaged recovery record without bricking all writes."""
+        path = self._prune_outbox_path
+        bak = path.with_name(
+            "%s.corrupt-%s-%d" % (
+                path.name, _now().strftime("%H%M%S%f"), os.getpid()))
+        try:
+            if os.name != "nt" and os.rename in getattr(
+                    os, "supports_dir_fd", set()):
+                flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | \
+                    getattr(os, "O_NOFOLLOW", 0)
+                parent_fd = os.open(str(path.parent), flags)
+                try:
+                    info = os.stat(
+                        path.name, dir_fd=parent_fd,
+                        follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                        raise UnsafePathError(
+                            "refusing to quarantine an unsafe prune outbox")
+                    os.rename(
+                        path.name, bak.name,
+                        src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+            else:
+                info = os.lstat(str(path))
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise UnsafePathError(
+                        "refusing to quarantine an unsafe prune outbox")
+                path.rename(bak)
+            print("warning: prune recovery outbox is corrupt (%s).\n"
+                  "  corrupt copy saved as %s; continuing without replay."
+                  % (reason, bak.name), file=sys.stderr)
+            return True
+        except (OSError, ValueError):
+            print("warning: prune recovery outbox is unreadable or unsafe; "
+                  "ignoring it without deleting it.", file=sys.stderr)
+            return False
+
+    def _remove_prune_outbox(self):
+        """Unlink only the exact private regular outbox in `.mind/`."""
+        path = self._prune_outbox_path
+        if not path.exists() and not path.is_symlink():
+            return
+        if os.name != "nt" and os.unlink in getattr(
+                os, "supports_dir_fd", set()):
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | \
+                getattr(os, "O_NOFOLLOW", 0)
+            parent_fd = os.open(str(path.parent), flags)
+            try:
+                info = os.stat(
+                    path.name, dir_fd=parent_fd, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise UnsafePathError(
+                        "refusing to remove an unsafe prune outbox")
+                os.unlink(path.name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+            except FileNotFoundError:
+                pass
+            finally:
+                os.close(parent_fd)
+            return
+        fd = _open_regular(path, os.O_RDONLY, boundary=self.path.parent)
+        try:
+            opened = os.fstat(fd)
+            current = os.lstat(str(path))
+            if (opened.st_dev, opened.st_ino) != (
+                    current.st_dev, current.st_ino):
+                raise StaleTargetError(
+                    "prune outbox changed before removal")
+        finally:
+            os.close(fd)
+        path.unlink()
+
+    def _read_prune_outbox(self):
+        path = self._prune_outbox_path
+        if not path.exists() or path.is_symlink():
+            return []
+        try:
+            info = os.lstat(str(path))
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or \
+                    info.st_size > 5_000_000:
+                raise ValueError("unsafe prune outbox")
+            data = json.loads(_read_text_retry(
+                path, boundary=self.path.parent))
+            if not isinstance(data, list):
+                raise ValueError("prune outbox has the wrong structure")
+        except (OSError, ValueError, json.JSONDecodeError,
+                UnicodeError, RecursionError) as e:
+            self._quarantine_prune_outbox(e)
+            return []
+        out = []
+        for record in data:
+            if not isinstance(record, dict):
+                self._quarantine_prune_outbox("invalid record")
+                return []
+            tx = record.get("tx")
+            ids = record.get("ids")
+            texts = record.get("texts")
+            date = record.get("date")
+            if not (isinstance(tx, str) and re.fullmatch(r"[0-9a-f]{24}", tx)
+                    and isinstance(ids, list) and isinstance(texts, list)
+                    and len(ids) == len(texts)
+                    and len(ids) <= MAX_PRUNES_PER_CYCLE
+                    and all(isinstance(v, str) and
+                            re.fullmatch(r"[0-9a-f]{12}", v)
+                            for v in ids)
+                    and all(isinstance(v, str) and
+                            len(v) <= MAX_TEXT_CHARS + 13
+                            for v in texts)
+                    and isinstance(date, str)
+                    and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date)):
+                self._quarantine_prune_outbox("invalid record fields")
+                return []
+            out.append({"tx": tx, "ids": ids, "texts": texts,
+                        "date": date})
+        return out
+
+    def _write_prune_outbox(self, records):
+        path = self._prune_outbox_path
+        if records:
+            payload = json.dumps(records, ensure_ascii=False, indent=2)
+            if len(payload.encode("utf-8")) > MAX_PRUNE_OUTBOX_BYTES:
+                raise FileLimitError("prune outbox exceeds %d bytes"
+                                     % MAX_PRUNE_OUTBOX_BYTES)
+            _atomic_write(path, payload, boundary=self.path.parent)
+        else:
+            self._remove_prune_outbox()
+
+    def _stage_prunes(self, records):
+        pending = self._read_prune_outbox()
+        known = {r["tx"] for r in pending}
+        pending.extend(r for r in records if r["tx"] not in known)
+        self._write_prune_outbox(pending)
+
+    def _recover_prune_outbox(self):
+        """Finish or cancel crash-interrupted prune side effects."""
+        pending = self._read_prune_outbox()
+        if not pending:
+            return
+        keep = []
+        for record in pending:
+            # The outbox lands before graph.json. If any target is still in
+            # the fresh graph, that graph commit never completed: cancel.
+            if any(nid in self.nodes for nid in record["ids"]):
+                continue
+            if not self._archive(
+                    record["texts"], record["date"], record["tx"]):
+                keep.append(record)
+                continue
+            if not self._journal_has_prune(record["tx"]):
+                if not self._journal_immediate(
+                        "prune", ids=record["ids"], texts=record["texts"],
+                        tx=record["tx"]):
+                    keep.append(record)
+        self._write_prune_outbox(keep)
+
+    def _archive(self, texts, when, tx=None):
         """Forgotten, not destroyed: pruned memories append to archive.md.
         Returns True only when the archive write actually happened."""
         arch = self.path.parent / "archive.md"
-        if arch.is_symlink():
+        if not self._archive_preflight():
             return False
-        lines = ["\n## forgotten on %s\n" % now.date()]
+        marker = "<!-- mind-prune:%s -->" % tx if tx else None
+        if marker and arch.exists():
+            try:
+                if marker in _read_text_retry(
+                        arch, boundary=self.path.parent):
+                    return True
+            except (OSError, UnicodeError):
+                return False
+        lines = ["\n## forgotten on %s\n" % when]
         lines += ["- %s" % t for t in texts]
+        if marker:
+            lines.append(marker)
         header = "" if arch.exists() else \
             "# mind archive — memories pruned by decay (restore with `remember`)\n"
         # APPEND, don't rewrite: the archive only grows, and rewriting the
         # whole file per prune batch is O(archive) forever (auditor
         # finding). Same trust-boundary checks as every other write.
         try:
-            _reject_symlinked_parents(arch, self.path.parent)
-            fd = os.open(str(arch),
-                         os.O_WRONLY | os.O_CREAT | os.O_APPEND |
-                         getattr(os, "O_NOFOLLOW", 0), 0o644)
-            try:
-                _write_once(fd, (header + "\n".join(lines) + "\n")
-                            .encode("utf-8"))
-                os.fsync(fd)    # archived text is a durability promise
-            finally:
-                os.close(fd)
+            _append_regular(
+                arch, (header + "\n".join(lines) + "\n").encode("utf-8"),
+                boundary=self.path.parent, durable=True)
         except (OSError, ValueError):
             return False
         return True
 
+    def _journal_has_prune(self, tx):
+        for event in self.journal_entries():
+            if event.get("op") == "prune" and event.get("tx") == tx:
+                return True
+        return False
+
     def _log_signal(self, kind, content):
+        if self._transaction_active():
+            self._transaction_state.signals.append((kind, content))
+            return
+        self._log_signal_immediate(kind, content)
+
+    def _log_signal_immediate(self, kind, content):
         # same O_NOFOLLOW discipline as every other write path: the
         # is_symlink() check alone is TOCTOU-raceable (auditor finding,
         # 6.2.1 — this was the one append still using a plain open())
@@ -1798,17 +2529,11 @@ class Hippocampus:
         if sig_file.is_symlink():
             return
         try:
-            _reject_symlinked_parents(sig_file, self.path.parent)
-            fd = os.open(str(sig_file),
-                         os.O_WRONLY | os.O_CREAT | os.O_APPEND |
-                         getattr(os, "O_NOFOLLOW", 0), 0o644)
-            try:
-                _write_once(fd, (json.dumps(
-                    {"kind": kind, "content": content,
-                     "ts": _now().isoformat()},
-                    ensure_ascii=False) + "\n").encode("utf-8"))
-            finally:
-                os.close(fd)
+            _append_regular(sig_file, (json.dumps(
+                {"kind": kind, "content": content,
+                 "ts": _now().isoformat()},
+                ensure_ascii=False) + "\n").encode("utf-8"),
+                boundary=self.path.parent)
         except (OSError, ValueError):
             pass    # telemetry only — never block the write it rode on
 
@@ -1824,12 +2549,18 @@ class Hippocampus:
 
     def _journal(self, op, **fields):
         """Append-only provenance log (journal.jsonl). Unlike
-        signals.jsonl (telemetry, cleared by dream), the journal is NEVER
+        signals.jsonl (telemetry, consumed by dream), the journal is NEVER
         rotated or deleted: every fact-mutating operation records who,
         when, and what, so "where did this fact come from" stays
         answerable for the life of the project. Journal failure warns but
         never blocks a memory write (availability over completeness —
         documented tradeoff)."""
+        if self._transaction_active():
+            self._transaction_state.journal.append((op, fields))
+            return True
+        return self._journal_immediate(op, **fields)
+
+    def _journal_immediate(self, op, **fields):
         jf = self.path.parent / JOURNAL_FILE
         # same trust boundary as every other write: a symlinked journal
         # OR a symlinked .mind root must never leak a file outside the
@@ -1839,11 +2570,11 @@ class Hippocampus:
         except ValueError:
             print("warning: .mind is unsafe (symlink?); skipping "
                   "provenance entry.", file=sys.stderr)
-            return
+            return False
         if jf.is_symlink():
             print("warning: journal.jsonl is a symlink; skipping "
                   "provenance entry.", file=sys.stderr)
-            return
+            return False
         by, session = self._actor()
         entry = {"ts": _now().isoformat(), "op": op, "by": by}
         if session:
@@ -1853,17 +2584,15 @@ class Hippocampus:
             # single O_APPEND os.write: concurrent writers cannot
             # interleave a line on a local filesystem (auditor finding:
             # the provenance log was the one unlocked write path)
-            fd = os.open(str(jf), os.O_WRONLY | os.O_CREAT | os.O_APPEND |
-                         getattr(os, "O_NOFOLLOW", 0), 0o644)
-            try:
-                _write_once(fd, (json.dumps(entry, ensure_ascii=False)
-                                 + "\n").encode("utf-8"))
-                os.fsync(fd)    # provenance is permanent — survive power loss
-            finally:
-                os.close(fd)
-        except OSError as e:
+            _append_regular(
+                jf, (json.dumps(entry, ensure_ascii=False)
+                     + "\n").encode("utf-8"),
+                boundary=self.path.parent, durable=True)
+            return True
+        except (OSError, ValueError) as e:
             print("warning: journal.jsonl not writable (%s); provenance "
                   "entry lost." % e, file=sys.stderr)
+            return False
 
     @staticmethod
     def _event_mentions(event, node_id):
@@ -1875,36 +2604,66 @@ class Hippocampus:
 
     def journal_entries(self, node_id=None, tail_bytes=10_000_000):
         """Read the provenance log, optionally filtered to one node.
-        Targeted provenance scans the full file incrementally so `why <id>`
-        remains answerable after years without loading unrelated events.
-        Unfiltered status reads stay tail-capped to avoid loading an
-        ever-growing journal into memory."""
+        Targeted provenance scans up to the latest 100 MB incrementally and
+        retains at most 10,000 matching events. Unfiltered status reads stay
+        tail-capped to avoid loading an ever-growing journal into memory."""
+        if node_id is not None:
+            if not isinstance(node_id, str) or len(node_id) > 128:
+                return JournalEntries()
         jf = self.path.parent / JOURNAL_FILE
         if not jf.exists() or jf.is_symlink():
-            return []
+            return JournalEntries()
         try:
-            fd = os.open(str(jf), os.O_RDONLY |
-                         getattr(os, "O_NOFOLLOW", 0))
-        except OSError:
-            return []
+            fd = _open_regular(
+                jf, os.O_RDONLY, boundary=self.path.parent)
+        except (OSError, ValueError):
+            return JournalEntries()
         with os.fdopen(fd, "rb") as f:
             size = os.fstat(f.fileno()).st_size
+            if node_id is not None and size > MAX_JOURNAL_SCAN_BYTES:
+                f.seek(size - MAX_JOURNAL_SCAN_BYTES)
+                f.readline()
+                print("note: journal exceeds the targeted scan limit; "
+                      "reading the last 100 MB.", file=sys.stderr)
             if node_id is None and size > tail_bytes:
                 f.seek(size - tail_bytes)
                 f.readline()
                 print("note: journal is %.1f MB; reading the last 10 MB."
                       % (size / 1e6), file=sys.stderr)
-            out = []
+            out = deque(maxlen=MAX_JOURNAL_MATCHES)
+            total = 0
             for raw in f:
                 try:
                     event = json.loads(raw.decode("utf-8", "replace"))
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                except (json.JSONDecodeError, UnicodeDecodeError,
+                        RecursionError):
                     continue
                 if not isinstance(event, dict):
                     continue
+                op = event.get("op")
+                if not isinstance(op, str):
+                    continue
+                clean = {"op": _display_text(op, 40)}
+                for field in (
+                        "ts", "by", "session", "id", "old_id", "new_id",
+                        "other", "relation", "text", "old_text", "new_text",
+                        "tx"):
+                    value = event.get(field)
+                    if isinstance(value, str):
+                        clean[field] = _display_text(
+                            value, MAX_TEXT_CHARS if "text" in field else 160)
+                for field in ("ids", "texts"):
+                    value = event.get(field)
+                    if isinstance(value, list):
+                        clean[field] = [
+                            _display_text(v, MAX_TEXT_CHARS)
+                            for v in value if isinstance(v, str)
+                        ][:MAX_PRUNES_PER_CYCLE]
+                event = clean
                 if node_id is None or self._event_mentions(event, node_id):
                     out.append(event)
-            return out
+                    total += 1
+            return JournalEntries(out, total_count=total)
 
     # -- temporal validity ----------------------------------------------
     @staticmethod
@@ -1942,37 +2701,68 @@ class Hippocampus:
 # ────────────────────────────────────────────────────────────────
 class Cortex:
     def __init__(self, path):
-        self.path = path
-        if not self.path.is_symlink():
-            try:
-                self.path.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                pass
+        self.path = Path(path)
 
     def files(self):
         if self.path.is_symlink() or not self.path.is_dir():
             return []
-        return sorted(p for p in self.path.glob("*.md")
-                      if p.is_file() and not p.is_symlink())
+        out = []
+        try:
+            with os.scandir(str(self.path)) as entries:
+                for entry in entries:
+                    if len(out) >= MAX_CORTEX_FILES:
+                        break
+                    if not entry.name.endswith(".md") or entry.is_symlink():
+                        continue
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            out.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            return []
+        return sorted(out)
 
     def promote(self, topic, content):
+        if not isinstance(topic, str) or not isinstance(content, str):
+            raise ValueError("cortex topic and content must be strings")
+        topic = _display_text(topic, 100)
+        if not topic:
+            raise ValueError("cortex topic must not be empty")
+        try:
+            content_bytes = content.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("cortex content is not valid UTF-8 text")
+        if len(content_bytes) > MAX_AUX_BYTES:
+            raise FileLimitError("cortex content exceeds %d bytes"
+                                 % MAX_AUX_BYTES)
+        if self.path.is_symlink():
+            raise ValueError("cortex directory is a symlink")
+        _secure_mkdirs(self.path, self.path.parent)
         base = re.sub(r'[^\w؀-ۿ]+', '_', topic).strip('_')[:40]
-        fname = (base or "topic") + ".md"
+        suffix = hashlib.md5(topic.encode("utf-8")).hexdigest()[:8]
+        fname = "%s-%s.md" % (base or "topic", suffix)
         fpath = self.path / fname
-        # two distinct topics can sanitize to the same filename — never
-        # silently overwrite "durable" knowledge about a different topic
-        # (auditor finding): disambiguate with a short content hash.
         if fpath.is_symlink():
             raise ValueError("cortex target is a symlink")
-        if fpath.exists():
-            first = fpath.read_text("utf-8").splitlines()[:1]
-            if first and first[0] != "# %s" % topic:
-                suffix = hashlib.md5(topic.encode("utf-8")).hexdigest()[:6]
-                fpath = self.path / ("%s-%s.md" % (base or "topic", suffix))
-        header = "# %s\n\n> promoted by dream on %s\n\n" % (topic, _now().date())
-        # boundary = .mind/ so a symlinked cortex/ dir can't redirect the
-        # write outside the project (auditor finding)
-        _atomic_write(fpath, header + content + "\n", boundary=self.path.parent)
+        lock_path = self.path.parent / "cortex.lock"
+        with _exclusive_file_lock(lock_path, self.path.parent):
+            existing_lines = []
+            if fpath.exists():
+                old = _read_text_retry(
+                    fpath, max_bytes=MAX_AUX_BYTES,
+                    boundary=self.path.parent)
+                existing_lines = [
+                    line for line in old.splitlines()
+                    if line.startswith("- ")
+                ]
+            merged_lines = list(dict.fromkeys(
+                existing_lines + content.splitlines()))
+            header = "# %s\n\n> promoted by dream on %s\n\n" % (
+                topic, _now().date())
+            _atomic_write(
+                fpath, header + "\n".join(merged_lines) + "\n",
+                boundary=self.path.parent)
         return str(fpath.relative_to(self.path.parent))
 
 
@@ -1987,21 +2777,39 @@ class Dreamer:
     in the dream journal. Run with dry_run=True to preview."""
 
     def __init__(self, mind_dir, hippo, cortex):
+        mind_dir = Path(mind_dir)
         self.dir = mind_dir / DREAMS_DIR
-        try:
-            if not self.dir.is_symlink():
-                self.dir.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            # a dangling-symlink dreams/ raises EEXIST here (exists() is
-            # False so exist_ok can't swallow it). Constructing the Dreamer
-            # must never take down unrelated commands — dream() itself
-            # already refuses the unsafe journal write gracefully.
-            pass
         self.hippo = hippo
         self.cortex = cortex
         self.signals_file = mind_dir / SIGNALS_FILE
 
     def dream(self, dry_run=False):
+        promotion_plans = []
+        with self.hippo._transaction():
+            memo_text, signal_snapshot = self._dream(
+                dry_run=dry_run, promotion_plans=promotion_plans)
+            if dry_run:
+                return None, memo_text
+            # Commit graph.json first but retain its lock until every derived
+            # artifact is complete. A later dream cannot overtake this one.
+            self.hippo._flush_transaction()
+            failures = []
+            for topic, content in promotion_plans:
+                try:
+                    self.cortex.promote(topic, content)
+                except (OSError, ValueError, UnicodeError) as e:
+                    failures.append("%s (%s)" % (
+                        _display_text(topic, 80), _display_text(e, 120)))
+            if failures:
+                memo_text += (
+                    "\n## Post-commit notes\n"
+                    "- cortex promotion skipped: %s\n"
+                    % "; ".join(failures))
+            result = self._write_journal(memo_text)
+            self._consume_signals(signal_snapshot)
+            return result
+
+    def _dream(self, dry_run=False, promotion_plans=None):
         mode = " (dry run — nothing written)" if dry_run else ""
         log = ["# Dream journal — %s%s" % (_now().date(), mode), ""]
         log.append("_cycle started %s_" % _now().strftime("%H:%M"))
@@ -2009,7 +2817,7 @@ class Dreamer:
         # 1. light sleep: count the session's write signals (telemetry). The
         # consolidation inputs are the node/edge weights themselves, not the
         # signal log — so this is reported, then cleared, not replayed.
-        signals = self._read_signals()
+        signals, signal_snapshot = self._read_signals()
         log.append("\n## Light sleep\nSaw %d session signals "
                    "(telemetry; consolidation runs on the graph weights)."
                    % len(signals))
@@ -2044,7 +2852,8 @@ class Dreamer:
 
         # 3. REM: cluster related memories and promote recurring themes.
         # Clustering uses offline hash embeddings — deterministic, no network.
-        promoted = self._rem_promote(log, dry_run)
+        promoted = self._rem_promote(
+            log, dry_run, promotion_plans=promotion_plans)
 
         # 4. REM: contradiction scan (feeds reconsolidation)
         conflicts = self._rem_conflicts(log, dry_run)
@@ -2055,15 +2864,19 @@ class Dreamer:
                    % (len(self.hippo.nodes), len(pruned), len(promoted),
                       len(conflicts)))
 
-        memo_text = "\n".join(log) + "\n"
-        if dry_run:
-            return None, memo_text
+        return "\n".join(log) + "\n", signal_snapshot
+
+    def _write_journal(self, memo_text):
+        """Write derived dream artifacts only after graph commit succeeds."""
         memo = self.dir / ("%s.md" % _now().date())
         # boundary = .mind/ so a symlinked dreams/ dir can't redirect the
         # journal write outside the project (auditor finding). If the dir is
         # unsafe, the consolidation already happened — just skip the journal
         # rather than crash with a traceback.
         try:
+            if self.dir.is_symlink():
+                raise ValueError("dreams directory is a symlink")
+            _secure_mkdirs(self.dir, self.hippo.path.parent)
             # a second dream on the same date APPENDS its cycle to the day's
             # journal instead of silently replacing it (auditor finding:
             # only the last cycle of the day used to survive). The append
@@ -2077,40 +2890,44 @@ class Dreamer:
             payload = memo_text
             if memo.exists():
                 payload = "\n---\n\n" + memo_text
-            fd = os.open(str(memo),
-                         os.O_WRONLY | os.O_CREAT | os.O_APPEND |
-                         getattr(os, "O_NOFOLLOW", 0), 0o644)
-            try:
-                _write_once(fd, payload.encode("utf-8"))
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        except ValueError:
+            _append_regular(
+                memo, payload.encode("utf-8"),
+                boundary=self.hippo.path.parent, durable=True)
+        except (OSError, ValueError):
             print("warning: .mind/dreams is unsafe (symlink?); "
                   "skipping dream journal for this run.", file=sys.stderr)
             return None, memo_text
-        if self.signals_file.exists() and not self.signals_file.is_symlink():
-            try:
-                self.signals_file.unlink()
-            except FileNotFoundError:
-                pass
         return str(memo.relative_to(self.hippo.path.parent)), memo_text
 
-    def _rem_promote(self, log, dry_run):
+    def _rem_promote(self, log, dry_run, promotion_plans=None):
         emb = self.hippo.embedder
         clusters = []
+        by_key = defaultdict(set)
+        comparisons = 0
         for nid in sorted(self.hippo.nodes):
             n = self.hippo.nodes[nid]
             if not self.hippo._valid_at(n):   # closed facts don't cluster
                 continue
             placed = False
-            for c in clusters:
+            candidates = set()
+            for key in n.get("keys", []):
+                candidates.update(by_key.get(key, ()))
+            for index in sorted(candidates):
+                if comparisons >= MAX_DREAM_COMPARISONS:
+                    break
+                comparisons += 1
+                c = clusters[index]
                 if emb.similarity(n["text"], c["centroid"]) > CLUSTER_SIM:
                     c["members"].append(nid)
+                    for key in n.get("keys", []):
+                        by_key[key].add(index)
                     placed = True
                     break
             if not placed:
+                index = len(clusters)
                 clusters.append({"centroid": n["text"], "members": [nid]})
+                for key in n.get("keys", []):
+                    by_key[key].add(index)
         promoted = []
         log.append("\n## REM — consolidation")
         for c in clusters:
@@ -2118,20 +2935,19 @@ class Dreamer:
                 texts = [self.hippo.nodes[m]["text"] for m in c["members"][:5]]
                 topic = c["centroid"][:50]
                 if not dry_run:
-                    try:
-                        self.cortex.promote(topic, "\n".join("- %s" % t for t in texts))
-                    except ValueError:
-                        # symlinked cortex/ dir: skip promotion rather than
-                        # crash the whole dream (auditor finding)
-                        log.append("  - (skipped promotion: cortex dir unsafe)")
-                        continue
+                    if promotion_plans is not None:
+                        promotion_plans.append((
+                            topic, "\n".join("- %s" % t for t in texts)))
                 promoted.append(topic)
                 log.append("- %s cluster (%d memories) -> cortex: %s"
-                           % ("would promote" if dry_run else "promoted",
+                           % ("would promote" if dry_run else "selected",
                               len(c["members"]), topic))
         if not promoted:
             log.append("- no cluster reached the promotion threshold (%d)."
                        % PROMOTION_THRESHOLD)
+        if comparisons >= MAX_DREAM_COMPARISONS:
+            log.append("- promotion comparison budget reached (%d)."
+                       % MAX_DREAM_COMPARISONS)
         return promoted
 
     def _rem_conflicts(self, log, dry_run):
@@ -2150,48 +2966,66 @@ class Dreamer:
         for _, n in nodes:
             for k in set(n.get("keys", [])):
                 df[k] += 1
+        rare_members = defaultdict(list)
+        rare_cutoff = max(2, N // 4)
+        for nid, n in nodes:
+            for key in set(n.get("keys", [])):
+                if df[key] <= rare_cutoff:
+                    rare_members[key].append(nid)
+        pair_hits = Counter()
+        pair_work = 0
+        for key in sorted(rare_members):
+            members = sorted(rare_members[key])
+            for i, ida in enumerate(members):
+                for idb in members[i + 1:]:
+                    pair_hits[(ida, idb)] += 1
+                    pair_work += 1
+                    if pair_work >= MAX_DREAM_COMPARISONS:
+                        break
+                if pair_work >= MAX_DREAM_COMPARISONS:
+                    break
+            if pair_work >= MAX_DREAM_COMPARISONS:
+                break
+        node_map = dict(nodes)
         conflicts = []
         log.append("\n## REM — contradiction scan")
-        for i in range(len(nodes)):
-            for j in range(i + 1, len(nodes)):
-                ida, a = nodes[i]
-                idb, b = nodes[j]
-                rare_shared = [k for k in set(a["keys"]) & set(b["keys"])
-                               if df[k] <= max(2, N // 4)]
-                if len(rare_shared) < 2:
-                    continue
-                sim = emb.similarity(a["text"], b["text"])
-                if 0.35 <= sim < 0.9:
-                    conflicts.append((ida, idb))
-                    if not dry_run:
-                        # flag, never clobber: an existing user link between
-                        # the pair keeps its relation and earned weight —
-                        # "never silently destroys data" covers edge
-                        # metadata too (auditor finding, 6.2.9)
-                        fwd = self.hippo.edges.get(ida, {}).get(idb)
-                        rev = self.hippo.edges.get(idb, {}).get(ida)
-                        user_edge = any(
-                            e is not None and
-                            e.get("relation") != "possible-conflict"
-                            for e in (fwd, rev))
-                        if not user_edge:
-                            now_iso = _now().isoformat()
-                            self.hippo.edges.setdefault(ida, {})[idb] = {
-                                "relation": "possible-conflict",
-                                "weight": 0.5, "created": now_iso}
-                            self.hippo.edges.setdefault(idb, {})[ida] = {
-                                "relation": "possible-conflict",
-                                "weight": 0.5, "created": now_iso}
-                            self.hippo._edge_updates.update(
-                                ((ida, idb), (idb, ida)))
-                    log.append("- possible conflict (sim %.2f):" % sim)
-                    log.append("    a: %s" % a["text"][:80])
-                    log.append("    b: %s" % b["text"][:80])
-                    log.append("    resolve with: mind correct \"<wrong>\" \"<right>\"")
+        for (ida, idb), shared_count in sorted(pair_hits.items()):
+            if shared_count < 2:
+                continue
+            a, b = node_map[ida], node_map[idb]
+            sim = emb.similarity(a["text"], b["text"])
+            if 0.35 <= sim < 0.9:
+                conflicts.append((ida, idb))
+                if not dry_run:
+                    # flag, never clobber: an existing user link between
+                    # the pair keeps its relation and earned weight.
+                    fwd = self.hippo.edges.get(ida, {}).get(idb)
+                    rev = self.hippo.edges.get(idb, {}).get(ida)
+                    user_edge = any(
+                        e is not None and
+                        e.get("relation") != "possible-conflict"
+                        for e in (fwd, rev))
+                    if not user_edge:
+                        now_iso = _now().isoformat()
+                        self.hippo.edges.setdefault(ida, {})[idb] = {
+                            "relation": "possible-conflict",
+                            "weight": 0.5, "created": now_iso}
+                        self.hippo.edges.setdefault(idb, {})[ida] = {
+                            "relation": "possible-conflict",
+                            "weight": 0.5, "created": now_iso}
+                        self.hippo._edge_updates.update(
+                            ((ida, idb), (idb, ida)))
+                log.append("- possible conflict (sim %.2f):" % sim)
+                log.append("    a: %s" % a["text"][:80])
+                log.append("    b: %s" % b["text"][:80])
+                log.append("    resolve with: mind correct \"<wrong>\" \"<right>\"")
         if not conflicts:
             log.append("- none found.")
         elif not dry_run:
             self.hippo._save()
+        if pair_work >= MAX_DREAM_COMPARISONS:
+            log.append("- contradiction candidate budget reached (%d)."
+                       % MAX_DREAM_COMPARISONS)
         return conflicts
 
     def _read_signals(self):
@@ -2199,19 +3033,46 @@ class Dreamer:
         # a symlinked signals file or slurp an absurdly large one
         # (auditor finding)
         if not self.signals_file.exists() or self.signals_file.is_symlink():
-            return []
-        if self.signals_file.stat().st_size > 5_000_000:
-            print("warning: signals.jsonl is suspiciously large; "
+            return [], ""
+        try:
+            content = _read_text_retry(
+                self.signals_file, max_bytes=5_000_000,
+                boundary=self.hippo.path.parent)
+        except (OSError, ValueError, UnicodeError):
+            print("warning: signals.jsonl is unsafe or too large; "
                   "ignoring it this cycle.", file=sys.stderr)
-            return []
+            return [], ""
         out = []
-        for line in self.signals_file.read_text(
-                "utf-8", errors="replace").splitlines():
+        for line in content.splitlines():
             try:
                 out.append(json.loads(line))
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 continue
-        return out
+        return out, content
+
+    def _consume_signals(self, consumed):
+        """Remove only the exact signal prefix observed by this dream."""
+        if not consumed:
+            return
+        for _attempt in range(20):
+            try:
+                current, identity = _read_text_retry(
+                    self.signals_file, max_bytes=5_000_000,
+                    with_identity=True, boundary=self.hippo.path.parent)
+            except FileNotFoundError:
+                return
+            except (OSError, ValueError, UnicodeError):
+                return
+            if not current.startswith(consumed):
+                return
+            try:
+                _atomic_write(
+                    self.signals_file, current[len(consumed):],
+                    boundary=self.hippo.path.parent,
+                    expected_identity=identity)
+                return
+            except StaleTargetError:
+                continue
 
 
 def _invocation(project_root=None):
@@ -2260,7 +3121,7 @@ class Active:
     TARGETS = CANONICAL + DOT_TARGETS
 
     def __init__(self, mind_dir, hippo, cortex):
-        self.dir = mind_dir
+        self.dir = Path(mind_dir)
         self.hippo = hippo
         self.cortex = cortex
         self.path = mind_dir / ACTIVE_FILE
@@ -2303,7 +3164,11 @@ class Active:
             used += len(line)
             if len(hot) >= 8:
                 break
-        cortex_files = ["- `cortex/%s`" % f.name for f in self.cortex.files()[:6]]
+        cortex_files = [
+            "- `cortex/%s`" % _display_text(
+                f.name.replace("`", "'"), 120)
+            for f in self.cortex.files()[:6]
+        ]
         inv = _invocation(project_root)
         # The standing-orders doctrine below is the write-side automation:
         # it rides the one channel every coding agent already auto-loads
@@ -2378,12 +3243,25 @@ inside a memory.
                     if self.hippo._valid_at(n))
         last = "never"
         ddir = self.dir / DREAMS_DIR
-        if ddir.exists() and not ddir.is_symlink():
-            days = sorted(p.stem for p in ddir.glob("????-??-??.md"))
-            if days:
-                last = days[-1]
+        latest = _latest_dream_stem(ddir)
+        if latest:
+            last = latest
         return ("- %d memories (%d currently true) · last dream: %s"
                 % (total, valid, last))
+
+    @staticmethod
+    def _inside_fence(content, position):
+        fence = None
+        for line in content[:position].splitlines():
+            match = re.match(r"^\s*(```+|~~~+)", line)
+            if not match:
+                continue
+            marker = match.group(1)[0]
+            if fence is None:
+                fence = marker
+            elif fence == marker:
+                fence = None
+        return fence is not None
 
     def export_to_agents(self, project_root):
         """Write the working-memory block into every agent's instruction file,
@@ -2395,7 +3273,8 @@ inside a memory.
         # on CLAUDE.md; auditor finding, 6.2.7)
         if self.path.is_symlink():
             raise ValueError("ACTIVE.md is a symlink")
-        src = _read_text_retry(self.path) if self.path.exists() else ""
+        src = (_read_text_retry(self.path, boundary=self.path.parent)
+               if self.path.exists() else "")
         written = []
         for target in self.TARGETS:
             target_path = Path(target)
@@ -2421,28 +3300,43 @@ inside a memory.
             if tpath.is_symlink():
                 written.append("%s (skipped: symlink)" % target)
                 continue
-            tpath.parent.mkdir(parents=True, exist_ok=True)
+            _secure_mkdirs(tpath.parent, project_root)
             user_content = ""
+            expected_identity = _EXPECTED_MISSING
             if tpath.exists():
                 try:
-                    content = _read_text_retry(tpath)
+                    content, expected_identity = _read_text_retry(
+                        tpath, with_identity=True, boundary=project_root)
                 except FileNotFoundError:
                     content = ""   # vanished mid-race: treat as fresh
+                except (OSError, ValueError, UnicodeError) as e:
+                    written.append("%s (skipped: unsafe or unreadable: %s)"
+                                   % (target, _display_text(e, 120)))
+                    continue
                 # OUR block is identified structurally (BEGIN marker whose
                 # body starts with our exact generated header), never by a
                 # bare marker string: users legitimately quote the marker
                 # syntax in fenced docs, and split-on-first/last silently
                 # destroyed everything in between (auditor finding, wave 2)
                 ours = -1
-                idx = content.find(self.BEGIN)
-                while idx != -1:
+                begin_re = re.compile(
+                    r"(?m)^" + re.escape(self.BEGIN) + r"[ \t]*$")
+                for match in begin_re.finditer(content):
+                    idx = match.start()
+                    if self._inside_fence(content, idx):
+                        continue
                     body = content[idx + len(self.BEGIN):].lstrip("\n")
                     if body.startswith("# ACTIVE.md — mind working memory"):
                         ours = idx
                         break
-                    idx = content.find(self.BEGIN, idx + 1)
                 if ours != -1:
-                    j = content.find(self.END, ours)
+                    j = -1
+                    end_re = re.compile(
+                        r"(?m)^" + re.escape(self.END) + r"[ \t]*$")
+                    for match in end_re.finditer(content, ours):
+                        if not self._inside_fence(content, match.start()):
+                            j = match.start()
+                            break
                     if j == -1:
                         # the END guard was hand-deleted: rewriting would
                         # silently truncate everything after BEGIN — leave
@@ -2469,18 +3363,31 @@ inside a memory.
                     # (auditor finding: HIGH — a real CLAUDE.md saying "run
                     # mind.py" was destroyed with no backup or warning).
                     if stripped.startswith("# ACTIVE.md — mind working memory"):
-                        user_content = ""
+                        written.append(
+                            "%s (skipped: generated header without markers; "
+                            "restore the markers or remove the stale block)"
+                            % target)
+                        continue
                     else:
                         user_content = stripped
             block = "%s\n%s\n%s" % (self.BEGIN, src, self.END)
             if user_content:
                 new_content = "%s\n\n---\n<!-- user content below -->\n%s\n" % (
                     block, user_content)
-                written.append("%s (memory + preserved content)" % target)
+                result = "%s (memory + preserved content)" % target
             else:
                 new_content = block + "\n"
-                written.append("%s (memory)" % target)
-            _atomic_write(tpath, new_content)
+                result = "%s (memory)" % target
+            try:
+                _atomic_write(
+                    tpath, new_content, boundary=project_root,
+                    expected_identity=expected_identity)
+            except StaleTargetError:
+                written.append(
+                    "%s (skipped: changed concurrently; rerun export)"
+                    % target)
+                continue
+            written.append(result)
         return written
 
 
@@ -2501,24 +3408,22 @@ class Mind:
         # cortex/dreams directories outside the project (auditor finding)
         if self.dir.is_symlink():
             raise ValueError("refusing: .mind is a symlink")
-        if (self.dir / GRAPH_FILE).exists():
-            print("mind memory already exists in %s (nothing changed)." % self.dir)
-            print("  to reset: delete .mind/ first. for a report:"
-                  " %s status" % _invocation(self.root))
-            return
+        existing = (self.dir / GRAPH_FILE).exists()
         for subdir in (CORTEX_DIR, DREAMS_DIR):
             if (self.dir / subdir).is_symlink():
                 raise ValueError("refusing: .mind/%s is a symlink" % subdir)
-        self.dir.mkdir(parents=True, exist_ok=True)
-        (self.dir / CORTEX_DIR).mkdir(exist_ok=True)
-        (self.dir / DREAMS_DIR).mkdir(exist_ok=True)
+        _secure_mkdirs(self.dir, self.root)
+        _secure_mkdirs(self.dir / CORTEX_DIR, self.root)
+        _secure_mkdirs(self.dir / DREAMS_DIR, self.root)
         self.hippo = Hippocampus(self.dir / GRAPH_FILE)
-        self.hippo._save()
+        if not existing:
+            self.hippo._save()
         self.cortex = Cortex(self.dir / CORTEX_DIR)
+        self.dreamer = Dreamer(self.dir, self.hippo, self.cortex)
         self.active = Active(self.dir, self.hippo, self.cortex)
-        self.active.generate(self.root)
-        self.active.export_to_agents(self.root)
-        print("""created mind memory in %s
+        written = self._refresh_exports()
+        verb = "repaired and refreshed" if existing else "created"
+        print("""%s mind memory in %s
 
 layers:
   .mind/ACTIVE.md    working memory (always in agent context)
@@ -2539,8 +3444,10 @@ automatic from here on:
   - your agent reads the contract every session and saves/recalls on its own
   - consolidation self-runs: writes trigger a dream cycle when due (no cron)
 
-manual commands (optional):  %s remember/recall/dream/status""" % (
-            self.dir, _invocation(self.root)))
+manual commands (optional):  %s remember/recall/dream/status
+
+export results: %s""" % (
+            verb, self.dir, _invocation(self.root), ", ".join(written)))
 
     def _ensure(self):
         if self.dir.is_symlink():
@@ -2553,6 +3460,30 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
         self.cortex = Cortex(self.dir / CORTEX_DIR)
         self.dreamer = Dreamer(self.dir, self.hippo, self.cortex)
         self.active = Active(self.dir, self.hippo, self.cortex)
+
+    def _refresh_exports(self):
+        """Publish derived files from the newest graph under the graph lock."""
+        with self.hippo._transaction():
+            try:
+                self.active.generate(self.root)
+            except (OSError, ValueError, UnicodeError) as e:
+                return ["ACTIVE.md (skipped: unsafe or unwritable: %s)"
+                        % _display_text(e, 120)]
+            try:
+                return self.active.export_to_agents(self.root)
+            except (OSError, ValueError, UnicodeError) as e:
+                return ["agent export (skipped: unsafe or unwritable: %s)"
+                        % _display_text(e, 120)]
+
+    @staticmethod
+    def _export_summary(written):
+        skipped = [item for item in written if "(skipped:" in item]
+        return ("%d updated%s" % (
+            len(written) - len(skipped),
+            "; %d skipped (%s)" % (
+                len(skipped), ", ".join(_display_text(s, 120)
+                                        for s in skipped))
+            if skipped else ""))
 
     def _auto_dream(self):
         """Self-running consolidation — the `git gc --auto` pattern.
@@ -2574,31 +3505,34 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
         try:
             pending = 0
             sig = self.dir / SIGNALS_FILE
-            if sig.exists() and not sig.is_symlink() \
-                    and sig.stat().st_size <= 5_000_000:
-                pending = sum(1 for ln in sig.read_text(
-                    "utf-8", errors="replace").splitlines()
-                              if ln.strip())
+            if sig.exists() and not sig.is_symlink():
+                try:
+                    signal_text = _read_text_retry(
+                        sig, max_bytes=5_000_000, boundary=self.dir)
+                except (OSError, ValueError, UnicodeError):
+                    signal_text = ""
+                pending = sum(
+                    1 for ln in signal_text.splitlines() if ln.strip())
             if pending == 0:
                 return False
             last_date = None
             ddir = self.dir / DREAMS_DIR
-            if ddir.exists() and not ddir.is_symlink():
-                days = sorted(p.stem for p in ddir.glob("????-??-??.md"))
-                if days:
-                    try:
-                        last_date = datetime.strptime(days[-1], "%Y-%m-%d").date()
-                    except ValueError:
-                        last_date = None
+            latest = _latest_dream_stem(ddir)
+            if latest:
+                try:
+                    last_date = datetime.strptime(
+                        latest, "%Y-%m-%d").date()
+                except ValueError:
+                    last_date = None
             stale = (last_date is None or
                      last_date <= (_now() - timedelta(hours=AUTO_DREAM_HOURS)).date())
             if not (pending >= AUTO_DREAM_SIGNALS or stale):
                 return False
             memo, _ = self.dreamer.dream(dry_run=False)
-            self.active.generate(self.root)
-            self.active.export_to_agents(self.root)
+            written = self._refresh_exports()
             print("  🌙 auto-dream: memory consolidated (%s)"
                   % (memo or "journal skipped"))
+            print("  export: %s" % self._export_summary(written))
             return True
         except Exception as e:                       # noqa: BLE001
             # maintenance must never break the write it rode on
@@ -2608,18 +3542,17 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
     def remember(self, text):
         self._ensure()
         nid = self.hippo.remember(text)
-        self.active.generate(self.root)
-        self.active.export_to_agents(self.root)
-        print("remembered: %s" % self.hippo.nodes[nid]["text"])
-        print("  (node %s, total nodes: %d)" % (nid, len(self.hippo.nodes)))
-        print("  ACTIVE.md + AGENTS.md/CLAUDE.md/GEMINI.md updated")
+        written = self._refresh_exports()
+        print("remembered: %s" % _display_text(self.hippo.nodes[nid]["text"]))
+        print("  (node %s, total nodes: %d)" % (
+            _display_text(nid, 128), len(self.hippo.nodes)))
+        print("  export: %s" % self._export_summary(written))
         self._auto_dream()
 
     def link(self, a, b, relation="related"):
         self._ensure()
-        print(self.hippo.link(a, b, relation))
-        self.active.generate(self.root)
-        self.active.export_to_agents(self.root)
+        print(_display_text(self.hippo.link(a, b, relation)))
+        self._refresh_exports()
         self._auto_dream()
 
     def recall(self, query, at=None):
@@ -2627,16 +3560,20 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
         results, latency, kinds = self.hippo.recall(query, at=at)
         if not results:
             print("no results for \"%s\"%s (empty graph or no match)"
-                  % (query, " at %s" % at[:10] if at else ""))
+                  % (_display_text(query), " at %s" % _display_text(
+                      at[:10]) if at else ""))
             return
         when = " (as of %s)" % at[:10] if at else ""
         print("recall for \"%s\"%s — %d results [%.2f ms]\n"
-              % (query, when, len(results), latency))
+              % (_display_text(query), _display_text(when),
+                 len(results), latency))
         for i, (nid, score, n) in enumerate(results, 1):
-            print("  %d. [%.3f] (%s) %s" % (i, score, kinds.get(nid, "trace"), n["text"]))
+            print("  %d. [%.3f] (%s) %s" % (
+                i, score, _display_text(kinds.get(nid, "trace"), 40),
+                _display_text(n["text"])))
             print("     (confidence %.1f, recalled %dx, weight %.2f, id %s)"
                   % (n.get("confidence", 1), n.get("access_count", 0),
-                     n["weight"], nid))
+                     n["weight"], _display_text(nid, 128)))
         # path-aware like the exported contract: agents copy this hint
         # literally, and a bare `mind.py` mis-fires outside the project
         # root — the same field-failure class _invocation() exists to kill
@@ -2647,18 +3584,18 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
     def confirm(self, node_ids):
         self._ensure()
         unique_ids = list(dict.fromkeys(node_ids))
+        changed = self.hippo.bump(unique_ids)
         known = [nid for nid in unique_ids if nid in self.hippo.nodes]
         unknown = [nid for nid in unique_ids if nid not in self.hippo.nodes]
-        if known:
-            self.hippo.bump(known)
-            self.active.generate(self.root)
-            self.active.export_to_agents(self.root)
+        if changed and known:
+            self._refresh_exports()
             print("reinforced %d memor%s — stability +%d days each, edges "
                   "restrengthened" % (len(known), "y" if len(known) == 1 else "ies",
                                       int(STABILITY_PER_ACCESS)))
             self._auto_dream()
         for nid in unknown:
-            print("unknown id: %s (get ids from `recall` output)" % nid,
+            print("unknown id: %s (get ids from `recall` output)"
+                  % _display_text(nid, 128),
                   file=sys.stderr)
         if not known:
             sys.exit(1)
@@ -2667,23 +3604,22 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
         self._ensure()
         old = self.hippo.correct(old_hint, new_text)
         if old is None:
-            print("no memory matched \"%s\" — nothing corrected." % old_hint)
+            print("no memory matched \"%s\" — nothing corrected."
+                  % _display_text(old_hint))
             return
         if self.hippo._clean_text(new_text) == old:
             print("already current — nothing changed.")
             return
-        self.active.generate(self.root)
-        self.active.export_to_agents(self.root)
+        self._refresh_exports()
         print("reconsolidated:")
-        print("  was: %s" % old)
-        print("  now: %s" % self.hippo._clean_text(new_text))
+        print("  was: %s" % _display_text(old))
+        print("  now: %s" % _display_text(
+            self.hippo._clean_text(new_text)))
         print("  (old fact CLOSED, not erased — `why` and `--at` can still reach it)")
         self._auto_dream()
 
     def why(self, nid):
-        """Full provenance answer for one memory: where did this fact
-        come from, is it still true, and its full event count plus latest
-        events (the append-only file remains the complete record)."""
+        """Bounded provenance answer: origin, validity, and latest events."""
         self._ensure()
         n = self.hippo.nodes.get(nid)
         if n is None:
@@ -2693,24 +3629,28 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
             events = self.hippo.journal_entries(nid)
             if not events:
                 print("unknown id: %s (get ids from `recall` or `entity`)"
-                      % nid, file=sys.stderr)
+                      % _display_text(nid, 128), file=sys.stderr)
                 sys.exit(1)
-            print("memory %s" % nid)
-            print("  status:     PRUNED from the graph — journal lineage:")
-            for e in events:
+            count = getattr(events, "total_count", len(events))
+            trunc = "" if count <= 8 else "; last 8 shown"
+            print("memory %s" % _display_text(nid, 128))
+            print("  status:     PRUNED from the graph — journal lineage "
+                  "(%d events%s):" % (count, trunc))
+            for e in events[-8:]:
                 extra = ""
                 for f in ("text", "old_text", "new_text"):
                     if e.get(f):
-                        extra = "  %s" % e[f][:70]
+                        extra = "  %s" % _display_text(e[f], 70)
                         break
-                print("    %s %s by=%s%s" % (e.get("ts", "?")[:19],
-                                             e.get("op"),
-                                             e.get("by", "?"), extra))
+                print("    %s %s by=%s%s" % (
+                    _display_text(e.get("ts", "?"), 19),
+                    _display_text(e.get("op", "?"), 40),
+                    _display_text(e.get("by", "?"), 80), extra))
             return
         origin = n.get("origin", {})
         vt = n.get("valid_to")
-        print("memory %s" % nid)
-        print("  text:       %s" % n["text"])
+        print("memory %s" % _display_text(nid, 128))
+        print("  text:       %s" % _display_text(n["text"]))
         print("  status:     %s" % (
             "STILL TRUE (valid since %s)" % n.get("valid_from", "?")[:19]
             if vt is None else
@@ -2724,22 +3664,28 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
                  n.get("weight", 1.0)))
         for h in n.get("history", []):
             print("  previously: %s (replaced %s)"
-                  % (h.get("text", "?"), h.get("replaced", "?")[:19]))
+                  % (_display_text(h.get("text", "?")),
+                     _display_text(h.get("replaced", "?"), 19)))
         rels = [(nbr, e) for nbr, e in self.hippo.edges.get(nid, {}).items()
                 if e.get("relation") in ("supersedes", "superseded-by")]
         for nbr, e in rels:
             other = self.hippo.nodes.get(nbr, {})
-            print("  %s: %s (%s)" % (e["relation"], nbr,
-                                     other.get("text", "?")[:60]))
+            print("  %s: %s (%s)" % (
+                _display_text(e["relation"], 60),
+                _display_text(nbr, 128),
+                _display_text(other.get("text", "?"), 60)))
         events = self.hippo.journal_entries(nid)
         if events:
-            trunc = ("" if len(events) <= 8 else
-                     "; last 8 shown — full log in .mind/journal.jsonl")
-            print("  journal (%d events%s):" % (len(events), trunc))
+            count = getattr(events, "total_count", len(events))
+            trunc = ("" if count <= 8 else
+                     "; last 8 shown — journal file retains more")
+            print("  journal (%d events%s):" % (count, trunc))
             for e in events[-8:]:
-                print("    %s %s%s" % (e.get("ts", "?")[:19], e.get("op"),
-                                       " by=%s" % e.get("by") if e.get("by")
-                                       else ""))
+                print("    %s %s%s" % (
+                    _display_text(e.get("ts", "?"), 19),
+                    _display_text(e.get("op", "?"), 40),
+                    " by=%s" % _display_text(e.get("by"), 80)
+                    if e.get("by") else ""))
         else:
             print("  journal:    (no entries — predates 6.0.0 or journal lost)")
 
@@ -2747,6 +3693,7 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
         """Entity view: every fact — current and superseded — that
         mentions this (normalized) term, with validity intervals."""
         self._ensure()
+        term = self.hippo._validated_query(term, "entity term")
         term_l = term.lower()
         # multi-word NORMALIZE phrases ("تايب سكريبت") must be replaced
         # before tokenization, exactly as _extract_keys does (auditor
@@ -2758,7 +3705,7 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
         wanted = {NORMALIZE.get(t, t) for t in toks} | {stem(t) for t in toks}
         wanted.discard("")
         if not wanted:
-            print("no indexable term in \"%s\"" % term)
+            print("no indexable term in \"%s\"" % _display_text(term))
             return
         rows = []
         for nid, n in self.hippo.nodes.items():
@@ -2767,10 +3714,11 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
             if wanted & nkeys or wanted & nstems:
                 rows.append((n.get("valid_from", ""), nid, n))
         if not rows:
-            print("no facts mention \"%s\"" % term)
+            print("no facts mention \"%s\"" % _display_text(term))
             return
         rows.sort()
-        print("entity \"%s\" — %d fact(s):\n" % (term, len(rows)))
+        print("entity \"%s\" — %d fact(s):\n"
+              % (_display_text(term), len(rows)))
         for _, nid, n in rows:
             vt = n.get("valid_to")
             span = ("%s -> now" % n.get("valid_from", "?")[:10] if vt is None
@@ -2780,9 +3728,11 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
             arrow = (" -> superseded by %s" % n["superseded_by"]
                      if n.get("superseded_by") else "")
             print("  %s[%s] %s (id %s, by %s via %s)%s"
-                  % (mark, span, n["text"], nid,
-                     origin.get("by", "unknown"),
-                     origin.get("via", "?"), arrow))
+                  % (_display_text(mark, 4), _display_text(span, 40),
+                     _display_text(n["text"]), _display_text(nid, 128),
+                     _display_text(origin.get("by", "unknown"), 80),
+                     _display_text(origin.get("via", "?"), 40),
+                     _display_text(arrow, 180)))
 
     def dream(self, dry_run=False):
         self._ensure()
@@ -2791,15 +3741,13 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
             print(text)
             print("(dry run — nothing was written)")
             return
-        self.active.generate(self.root)
-        self.active.export_to_agents(self.root)
+        self._refresh_exports()
         print("dream cycle complete. journal: %s" % memo)
         print("  (read it to see what was forgotten, promoted, or flagged)")
 
     def export(self):
         self._ensure()
-        self.active.generate(self.root)
-        written = self.active.export_to_agents(self.root)
+        written = self._refresh_exports()
         print("exported memory to: %s" % ", ".join(written))
 
     def status(self):
@@ -2819,10 +3767,14 @@ manual commands (optional):  %s remember/recall/dream/status""" % (
                        else 0)
         pending = 0
         sig = self.dir / SIGNALS_FILE
-        if sig.exists() and not sig.is_symlink() \
-                and sig.stat().st_size <= 5_000_000:
-            pending = sum(1 for ln in sig.read_text(
-                "utf-8", errors="replace").splitlines() if ln.strip())
+        if sig.exists() and not sig.is_symlink():
+            try:
+                signal_text = _read_text_retry(
+                    sig, max_bytes=5_000_000, boundary=self.dir)
+            except (OSError, ValueError, UnicodeError):
+                signal_text = ""
+            pending = sum(
+                1 for ln in signal_text.splitlines() if ln.strip())
         journal_path = self.dir / JOURNAL_FILE
         journal_n = len(self.hippo.journal_entries())
         journal_display = str(journal_n)
@@ -2835,7 +3787,7 @@ nodes:           %d (%d currently true, %d superseded)
 edges:           %d
 avg weight:      %.3f
 cortex files:    %d
-working memory:  %d bytes (~%d tokens)
+working memory:  %d bytes (~%d estimated tokens)
 pending signals: %d
 journal events:  %s (append-only provenance)
 version:         %s""" % (self.dir, n_nodes, n_valid, n_nodes - n_valid,

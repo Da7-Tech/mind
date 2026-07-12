@@ -1,5 +1,67 @@
 # Changelog
 
+## 6.2.10 — 2026-07-12
+
+Comprehensive concurrency, filesystem, resource, export, and claims audit.
+Twelve independent read-only reviews across two discovery rounds were
+semantically merged, then every surviving family was reproduced and closed
+with maintainer-written regression tests and three local verification
+methods (static review, black-box/differential probes, and the complete
+test/fuzz/benchmark/mutation gates).
+
+- **Semantic operations are serializable now.** One existing
+  `graph.json.lock` covers fresh reload, decision, and one graph commit.
+  This closes stale `correct`, `link`, reopen, duplicate-remember, decay,
+  auto-dream, and parallel-correction races without a second lock that old
+  releases do not understand. Shared objects are thread-serialized and lock
+  waits are bounded.
+- **Pruning is crash-recoverable and truthful.** A durable idempotent outbox
+  lands before graph deletion; archive and provenance delivery happen only
+  after the graph commit and recover after interruption. Vetoed/failed
+  prunes cannot create false archive lines, and retries cannot duplicate
+  archive or journal records.
+- **Project files are treated as untrusted filesystem objects.** Reads and
+  appends require regular single-link files and use nonblocking,
+  no-follow opens; FIFOs, devices, sockets, symlinks, and hard links cannot
+  hang a command or redirect data. POSIX reads, appends, atomic writes, and
+  directory creation traverse opened directory handles, closing parent-swap
+  races, and preserve existing private permissions.
+- **Derived files cannot roll the graph backward.** Agent export reloads the
+  newest graph while holding its lock, compares target identity before
+  preserving rewrites, skips unreadable or concurrently edited targets, and
+  reports every skip instead of claiming all files changed. Markerless legacy
+  blocks and fenced marker examples are preserved. Partial `init` layouts
+  repair themselves; `dream --dry-run` creates nothing.
+- **Dream side effects follow the commit.** Cortex promotion, dream journals,
+  and signal consumption happen after graph persistence but before releasing
+  its lock. Signals consume only the observed prefix, preserving late
+  appends. Cortex filenames are deterministic and concurrent same-topic
+  promotions merge without losing facts.
+- **Resource and rendering bounds are explicit.** The graph is capped at
+  50 MB / 10,000 nodes / 100,000 directional edges / 100 history records per
+  node; memories and queries at 10,000 characters; targeted journal scans at
+  the latest 100 MB and 10,000 retained matches. Dream pair work is budgeted.
+  C1 controls, lone surrogates, malformed journal fields, node ids, queries,
+  and cortex filenames are terminal-safe.
+- **Append failures do not poison future provenance.** A short JSONL write is
+  terminated as a damaged fragment, so the next valid event remains
+  independently parseable.
+- **Recovery damage is isolated, not contagious.** A corrupt prune outbox is
+  quarantined with a warning instead of bricking every memory command; its
+  safe removal cannot unlink a swapped or multiply-linked object.
+- **The advertised Python floor is exercised.** Python 3.9 compatibility
+  paths avoid newer `pathlib` arguments, and simultaneous cortex-directory
+  and lock creation is retried and validated under contention. File-open
+  mode detection also uses a portable mask available on Windows.
+- **Claims now match the implementation.** Removed “reversible,” “all stale
+  races,” “per-field merge,” and sub-millisecond-at-1,000 wording; documented
+  local-filesystem durability assumptions, resource limits, bounded journal
+  history, skipped exports, and the absence of rollback.
+- 267 tests. Full fuzz: 420/420. Recall@1/5: 1.00/1.00 at 100 and 1,000
+  nodes; multilingual 24/24; discrimination 12/12; 180-day soak 15/15,
+  0/256 stale noise, 8/8 hot slots. Mutation rate: 38% on the
+  seeded 120-mutant sample.
+
 ## 6.2.9 — 2026-07-10
 
 Independent re-audit of the 6.2.8 hardening release: one line-by-line
