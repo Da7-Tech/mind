@@ -10,6 +10,13 @@
   and the exact command.
 - CI now smoke-tests the LongMemEval harness against a tiny local fixture,
   keeping the public dataset download out of the test matrix.
+- Added an optional `MIND_EMBED_CMD` recall re-ranker. The command reads text
+  from stdin and returns a numeric vector as JSON or whitespace-separated
+  floats; failures, timeouts, invalid vectors, and unset commands fall back to
+  the deterministic hash embedder.
+- Benchmarks now report the default offline recall column and, when
+  `MIND_EMBED_CMD` is set, a second embedded re-rank column so semantic
+  backend gains can be measured without changing the offline baseline.
 
 ## 6.2.10 — 2026-07-12
 

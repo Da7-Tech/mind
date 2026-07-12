@@ -39,8 +39,9 @@ No server, no vector store, no embedding model, no configuration file.
 
 ## Measured, not vibes
 
-The first table comes from `python3 bench/bench.py`; each later measurement
-names its own reproducible command — rerun them yourself
+The first table comes from `python3 bench/bench.py`; when `MIND_EMBED_CMD`
+is configured it also prints an embedded re-rank column next to the offline
+score. Each later measurement names its own reproducible command — rerun them yourself
 (Python 3.14 on Apple M-series — latencies are environment-dependent, rerun
 for your hardware; 20 bilingual queries with known answers against
 distractor-filled graphs):
@@ -142,8 +143,8 @@ Layer 1  WORKING MEMORY   .mind/ACTIVE.md  → injected into agent rule files
 Layer 2  HIPPOCAMPUS      .mind/graph.json → weighted concept graph
          recall = spreading activation (≤3 hops) fused with direct keyword
          matches via Reciprocal Rank Fusion + IDF, re-ranked by offline
-         hash embeddings; near-duplicate results are diversified (pattern
-         separation); fuzzy fallback finds memories from partial cues
+         hash embeddings or optional `MIND_EMBED_CMD`; near-duplicate
+         results are diversified (pattern separation); fuzzy fallback finds memories from partial cues
          (pattern completion)
 
 Layer 3  CORTEX           .mind/cortex/*.md → consolidated durable knowledge
@@ -246,6 +247,24 @@ and restrengthens its edges. The exported agent instructions teach this
 loop, and every dream weakens all edges slightly (synaptic homeostasis),
 so connections that never earn a confirmation decay and prune away.
 
+## Optional semantic re-ranking
+
+The default recall path remains fully offline and stdlib-only. To compare a
+learned embedding backend without changing storage or the graph algorithm,
+set `MIND_EMBED_CMD` to a command that reads text on stdin and prints either
+a JSON list of floats or whitespace-separated floats:
+
+```bash
+export MIND_EMBED_CMD='python3 local_embed.py'
+python3 mind.py recall "what css framework"
+python3 bench/bench.py    # prints offline vs embedded re-rank columns
+```
+
+The hook is used only for recall head re-ranking. If the command is missing,
+times out, exits non-zero, or returns an invalid vector, `mind` silently falls
+back to the built-in hash embeddings. Dream clustering, fuzzy fallback, and
+pattern separation continue to use the deterministic offline embedder.
+
 ## Safety properties
 
 - **Atomic, durable, symlink-refusing writes** everywhere — directory-handle
@@ -273,9 +292,10 @@ so connections that never earn a confirmation decay and prune away.
   sentry→errors...). Cross-domain synonymy *outside* that seed and the
   corpus still misses; polysemous words (black, express, spring...) are
   deliberately excluded from the seed because a false category on an
-  everyday sentence is worse than a missed synonym. True embeddings would
-  close the remainder at the cost of the zero-dependency promise; a
-  pluggable backend is on the roadmap.
+  everyday sentence is worse than a missed synonym. `MIND_EMBED_CMD` can
+  re-rank the recall head with a learned backend for those cases, but
+  quality then depends on the command you provide; the built-in fallback
+  remains deterministic and local.
 - Arabic stemming is light (prefix/suffix + broken-plural seed), not a full
   morphological analyzer. Other languages get no stemming or stopword
   lists at all — IDF and character n-grams carry them (measured above),

@@ -11,6 +11,7 @@ Run:  python3 bench/bench.py
 Numbers in README.md come from this script — re-run it yourself.
 """
 import random
+import os
 import shutil
 import statistics
 import sys
@@ -62,6 +63,25 @@ def build(n_distractors):
     return tmp, h
 
 
+class embed_env:
+    def __init__(self, cmd):
+        self.cmd = cmd
+        self.old = None
+
+    def __enter__(self):
+        self.old = os.environ.get("MIND_EMBED_CMD")
+        if self.cmd:
+            os.environ["MIND_EMBED_CMD"] = self.cmd
+        else:
+            os.environ.pop("MIND_EMBED_CMD", None)
+
+    def __exit__(self, *_):
+        if self.old is None:
+            os.environ.pop("MIND_EMBED_CMD", None)
+        else:
+            os.environ["MIND_EMBED_CMD"] = self.old
+
+
 def run_recall(h):
     hits1 = hits5 = 0
     lat = []
@@ -75,6 +95,15 @@ def run_recall(h):
         if any(marker in t for t in texts):
             hits5 += 1
     return hits1 / len(FACTS), hits5 / len(FACTS), lat
+
+
+def measure(n_distractors, embed_cmd=None):
+    with embed_env(embed_cmd):
+        tmp, h = build(n_distractors)
+        try:
+            return run_recall(h)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def dream_determinism():
@@ -94,17 +123,25 @@ def dream_determinism():
 def main():
     print("mind benchmark (python %s)" % sys.version.split()[0])
     print("=" * 56)
+    embed_cmd = os.environ.get("MIND_EMBED_CMD")
+    if embed_cmd:
+        print("embedded rerank: enabled through MIND_EMBED_CMD")
+    else:
+        print("embedded rerank: n/a (set MIND_EMBED_CMD to compare)")
     ok = True
     for n_distract, label in ((80, "100 nodes"), (980, "1,000 nodes")):
-        tmp, h = build(n_distract)
-        r1, r5, lat = run_recall(h)
-        print("%-12s recall@1 %.2f | recall@5 %.2f | "
-              "median %.2f ms | p95 %.2f ms"
+        r1, r5, lat = measure(n_distract, embed_cmd=None)
+        if embed_cmd:
+            er1, er5, elat = measure(n_distract, embed_cmd=embed_cmd)
+            embedded = " | embedded r@1 %.2f r@5 %.2f med %.2f ms" % (
+                er1, er5, statistics.median(elat))
+        else:
+            embedded = " | embedded n/a"
+        print("%-12s offline r@1 %.2f r@5 %.2f med %.2f ms p95 %.2f ms%s"
               % (label, r1, r5, statistics.median(lat),
-                 sorted(lat)[int(len(lat) * 0.95) - 1]))
+                 sorted(lat)[int(len(lat) * 0.95) - 1], embedded))
         if r1 < 0.9:            # regression gate for CI
             ok = False
-        shutil.rmtree(tmp, ignore_errors=True)
     det = dream_determinism()
     print("dream determinism: %s"
           % ("PASS (identical plan on identical state)" if det else "FAIL"))

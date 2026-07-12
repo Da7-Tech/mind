@@ -25,7 +25,7 @@ Usage: python3 mind.py <command> [args]
 
 Design: docs/DESIGN.md  |  License: MIT  |  https://github.com/Da7-Tech/mind
 """
-import sys, os, json, re, time, math, hashlib, tempfile, shlex, stat, threading
+import sys, os, json, re, time, math, hashlib, tempfile, shlex, stat, threading, subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter, defaultdict, deque
@@ -1075,6 +1075,110 @@ class HashEmbed:
         return max(0.0, dot / (na * nb))
 
 
+class CommandEmbed:
+    """Optional command-backed embeddings for recall re-ranking.
+
+    The command is read from MIND_EMBED_CMD by default. It receives the text
+    on stdin and should print either a JSON list of numbers or whitespace/
+    comma-separated floats. Any failure falls back to HashEmbed, so default
+    offline behaviour and zero-dependency installs stay unchanged.
+    """
+
+    def __init__(self, cmd=None, fallback=None, timeout=None):
+        self.cmd = (cmd if cmd is not None else os.environ.get("MIND_EMBED_CMD", "")).strip()
+        self.fallback = fallback or HashEmbed()
+        self.timeout = self._timeout(timeout)
+        self._cache = {}
+
+    @staticmethod
+    def _timeout(value):
+        if value is None:
+            value = os.environ.get("MIND_EMBED_TIMEOUT", "2.0")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return 2.0
+        return max(0.1, min(30.0, value))
+
+    @staticmethod
+    def _parse_vector(payload):
+        text = (payload or b"").decode("utf-8", "replace").strip()
+        if not text:
+            return None
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                for key in ("embedding", "vector", "values"):
+                    if key in data:
+                        data = data[key]
+                        break
+            if isinstance(data, list):
+                vec = [float(v) for v in data]
+                return vec if vec and all(math.isfinite(v) for v in vec) else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        parts = [p for p in re.split(r"[\s,]+", text) if p]
+        try:
+            vec = [float(p) for p in parts]
+        except ValueError:
+            return None
+        return vec if vec and all(math.isfinite(v) for v in vec) else None
+
+    @staticmethod
+    def _split_command(cmd, platform=None):
+        try:
+            parts = shlex.split(cmd, posix=(platform or os.name) != "nt")
+        except ValueError:
+            return None
+        if (platform or os.name) == "nt":
+            parts = [
+                p[1:-1] if len(p) >= 2 and p[0] == p[-1] and p[0] in ("'", '"') else p
+                for p in parts
+            ]
+        return parts
+
+    def _command_embed(self, text):
+        if not self.cmd:
+            return None
+        argv = self._split_command(self.cmd)
+        if not argv:
+            return None
+        try:
+            proc = subprocess.run(
+                argv,
+                input=(text or "").encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=self.timeout,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0 or len(proc.stdout) > 1_000_000:
+            return None
+        return self._parse_vector(proc.stdout)
+
+    def embed(self, text):
+        text = text or ""
+        if text in self._cache:
+            return self._cache[text]
+        vec = self._command_embed(text)
+        if vec is None:
+            vec = self.fallback.embed(text)
+        if len(self._cache) < 4096:
+            self._cache[text] = vec
+        return vec
+
+    def similarity(self, a, b):
+        va, vb = self.embed(a), self.embed(b)
+        if not va or not vb or len(va) != len(vb):
+            return self.fallback.similarity(a, b)
+        dot = sum(x * y for x, y in zip(va, vb))
+        na = math.sqrt(sum(x * x for x in va)) or 1.0
+        nb = math.sqrt(sum(y * y for y in vb)) or 1.0
+        return max(0.0, dot / (na * nb))
+
+
 # ────────────────────────────────────────────────────────────────
 # Layer 2: Hippocampus — the weighted concept graph
 # ────────────────────────────────────────────────────────────────
@@ -1091,6 +1195,7 @@ class Hippocampus:
         self.meta = {}    # small persisted strings (e.g. last_edge_decay)
         self.related = None
         self.embedder = HashEmbed()
+        self.reranker = CommandEmbed(fallback=self.embedder)
         self._thread_lock = threading.RLock()
         self._transaction_state = threading.local()
         self._deleted = set()
@@ -2143,7 +2248,7 @@ class Hippocampus:
         if len(ranked) > 1 and not identity_q:
             reranked = []
             for nid, base in ranked[:top_k * 3]:
-                sim = self.embedder.similarity(query, self.nodes[nid]["text"])
+                sim = self.reranker.similarity(query, self.nodes[nid]["text"])
                 reranked.append((nid, base * (1.0 + sim)))
             reranked.sort(key=lambda x: (-x[1], x[0]))
             ranked = reranked
