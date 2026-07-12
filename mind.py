@@ -212,15 +212,19 @@ def _open_regular(path, flags, mode=0o600, boundary=None):
             raise UnsafePathError(
                 "refusing %s: regular, single-link file required" % path)
         if os.name == "nt":
-            after = os.lstat(str(path))
+            try:
+                after = os.lstat(str(path))
+            except FileNotFoundError:
+                raise StaleTargetError(
+                    "file changed during open: %s" % path)
             if (after.st_dev, after.st_ino) != (info.st_dev, info.st_ino):
-                raise UnsafePathError(
-                    "refusing file swapped during open: %s" % path)
+                raise StaleTargetError(
+                    "file changed during open: %s" % path)
             if before is not None and (
                     before.st_dev, before.st_ino) != (
                     after.st_dev, after.st_ino):
-                raise UnsafePathError(
-                    "refusing file changed during open: %s" % path)
+                raise StaleTargetError(
+                    "file changed during open: %s" % path)
         return fd
     except BaseException:
         os.close(fd)
@@ -277,6 +281,10 @@ def _read_text_retry(path, max_bytes=MAX_AUX_BYTES, with_identity=False,
             if os.name != "nt" or attempt == 199:
                 raise
             time.sleep(0.05)
+        except StaleTargetError:
+            if attempt == 199:
+                raise
+            time.sleep(0.005)
 
 
 def _append_regular(path, payload, boundary, mode=0o600, durable=False):

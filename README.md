@@ -24,7 +24,7 @@ and `.roo/rules/mind.md` in projects that already use those tools.
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.10/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='7cb7dbe501917ab40c986162746a7452fa0316fb7a0a47edd401fc12d2dd420e',h;print('mind.py: OK')"
+python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c',h;print('mind.py: OK')"
 python3 mind.py init
 python3 mind.py remember "the project database is postgres 16"
 python3 mind.py recall "which database do we use"
@@ -105,7 +105,7 @@ rounds had missed (see CHANGELOG 5.5.0).
 must catch them. Its first run exposed 17 behaviors the tests didn't
 actually pin down — each is now locked by a dedicated regression test
 (raw kill rate on the seeded 120-mutant sample: 33% at first run,
-**37%**
+**38%**
 on this release — the sample is re-drawn whenever the file changes, so
 the number moves a few points between releases; it is remeasured and
 republished each time because hiding it would be the exact sin this
@@ -115,7 +115,7 @@ local calculations superseded by the locked merge, platform-only branches,
 boundary/display constants, and ranking calibration guarded by the CI
 benchmark gates rather than exact unit assertions; the tool prints every one.
 
-Test suite: **266 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
+Test suite: **267 tests**, stdlib `unittest`, `python3 -m unittest discover -s tests` —
 including regression tests for concurrency (parallel writers must not lose
 each other's memories), destructive-op gating, corrupt-graph recovery, and
 a mutation-kill class where every test pins a behavior the suite
@@ -354,7 +354,7 @@ optional, since auto-dream already covers it.
 ## Development
 
 ```bash
-python3 -m unittest discover -s tests   # 266 tests
+python3 -m unittest discover -s tests   # 267 tests
 python3 bench/bench.py                  # reproduce the EN/AR numbers
 python3 bench/multilang.py              # 8 untuned languages
 python3 bench/soak.py                   # 180 simulated days

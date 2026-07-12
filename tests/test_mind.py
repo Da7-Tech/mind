@@ -3499,6 +3499,26 @@ class TestThirteenthAudit(TmpDirTest):
             if marker is not None:
                 os.O_ACCMODE = marker
 
+    def test_text_read_retries_a_transient_identity_change(self):
+        target = self.tmp / "replace-race.txt"
+        target.write_text("stable", "utf-8")
+        original = M._open_regular
+        calls = [0]
+
+        def stale_once(*args, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise M.StaleTargetError("injected replace race")
+            return original(*args, **kwargs)
+
+        M._open_regular = stale_once
+        try:
+            self.assertEqual(
+                M._read_text_retry(target, boundary=self.tmp), "stable")
+        finally:
+            M._open_regular = original
+        self.assertEqual(calls[0], 2)
+
     @unittest.skipIf(os.name == "nt", "POSIX dir-fd race control")
     def test_atomic_write_parent_swap_cannot_escape_boundary(self):
         parent = self.tmp / "rules"

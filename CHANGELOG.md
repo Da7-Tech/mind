@@ -57,9 +57,9 @@ test/fuzz/benchmark/mutation gates).
   races,” “per-field merge,” and sub-millisecond-at-1,000 wording; documented
   local-filesystem durability assumptions, resource limits, bounded journal
   history, skipped exports, and the absence of rollback.
-- 266 tests. Full fuzz: 420/420. Recall@1/5: 1.00/1.00 at 100 and 1,000
+- 267 tests. Full fuzz: 420/420. Recall@1/5: 1.00/1.00 at 100 and 1,000
   nodes; multilingual 24/24; discrimination 12/12; 180-day soak 15/15,
-  0/256 stale noise, 8/8 hot slots. Mutation rate: 37% on the
+  0/256 stale noise, 8/8 hot slots. Mutation rate: 38% on the
   seeded 120-mutant sample.
 
 ## 6.2.9 — 2026-07-10
