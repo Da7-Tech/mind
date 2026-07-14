@@ -142,6 +142,72 @@ class TestCommandEmbed(TmpDirTest):
             [r"C:\Program Files\Python\python.exe", r"C:\tmp\embedder.py"],
         )
 
+    def test_command_failure_never_mixes_embedding_spaces(self):
+        script = self.tmp / "partial_embedder.py"
+        script.write_text(
+            "import sys\n"
+            "text = sys.stdin.read()\n"
+            "if 'query' in text:\n"
+            "    print('1 0')\n"
+            "else:\n"
+            "    raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        fallback = HashEmbed(dim=2)
+        e = CommandEmbed(
+            cmd="%s %s" % (sys.executable, script),
+            fallback=fallback,
+        )
+
+        self.assertAlmostEqual(
+            e.similarity("query", "document"),
+            fallback.similarity("query", "document"),
+        )
+
+    def test_transient_failure_is_retried_after_short_cache(self):
+        script = self.tmp / "flaky_embedder.py"
+        marker = self.tmp / "flaky-marker"
+        script.write_text(
+            "import pathlib, sys\n"
+            "marker = pathlib.Path(sys.argv[1])\n"
+            "if not marker.exists():\n"
+            "    marker.write_text('failed once')\n"
+            "    raise SystemExit(1)\n"
+            "print('1 0')\n",
+            encoding="utf-8",
+        )
+        fallback = HashEmbed(dim=2)
+        e = CommandEmbed(
+            cmd="%s %s %s" % (sys.executable, script, marker),
+            fallback=fallback,
+        )
+        e.FAILURE_CACHE_SECONDS = 0.0
+
+        self.assertEqual(e.embed("same text"), fallback.embed("same text"))
+        self.assertEqual(e.embed("same text"), [1.0, 0.0])
+
+    def test_zero_vector_and_oversized_output_fall_back(self):
+        zero_script = self.tmp / "zero_embedder.py"
+        zero_script.write_text("print('0 0')\n", encoding="utf-8")
+        fallback = HashEmbed(dim=2)
+        zero = CommandEmbed(
+            cmd="%s %s" % (sys.executable, zero_script),
+            fallback=fallback,
+        )
+        self.assertEqual(zero.embed("text"), fallback.embed("text"))
+
+        large_script = self.tmp / "large_embedder.py"
+        large_script.write_text(
+            "import sys\n"
+            "sys.stdout.write('1 ' * 600000)\n",
+            encoding="utf-8",
+        )
+        large = CommandEmbed(
+            cmd="%s %s" % (sys.executable, large_script),
+            fallback=fallback,
+        )
+        self.assertEqual(large.embed("text"), fallback.embed("text"))
+
     def test_recall_uses_embed_command_for_head_reranking(self):
         old = os.environ.get("MIND_EMBED_CMD")
         os.environ["MIND_EMBED_CMD"] = self._embed_script()

@@ -251,8 +251,9 @@ so connections that never earn a confirmation decay and prune away.
 
 The default recall path remains fully offline and stdlib-only. To compare a
 learned embedding backend without changing storage or the graph algorithm,
-set `MIND_EMBED_CMD` to a command that reads text on stdin and prints either
-a JSON list of floats or whitespace-separated floats:
+set `MIND_EMBED_CMD` to a trusted local command that reads text on stdin and
+prints either a JSON list of floats or whitespace-separated floats. The
+command is parsed into arguments and executed directly, never through a shell:
 
 ```bash
 export MIND_EMBED_CMD='python3 local_embed.py'
@@ -262,8 +263,12 @@ python3 bench/bench.py    # prints offline vs embedded re-rank columns
 
 The hook is used only for recall head re-ranking. If the command is missing,
 times out, exits non-zero, or returns an invalid vector, `mind` silently falls
-back to the built-in hash embeddings. Dream clustering, fuzzy fallback, and
-pattern separation continue to use the deterministic offline embedder.
+back to the built-in hash embeddings for the whole comparison, so vectors from
+different embedding spaces are never mixed. Failed texts are retried after a
+short cache window. Set `MIND_EMBED_TIMEOUT` to control the per-text timeout
+in seconds (default `2`, clamped to `0.1`–`30`). Dream clustering, fuzzy
+fallback, and pattern separation continue to use the deterministic offline
+embedder.
 
 ## Safety properties
 

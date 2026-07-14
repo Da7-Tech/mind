@@ -1084,9 +1084,13 @@ class CommandEmbed:
     offline behaviour and zero-dependency installs stay unchanged.
     """
 
+    MAX_OUTPUT_BYTES = 1_000_000
+    FAILURE_CACHE_SECONDS = 5.0
+
     def __init__(self, cmd=None, fallback=None, timeout=None):
-        self.cmd = (cmd if cmd is not None else os.environ.get("MIND_EMBED_CMD", "")).strip()
-        self.fallback = fallback or HashEmbed()
+        raw_cmd = cmd if cmd is not None else os.environ.get("MIND_EMBED_CMD", "")
+        self.cmd = str(raw_cmd or "").strip()
+        self.fallback = fallback if fallback is not None else HashEmbed()
         self.timeout = self._timeout(timeout)
         self._cache = {}
 
@@ -1114,7 +1118,10 @@ class CommandEmbed:
                         break
             if isinstance(data, list):
                 vec = [float(v) for v in data]
-                return vec if vec and all(math.isfinite(v) for v in vec) else None
+                return (
+                    vec if vec and any(vec)
+                    and all(math.isfinite(v) for v in vec) else None
+                )
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
         parts = [p for p in re.split(r"[\s,]+", text) if p]
@@ -1122,7 +1129,10 @@ class CommandEmbed:
             vec = [float(p) for p in parts]
         except ValueError:
             return None
-        return vec if vec and all(math.isfinite(v) for v in vec) else None
+        return (
+            vec if vec and any(vec)
+            and all(math.isfinite(v) for v in vec) else None
+        )
 
     @staticmethod
     def _split_command(cmd, platform=None):
@@ -1144,34 +1154,65 @@ class CommandEmbed:
         if not argv:
             return None
         try:
-            proc = subprocess.run(
-                argv,
-                input=(text or "").encode("utf-8"),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                timeout=self.timeout,
-                check=False,
-            )
+            # Keep unexpectedly large command output off the Python heap. The
+            # command is user-configured and trusted, but accidental output
+            # floods should still degrade to HashEmbed instead of exhausting
+            # agent memory.
+            with tempfile.TemporaryFile() as stdout:
+                proc = subprocess.run(
+                    argv,
+                    input=(text or "").encode("utf-8"),
+                    stdout=stdout,
+                    stderr=subprocess.DEVNULL,
+                    timeout=self.timeout,
+                    check=False,
+                )
+                size = stdout.tell()
+                if proc.returncode != 0 or size > self.MAX_OUTPUT_BYTES:
+                    return None
+                stdout.seek(0)
+                payload = stdout.read(self.MAX_OUTPUT_BYTES + 1)
         except (OSError, subprocess.SubprocessError):
             return None
-        if proc.returncode != 0 or len(proc.stdout) > 1_000_000:
-            return None
-        return self._parse_vector(proc.stdout)
+        return self._parse_vector(payload)
 
-    def embed(self, text):
+    def _embed_with_source(self, text):
         text = text or ""
-        if text in self._cache:
-            return self._cache[text]
+        if not self.cmd:
+            return "fallback", self.fallback.embed(text)
+
+        now = time.monotonic()
+        cached = self._cache.get(text)
+        if cached is not None:
+            source, vec, retry_at = cached
+            if source == "command" or now < retry_at:
+                return source, vec
+
         vec = self._command_embed(text)
         if vec is None:
+            source = "fallback"
             vec = self.fallback.embed(text)
-        if len(self._cache) < 4096:
-            self._cache[text] = vec
-        return vec
+            retry_at = now + self.FAILURE_CACHE_SECONDS
+        else:
+            source = "command"
+            retry_at = float("inf")
+        if text in self._cache or len(self._cache) < 4096:
+            self._cache[text] = (source, vec, retry_at)
+        return source, vec
+
+    def embed(self, text):
+        return self._embed_with_source(text)[1]
 
     def similarity(self, a, b):
-        va, vb = self.embed(a), self.embed(b)
-        if not va or not vb or len(va) != len(vb):
+        source_a, va = self._embed_with_source(a)
+        source_b, vb = self._embed_with_source(b)
+        if (
+            source_a != "command"
+            or source_b != "command"
+            or not va
+            or not vb
+            or len(va) != len(vb)
+        ):
             return self.fallback.similarity(a, b)
         dot = sum(x * y for x, y in zip(va, vb))
         na = math.sqrt(sum(x * x for x in va)) or 1.0

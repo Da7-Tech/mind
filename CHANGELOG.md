@@ -13,7 +13,9 @@
 - Added an optional `MIND_EMBED_CMD` recall re-ranker. The command reads text
   from stdin and returns a numeric vector as JSON or whitespace-separated
   floats; failures, timeouts, invalid vectors, and unset commands fall back to
-  the deterministic hash embedder.
+  the deterministic hash embedder without mixing vector spaces. Transient
+  failures are retried after a short cache window, and oversized output stays
+  off the Python heap.
 - Benchmarks now report the default offline recall column and, when
   `MIND_EMBED_CMD` is set, a second embedded re-rank column so semantic
   backend gains can be measured without changing the offline baseline.
