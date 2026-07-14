@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Added `bench/longmemeval.py`, an independent LongMemEval retrieval harness
+  that downloads the official cleaned oracle dataset by default, maps history
+  sessions to `remember()` and questions to `recall()`, and reports exact
+  evidence-turn retrieval (with answer-session fallback only for unannotated
+  sessions), answer-string retrieval, latency, dataset SHA-256, git commit,
+  and the exact command.
+- CI now smoke-tests the LongMemEval harness against a tiny local fixture,
+  keeping the public dataset download out of the test matrix.
+
 ## 6.2.10 — 2026-07-12
 
 Comprehensive concurrency, filesystem, resource, export, and claims audit.

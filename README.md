@@ -92,6 +92,18 @@ match the class name", in both English and Arabic). Current score:
 **12/12**, gated at ≥ 0.85 in CI so discrimination can never silently
 regress again.
 
+**LongMemEval subset harness** (`bench/longmemeval.py`): maps the official
+cleaned LongMemEval oracle history to `remember()` calls and each question
+to `recall()`, then reports exact evidence-turn@1/evidence-turn@k (falling
+back to answer-session evidence only where the dataset has no marked answer
+turn), answer-string@k, latency, the exact git commit, dataset SHA-256, and
+command. This is a retrieval benchmark, not LLM answer grading. CI runs a
+tiny local fixture; to run the public subset yourself:
+
+```bash
+python3 bench/longmemeval.py --limit 50
+```
+
 **Fuzzed** (`bench/fuzz.py`, seeded + deterministic): 420 adversarial
 cases in the full run (CI runs the 160-case quick set on every push) — hostile graph files (NaN/Infinity, wrong-typed fields,
 control characters, truncated JSON, dangling edges) and hostile CLI input.
