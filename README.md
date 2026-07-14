@@ -94,10 +94,11 @@ regress again.
 
 **LongMemEval subset harness** (`bench/longmemeval.py`): maps the official
 cleaned LongMemEval oracle history to `remember()` calls and each question
-to `recall()`, then reports evidence@1/evidence@k, answer-string@k, latency,
-the exact git commit, dataset SHA-256, and command. This is a retrieval
-benchmark, not LLM answer grading. CI runs a tiny local fixture; to run the
-public subset yourself:
+to `recall()`, then reports exact evidence-turn@1/evidence-turn@k (falling
+back to answer-session evidence only where the dataset has no marked answer
+turn), answer-string@k, latency, the exact git commit, dataset SHA-256, and
+command. This is a retrieval benchmark, not LLM answer grading. CI runs a
+tiny local fixture; to run the public subset yourself:
 
 ```bash
 python3 bench/longmemeval.py --limit 50

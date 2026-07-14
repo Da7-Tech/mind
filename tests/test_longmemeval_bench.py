@@ -1,6 +1,7 @@
 """Tests for the LongMemEval benchmark harness."""
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
 
 
@@ -21,7 +22,7 @@ class TestLongMemEvalBench(unittest.TestCase):
         self.assertEqual(metrics["evaluated"], 1)
         self.assertEqual(metrics["skipped_abstention"], 1)
         self.assertEqual(metrics["skipped_no_evidence"], 0)
-        self.assertEqual(metrics["evidence_at_1_rate"], 1.0)
+        self.assertEqual(metrics["evidence_at_1_rate"], 0.0)
         self.assertEqual(metrics["evidence_at_k_rate"], 1.0)
         self.assertEqual(metrics["answer_string_at_k_rate"], 1.0)
 
@@ -50,6 +51,46 @@ class TestLongMemEvalBench(unittest.TestCase):
         self.assertEqual(metrics["evaluated"], 1)
         self.assertEqual(metrics["skipped_abstention"], 0)
         self.assertEqual(metrics["skipped_no_evidence"], 1)
+        self.assertEqual(metrics["memory_records"], 4)
+        self.assertEqual(metrics["avg_memory_records"], 4.0)
+
+    def test_turn_granularity_uses_exact_marked_turns(self):
+        instance = {
+            "question_id": "q1",
+            "answer_session_ids": ["s1"],
+            "haystack_session_ids": ["s1"],
+            "haystack_dates": ["2026-01-01"],
+            "haystack_sessions": [[
+                {"role": "user", "content": "irrelevant before"},
+                {"role": "assistant", "content": "answer is Kyoto", "has_answer": True},
+                {"role": "user", "content": "irrelevant after"},
+            ]],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            h = LME.Hippocampus(Path(tmp) / "graph.json")
+            evidence, total = LME.remember_instance(instance, h, "turn")
+
+        self.assertEqual(total, 3)
+        self.assertEqual(len(evidence), 1)
+        self.assertIn("answer is Kyoto", h.nodes[next(iter(evidence))]["text"])
+
+    def test_turn_granularity_falls_back_for_unmarked_answer_session(self):
+        instance = {
+            "question_id": "q1",
+            "answer_session_ids": ["s1"],
+            "haystack_session_ids": ["s1"],
+            "haystack_dates": ["2026-01-01"],
+            "haystack_sessions": [[
+                {"role": "user", "content": "first answer-session turn"},
+                {"role": "assistant", "content": "second answer-session turn"},
+            ]],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            h = LME.Hippocampus(Path(tmp) / "graph.json")
+            evidence, total = LME.remember_instance(instance, h, "turn")
+
+        self.assertEqual(total, 2)
+        self.assertEqual(len(evidence), 2)
 
 
 if __name__ == "__main__":

@@ -148,6 +148,7 @@ def remember_instance(instance, h, granularity):
         session_id = session_ids[i] if i < len(session_ids) else str(i)
         date = dates[i] if i < len(dates) else ""
         session_is_evidence = session_id in answer_sessions
+        session_has_marked_turn = any(t.get("has_answer") for t in turns)
         if granularity == "session":
             text = session_text(qid, session_id, date, turns)
             nid = h.remember(text)
@@ -159,7 +160,11 @@ def remember_instance(instance, h, granularity):
             text = turn_text(qid, session_id, date, turn.get("role"), turn.get("content", ""))
             nid = h.remember(text)
             total += 1
-            if session_is_evidence or turn.get("has_answer"):
+            # At turn granularity, count the dataset's exact has_answer turns.
+            # Some oracle answer sessions have no turn-level annotation; only
+            # those sessions fall back to session-level evidence.
+            if turn.get("has_answer") or (
+                    session_is_evidence and not session_has_marked_turn):
                 evidence_nodes.add(nid)
 
     return evidence_nodes, total
@@ -205,11 +210,11 @@ def evaluate(instances, limit=50, seed=13, top_k=5, granularity="turn",
         for idx, instance in enumerate(selected):
             h = Hippocampus(tmp / ("%04d.json" % idx))
             evidence_nodes, records = remember_instance(instance, h, granularity)
-            metrics["memory_records"] += records
             if not evidence_nodes:
                 metrics["skipped_no_evidence"] += 1
                 continue
 
+            metrics["memory_records"] += records
             t0 = time.perf_counter()
             results, _, _ = h.recall(instance.get("question", ""), top_k=top_k)
             metrics["latencies_ms"].append((time.perf_counter() - t0) * 1000)
@@ -253,8 +258,10 @@ def print_report(metrics, source, digest, args):
         metrics["evaluated"], metrics["skipped_abstention"], metrics["skipped_no_evidence"]))
     print("memory records: %d total | %.1f avg/question" % (
         metrics["memory_records"], metrics["avg_memory_records"]))
-    print("evidence@1 %.3f | evidence@%d %.3f | answer-string@%d %.3f" % (
-        metrics["evidence_at_1_rate"], args.top_k, metrics["evidence_at_k_rate"],
+    evidence_label = "evidence-turn" if args.granularity == "turn" else "evidence-session"
+    print("%s@1 %.3f | %s@%d %.3f | answer-string@%d %.3f" % (
+        evidence_label, metrics["evidence_at_1_rate"],
+        evidence_label, args.top_k, metrics["evidence_at_k_rate"],
         args.top_k, metrics["answer_string_at_k_rate"]))
     print("latency median %.2f ms | p95 %.2f ms" % (
         metrics["median_latency_ms"], metrics["p95_latency_ms"]))
