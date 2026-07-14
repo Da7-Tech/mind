@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import mind as M                                    # noqa: E402
 from mind import (Hippocampus, Cortex, Dreamer, Active, Mind,  # noqa: E402
-                  RelatedTerms, HashEmbed, stem, _atomic_write)
+                  RelatedTerms, HashEmbed, CommandEmbed, stem, _atomic_write)
 
 
 class TmpDirTest(unittest.TestCase):
@@ -103,6 +103,128 @@ class TestHashEmbed(unittest.TestCase):
         rel = e.similarity("المشروع يستخدم قاعدة بيانات", "قاعدة البيانات للمشروع")
         unrel = e.similarity("المشروع يستخدم قاعدة بيانات", "الطقس اليوم جميل")
         self.assertGreater(rel, unrel)
+
+
+class TestCommandEmbed(TmpDirTest):
+    def _embed_script(self):
+        script = self.tmp / "embedder.py"
+        script.write_text(
+            "import json, sys\n"
+            "text = sys.stdin.read().lower()\n"
+            "if 'tailwind' in text:\n"
+            "    print(json.dumps([0.0, 1.0]))\n"
+            "elif 'alpha' in text or 'bootstrap' in text or 'css framework' in text:\n"
+            "    print(json.dumps([1.0, 0.0]))\n"
+            "else:\n"
+            "    print(json.dumps([0.0, 1.0]))\n",
+            encoding="utf-8",
+        )
+        return "%s %s" % (sys.executable, script)
+
+    def test_command_embed_parses_json_vector(self):
+        e = CommandEmbed(cmd=self._embed_script(), fallback=HashEmbed())
+
+        self.assertGreater(
+            e.similarity("alpha query", "alpha document"),
+            e.similarity("alpha query", "beta document"),
+        )
+
+    def test_command_embed_splits_windows_paths(self):
+        self.assertEqual(
+            CommandEmbed._split_command(r"C:\Python\python.exe C:\tmp\embedder.py", platform="nt"),
+            [r"C:\Python\python.exe", r"C:\tmp\embedder.py"],
+        )
+        self.assertEqual(
+            CommandEmbed._split_command(
+                r'"C:\Program Files\Python\python.exe" "C:\tmp\embedder.py"',
+                platform="nt",
+            ),
+            [r"C:\Program Files\Python\python.exe", r"C:\tmp\embedder.py"],
+        )
+
+    def test_command_failure_never_mixes_embedding_spaces(self):
+        script = self.tmp / "partial_embedder.py"
+        script.write_text(
+            "import sys\n"
+            "text = sys.stdin.read()\n"
+            "if 'query' in text:\n"
+            "    print('1 0')\n"
+            "else:\n"
+            "    raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        fallback = HashEmbed(dim=2)
+        e = CommandEmbed(
+            cmd="%s %s" % (sys.executable, script),
+            fallback=fallback,
+        )
+
+        self.assertAlmostEqual(
+            e.similarity("query", "document"),
+            fallback.similarity("query", "document"),
+        )
+
+    def test_transient_failure_is_retried_after_short_cache(self):
+        script = self.tmp / "flaky_embedder.py"
+        marker = self.tmp / "flaky-marker"
+        script.write_text(
+            "import pathlib, sys\n"
+            "marker = pathlib.Path(sys.argv[1])\n"
+            "if not marker.exists():\n"
+            "    marker.write_text('failed once')\n"
+            "    raise SystemExit(1)\n"
+            "print('1 0')\n",
+            encoding="utf-8",
+        )
+        fallback = HashEmbed(dim=2)
+        e = CommandEmbed(
+            cmd="%s %s %s" % (sys.executable, script, marker),
+            fallback=fallback,
+        )
+        e.FAILURE_CACHE_SECONDS = 0.0
+
+        self.assertEqual(e.embed("same text"), fallback.embed("same text"))
+        self.assertEqual(e.embed("same text"), [1.0, 0.0])
+
+    def test_zero_vector_and_oversized_output_fall_back(self):
+        zero_script = self.tmp / "zero_embedder.py"
+        zero_script.write_text("print('0 0')\n", encoding="utf-8")
+        fallback = HashEmbed(dim=2)
+        zero = CommandEmbed(
+            cmd="%s %s" % (sys.executable, zero_script),
+            fallback=fallback,
+        )
+        self.assertEqual(zero.embed("text"), fallback.embed("text"))
+
+        large_script = self.tmp / "large_embedder.py"
+        large_script.write_text(
+            "import sys\n"
+            "sys.stdout.write('1 ' * 600000)\n",
+            encoding="utf-8",
+        )
+        large = CommandEmbed(
+            cmd="%s %s" % (sys.executable, large_script),
+            fallback=fallback,
+        )
+        self.assertEqual(large.embed("text"), fallback.embed("text"))
+
+    def test_recall_uses_embed_command_for_head_reranking(self):
+        old = os.environ.get("MIND_EMBED_CMD")
+        os.environ["MIND_EMBED_CMD"] = self._embed_script()
+        try:
+            h = self.hippo()
+            h.remember("css framework is tailwind")
+            h.remember("css framework is bootstrap")
+
+            results, _, _ = h.recall("what css framework")
+        finally:
+            if old is None:
+                os.environ.pop("MIND_EMBED_CMD", None)
+            else:
+                os.environ["MIND_EMBED_CMD"] = old
+
+        self.assertTrue(results)
+        self.assertIn("bootstrap", results[0][2]["text"])
 
 
 # ─────────────────────────── hippocampus ───────────────────────────
