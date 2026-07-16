@@ -1,0 +1,16 @@
+{
+  "format": 1,
+  "artifact": "mind.py",
+  "fragments": [
+    "00_prelude.py",
+    "10_language.py",
+    "20_embedding.py",
+    "30_graph.py",
+    "40_cortex.py",
+    "50_dream.py",
+    "60_export.py",
+    "70_policy.py",
+    "80_lifecycle.py",
+    "90_cli.py"
+  ]
+}

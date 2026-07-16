@@ -25,13 +25,13 @@ Usage: python3 mind.py <command> [args]
 
 Design: docs/DESIGN.md  |  License: MIT  |  https://github.com/Da7-Tech/mind
 """
-import sys, os, json, re, time, math, hashlib, tempfile, shlex, stat, threading, subprocess
-from datetime import datetime, timedelta
+import sys, os, json, re, time, math, hashlib, tempfile, shlex, stat, threading, subprocess, shutil, signal, queue
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
 
-__version__ = "6.2.10"
+__version__ = "7.0.0.dev0"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)
@@ -43,7 +43,16 @@ CORTEX_DIR = "cortex"
 DREAMS_DIR = "dreams"
 SIGNALS_FILE = "signals.jsonl"
 JOURNAL_FILE = "journal.jsonl"  # append-only provenance log — NEVER cleared
+JOURNAL_DIR = "journal"
 PRUNE_OUTBOX_FILE = "prune-outbox.json"
+SCHEDULER_FILE = "scheduler.json"
+SCHEDULER_LOCK_FILE = "scheduler.lock"
+RUNTIME_FILE = "runtime.py"
+PENDING_FILE = "pending.json"
+PENDING_LOCK_FILE = "pending.lock"
+LIFECYCLE_OUTBOX_FILE = "lifecycle-outbox.json"
+RESTORE_OUTBOX_FILE = "restore-outbox.json"
+BACKUPS_DIR = "backups"
 #   (signals.jsonl is session telemetry and its observed prefix is consumed
 #    by dream without deleting concurrent suffixes; the
 #    journal is the permanent answer to "where did this fact come from")
@@ -92,9 +101,33 @@ MAX_DREAM_COMPARISONS = 200_000
 MAX_PRUNES_PER_CYCLE = 256
 MAX_PRUNE_OUTBOX_BYTES = 5_000_000
 MAX_PRUNE_BATCH_BYTES = 4_000_000
+MAX_SIGNALS_BYTES = 5_000_000
+MAX_SCHEDULER_BYTES = 64_000
+MAX_PENDING_BYTES = 1_000_000
+MAX_PENDING_ITEMS = 1_000
+MAX_LIFECYCLE_FILE_BYTES = 500_000_000
+ARCHIVE_ROTATE_BYTES = 8_000_000
+RECEIPT_TAIL_BYTES = 1_000_000
+SCHEDULER_LEASE_SECONDS = 300
 MAX_CORTEX_FILES = 1_000
 MAX_DREAM_FILES = 10_000
 LOCK_TIMEOUT_SECONDS = 30.0
+MCP_PROTOCOL_VERSION = "2025-11-25"
+
+DIRECTED_RELATIONS = {
+    "depends-on": "required-by",
+    "owned-by": "owns",
+    "caused-by": "caused",
+    "part-of": "has-part",
+    "uses": "used-by",
+    "blocks": "blocked-by",
+    "implements": "implemented-by",
+    "deployed-to": "hosts",
+}
+MEMORY_TYPES = {"semantic", "episodic", "procedural", "decision"}
+MEMORY_SCOPES = {"project", "user"}
+MEMORY_TRUST = {"user", "repository", "tool", "untrusted"}
+MEMORY_SENSITIVITY = {"public", "internal", "sensitive", "secret"}
 
 
 class UnsafePathError(ValueError):
@@ -113,8 +146,20 @@ _NO_EXPECTATION = object()
 _EXPECTED_MISSING = object()
 
 
+def _content_md5(payload):
+    """Compatibility content hash; explicitly non-security on FIPS hosts."""
+    try:
+        return hashlib.md5(payload, usedforsecurity=False)
+    except TypeError:
+        return hashlib.md5(payload)
+
+
 def _now():
     return datetime.now()
+
+
+def _utc_ns():
+    return int(_now().astimezone().timestamp() * 1_000_000_000)
 
 
 def _reject_symlinked_parents(path, boundary):
@@ -439,6 +484,198 @@ def _latest_dream_stem(path):
     except OSError:
         return None
     return latest[:-3] if latest else None
+
+
+def _sweep_tmp_files(mind_dir, min_age_seconds=24 * 3600):
+    """Remove only old regular temporary files directly under `.mind/`."""
+    mind_dir = Path(mind_dir)
+    now = _now().timestamp()
+    removed = 0
+    if mind_dir.is_symlink() or not mind_dir.is_dir():
+        return removed
+    try:
+        entries = list(os.scandir(str(mind_dir)))[:10_000]
+    except OSError:
+        return removed
+    for entry in entries:
+        if entry.is_symlink() or not entry.name.endswith(".tmp"):
+            continue
+        try:
+            info = entry.stat(follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or now - info.st_mtime < min_age_seconds):
+                continue
+            Path(entry.path).unlink()
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _read_tail_text(path, max_bytes, boundary):
+    """Read a bounded UTF-8 tail without loading an append-only artifact."""
+    fd = _open_regular(path, os.O_RDONLY, boundary=boundary)
+    try:
+        size = os.fstat(fd).st_size
+        if size > max_bytes:
+            os.lseek(fd, size - max_bytes, os.SEEK_SET)
+        chunks = []
+        remaining = min(size, max_bytes)
+        while remaining:
+            chunk = os.read(fd, min(1_048_576, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks).decode("utf-8", "replace")
+    finally:
+        os.close(fd)
+
+
+def _read_bytes_bounded(path, max_bytes, boundary):
+    fd = _open_regular(path, os.O_RDONLY, boundary=boundary)
+    try:
+        size = os.fstat(fd).st_size
+        if size > max_bytes:
+            raise FileLimitError(
+                "%s exceeds the %d-byte lifecycle limit"
+                % (path, max_bytes))
+        chunks = []
+        remaining = size
+        while remaining:
+            chunk = os.read(fd, min(1_048_576, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _scheduler_default():
+    return {
+        "format": 1,
+        "pending": 0,
+        "last_dream_ns": 0,
+        "lease_token": None,
+        "lease_until_ns": 0,
+        "lease_pending": 0,
+    }
+
+
+def _read_scheduler_state(mind_dir):
+    path = Path(mind_dir) / SCHEDULER_FILE
+    state = _scheduler_default()
+    if not path.exists() or path.is_symlink():
+        return state
+    try:
+        raw = json.loads(_read_text_retry(
+            path, max_bytes=MAX_SCHEDULER_BYTES, boundary=mind_dir))
+    except (OSError, ValueError, UnicodeError, json.JSONDecodeError,
+            RecursionError):
+        return state
+    if not isinstance(raw, dict):
+        return state
+    for field in ("pending", "last_dream_ns", "lease_until_ns",
+                  "lease_pending"):
+        value = raw.get(field, state[field])
+        if isinstance(value, bool) or not isinstance(value, int):
+            value = state[field]
+        state[field] = max(0, value)
+    token = raw.get("lease_token")
+    state["lease_token"] = token[:128] if isinstance(token, str) else None
+    return state
+
+
+def _update_scheduler_state(mind_dir, update, use_lock=True):
+    mind_dir = Path(mind_dir)
+    def apply_update():
+        state = _read_scheduler_state(mind_dir)
+        result = update(state)
+        payload = json.dumps(state, ensure_ascii=False, sort_keys=True)
+        if len(payload.encode("utf-8")) > MAX_SCHEDULER_BYTES:
+            raise FileLimitError("scheduler state exceeds %d bytes"
+                                 % MAX_SCHEDULER_BYTES)
+        _atomic_write(
+            mind_dir / SCHEDULER_FILE, payload, boundary=mind_dir)
+        return result
+    if not use_lock:
+        return apply_update()
+    lock = mind_dir / SCHEDULER_LOCK_FILE
+    with _exclusive_file_lock(lock, mind_dir):
+        return apply_update()
+
+
+def _scheduler_note_signals(mind_dir, count=1):
+    def update(state):
+        state["pending"] = min(
+            1_000_000_000, state["pending"] + max(0, int(count)))
+    _update_scheduler_state(mind_dir, update)
+
+
+def _scheduler_note_signal(mind_dir):
+    _scheduler_note_signals(mind_dir, 1)
+
+
+def _scheduler_claim(mind_dir):
+    now_ns = time.time_ns()
+    stale_ns = int(AUTO_DREAM_HOURS * 3600 * 1_000_000_000)
+
+    def update(state):
+        if state["lease_token"] and state["lease_until_ns"] > now_ns:
+            return None
+        stale = (
+            state["last_dream_ns"] == 0
+            or now_ns - state["last_dream_ns"] >= stale_ns
+        )
+        if state["pending"] == 0 or not (
+                state["pending"] >= AUTO_DREAM_SIGNALS or stale):
+            state["lease_token"] = None
+            state["lease_until_ns"] = 0
+            state["lease_pending"] = 0
+            return None
+        token = hashlib.sha256((
+            "%d:%d:%d:%d" % (
+                os.getpid(), threading.get_ident(), now_ns,
+                state["pending"])
+        ).encode("ascii")).hexdigest()[:32]
+        state["lease_token"] = token
+        state["lease_until_ns"] = (
+            now_ns + SCHEDULER_LEASE_SECONDS * 1_000_000_000)
+        state["lease_pending"] = state["pending"]
+        return token
+
+    return _update_scheduler_state(mind_dir, update)
+
+
+def _scheduler_complete(mind_dir, token):
+    now_ns = time.time_ns()
+
+    def update(state):
+        if state["lease_token"] != token:
+            return False
+        state["pending"] = max(
+            0, state["pending"] - state["lease_pending"])
+        state["last_dream_ns"] = now_ns
+        state["lease_token"] = None
+        state["lease_until_ns"] = 0
+        state["lease_pending"] = 0
+        return True
+
+    return _update_scheduler_state(mind_dir, update)
+
+
+def _scheduler_release(mind_dir, token):
+    def update(state):
+        if state["lease_token"] != token:
+            return False
+        state["lease_token"] = None
+        state["lease_until_ns"] = 0
+        state["lease_pending"] = 0
+        return True
+
+    return _update_scheduler_state(mind_dir, update)
 
 
 def _write_all(fd, data):
@@ -1038,9 +1275,12 @@ class RelatedTerms:
 # and morphological variants; used for re-ranking and dream clustering.
 # ────────────────────────────────────────────────────────────────
 class HashEmbed:
+    MAX_CACHE_BYTES = 16_000_000
+
     def __init__(self, dim=512):
         self.dim = dim
         self._cache = {}
+        self._cache_bytes = 0
 
     def embed(self, text):
         if text in self._cache:
@@ -1063,8 +1303,11 @@ class HashEmbed:
             h = blake2b(f.encode("utf-8"), digest_size=8).digest()
             idx = int.from_bytes(h[:4], "little") % self.dim
             v[idx] += 1.0 if (h[4] & 1) == 0 else -1.0
-        if len(self._cache) < 4096:
+        vector_bytes = len(v) * 32
+        if (len(self._cache) < 4096 and
+                self._cache_bytes + vector_bytes <= self.MAX_CACHE_BYTES):
             self._cache[text] = v
+            self._cache_bytes += vector_bytes
         return v
 
     def similarity(self, a, b):
@@ -1073,8 +1316,6 @@ class HashEmbed:
         na = math.sqrt(sum(x * x for x in va)) or 1.0
         nb = math.sqrt(sum(y * y for y in vb)) or 1.0
         return max(0.0, dot / (na * nb))
-
-
 class CommandEmbed:
     """Optional command-backed embeddings for recall re-ranking.
 
@@ -1085,14 +1326,35 @@ class CommandEmbed:
     """
 
     MAX_OUTPUT_BYTES = 1_000_000
+    MAX_VECTOR_DIM = 8192
+    MAX_CACHE_BYTES = 16_000_000
     FAILURE_CACHE_SECONDS = 5.0
 
-    def __init__(self, cmd=None, fallback=None, timeout=None):
+    def __init__(self, cmd=None, fallback=None, timeout=None,
+                 budget=None, project_root=None):
         raw_cmd = cmd if cmd is not None else os.environ.get("MIND_EMBED_CMD", "")
         self.cmd = str(raw_cmd or "").strip()
         self.fallback = fallback if fallback is not None else HashEmbed()
         self.timeout = self._timeout(timeout)
+        self.budget = self._budget(budget)
+        self.project_root = Path(project_root or os.getcwd()).resolve()
+        self.argv, self.configuration_error = self._resolve_command(self.cmd)
+        self.server_cmd = str(
+            os.environ.get("MIND_EMBED_SERVER", "") or "").strip()
+        self.server_argv, self.server_configuration_error = \
+            self._resolve_command(self.server_cmd)
+        self._server_process = None
+        self._server_info = None
         self._cache = {}
+        self._cache_bytes = 0
+        self.last_report = {
+            "backend": "offline",
+            "model": None,
+            "calls": 0,
+            "latency_ms": 0.0,
+            "fallback": False,
+            "reason": None,
+        }
 
     @staticmethod
     def _timeout(value):
@@ -1102,6 +1364,16 @@ class CommandEmbed:
             value = float(value)
         except (TypeError, ValueError):
             return 2.0
+        return max(0.1, min(30.0, value))
+
+    @staticmethod
+    def _budget(value):
+        if value is None:
+            value = os.environ.get("MIND_EMBED_BUDGET", "3.0")
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return 3.0
         return max(0.1, min(30.0, value))
 
     @staticmethod
@@ -1118,10 +1390,7 @@ class CommandEmbed:
                         break
             if isinstance(data, list):
                 vec = [float(v) for v in data]
-                return (
-                    vec if vec and any(vec)
-                    and all(math.isfinite(v) for v in vec) else None
-                )
+                return CommandEmbed._valid_vector(vec)
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
         parts = [p for p in re.split(r"[\s,]+", text) if p]
@@ -1129,9 +1398,13 @@ class CommandEmbed:
             vec = [float(p) for p in parts]
         except ValueError:
             return None
+        return CommandEmbed._valid_vector(vec)
+
+    @staticmethod
+    def _valid_vector(vec):
         return (
-            vec if vec and any(vec)
-            and all(math.isfinite(v) for v in vec) else None
+            vec if vec and len(vec) <= CommandEmbed.MAX_VECTOR_DIM
+            and any(vec) and all(math.isfinite(v) for v in vec) else None
         )
 
     @staticmethod
@@ -1147,34 +1420,363 @@ class CommandEmbed:
             ]
         return parts
 
-    def _command_embed(self, text):
-        if not self.cmd:
-            return None
-        argv = self._split_command(self.cmd)
+    def _resolve_command(self, cmd):
+        if not cmd:
+            return None, None
+        argv = self._split_command(cmd)
         if not argv:
-            return None
+            return None, "invalid command syntax"
+        program = argv[0]
+        has_separator = os.sep in program or (
+            os.altsep is not None and os.altsep in program)
+        if os.path.isabs(program):
+            resolved = program
+        elif has_separator:
+            resolved = str((self.project_root / program).resolve())
+        else:
+            resolved = shutil.which(program)
+        if not resolved or not Path(resolved).is_file():
+            return None, "program not found: %s" % program
+        argv[0] = resolved
+        return argv, None
+
+    @staticmethod
+    def _terminate_process_group(proc):
         try:
-            # Keep unexpectedly large command output off the Python heap. The
-            # command is user-configured and trusted, but accidental output
-            # floods should still degrade to HashEmbed instead of exhausting
-            # agent memory.
+            if os.name != "nt":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except (OSError, ProcessLookupError):
+            pass
+
+    @staticmethod
+    def _frame(payload):
+        return (
+            str(len(payload)).encode("ascii") + b"\n" + payload
+        )
+
+    @staticmethod
+    def _read_frame(stream):
+        header = stream.readline()
+        if not header:
+            raise EOFError("embedding server closed stdout")
+        try:
+            size = int(header.strip())
+        except ValueError:
+            raise ValueError("invalid embedding server frame length")
+        if size < 0 or size > CommandEmbed.MAX_OUTPUT_BYTES:
+            raise ValueError("embedding server frame exceeds limit")
+        payload = stream.read(size)
+        if len(payload) != size:
+            raise EOFError("truncated embedding server frame")
+        return payload
+
+    def _close_server(self):
+        proc = self._server_process
+        self._server_process = None
+        self._server_info = None
+        if proc is None:
+            return
+        self._terminate_process_group(proc)
+        try:
+            proc.wait(timeout=1)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def close(self):
+        self._close_server()
+
+    def __del__(self):
+        try:
+            self._close_server()
+        except Exception:
+            pass
+
+    def _server_exchange(self, request, timeout):
+        if not self.server_argv:
+            return None, (
+                self.server_configuration_error or
+                "embedding server disabled"), 0.0
+        started = time.perf_counter()
+        if self._server_process is None:
+            creationflags = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                if os.name == "nt" else 0
+            )
+            try:
+                self._server_process = subprocess.Popen(
+                    self.server_argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=(os.name != "nt"),
+                    creationflags=creationflags,
+                )
+            except OSError as exc:
+                return None, "server start failed: %s" % _display_text(
+                    exc, 120), 0.0
+        proc = self._server_process
+        try:
+            payload = json.dumps(
+                request, ensure_ascii=False,
+                separators=(",", ":")).encode("utf-8")
+            proc.stdin.write(self._frame(payload))
+            proc.stdin.flush()
+        except (OSError, ValueError) as exc:
+            self._close_server()
+            return None, "server write failed: %s" % _display_text(
+                exc, 120), (
+                    time.perf_counter() - started) * 1000
+        result_queue = queue.Queue(maxsize=1)
+
+        def read_response():
+            try:
+                result_queue.put((self._read_frame(proc.stdout), None))
+            except Exception as exc:
+                result_queue.put((None, exc))
+
+        reader = threading.Thread(target=read_response, daemon=True)
+        reader.start()
+        try:
+            response, error = result_queue.get(timeout=timeout)
+        except queue.Empty:
+            self._close_server()
+            return None, "server deadline exceeded", (
+                time.perf_counter() - started) * 1000
+        if error is not None:
+            self._close_server()
+            return None, "server read failed: %s" % _display_text(
+                error, 120), (
+                    time.perf_counter() - started) * 1000
+        try:
+            decoded = json.loads(response.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, RecursionError):
+            self._close_server()
+            return None, "invalid server JSON", (
+                time.perf_counter() - started) * 1000
+        return decoded, None, (
+            time.perf_counter() - started) * 1000
+
+    def _ensure_server_handshake(self):
+        if self._server_info is not None:
+            return self._server_info, None, 0.0
+        response, error, latency = self._server_exchange({
+            "protocol": "mind-embed-server-v1",
+            "op": "handshake",
+        }, self.budget)
+        if error is not None:
+            return None, error, latency
+        if not isinstance(response, dict) or response.get(
+                "protocol") != "mind-embed-server-v1":
+            self._close_server()
+            return None, "invalid server handshake", latency
+        dimension = response.get("dimension")
+        if not isinstance(dimension, int) or not (
+                1 <= dimension <= self.MAX_VECTOR_DIM):
+            self._close_server()
+            return None, "invalid server dimension", latency
+        self._server_info = {
+            "model_id": _display_text(
+                response.get("model_id", "unknown"), 120),
+            "revision": _display_text(
+                response.get("revision", "unknown"), 120),
+            "dimension": dimension,
+        }
+        return self._server_info, None, latency
+
+    def _server_embeddings(self, texts):
+        info, error, handshake_latency = self._ensure_server_handshake()
+        if error is not None:
+            return None, None, error, handshake_latency
+        response, error, latency = self._server_exchange({
+            "protocol": "mind-embed-server-v1",
+            "op": "embed",
+            "texts": texts,
+        }, self.budget)
+        if error is not None:
+            return None, info, error, handshake_latency + latency
+        vectors = (
+            response.get("vectors") if isinstance(response, dict)
+            else None)
+        encoded = json.dumps({"vectors": vectors}).encode("utf-8")
+        parsed, _, parse_error = self._parse_batch(
+            encoded, len(texts))
+        if parsed is not None and any(
+                len(vector) != info["dimension"] for vector in parsed):
+            parsed, parse_error = None, "server dimension changed"
+        return (
+            parsed, info, parse_error,
+            handshake_latency + latency)
+
+    def _run_payload(self, payload, timeout):
+        if not self.argv:
+            return None, self.configuration_error or "backend disabled", 0.0
+        started = time.perf_counter()
+        creationflags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            if os.name == "nt" else 0
+        )
+        try:
             with tempfile.TemporaryFile() as stdout:
-                proc = subprocess.run(
-                    argv,
-                    input=(text or "").encode("utf-8"),
+                proc = subprocess.Popen(
+                    self.argv,
+                    stdin=subprocess.PIPE,
                     stdout=stdout,
                     stderr=subprocess.DEVNULL,
-                    timeout=self.timeout,
-                    check=False,
+                    start_new_session=(os.name != "nt"),
+                    creationflags=creationflags,
                 )
+                try:
+                    proc.communicate(input=payload, timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    self._terminate_process_group(proc)
+                    proc.wait()
+                    return None, "total deadline exceeded", (
+                        time.perf_counter() - started) * 1000
                 size = stdout.tell()
-                if proc.returncode != 0 or size > self.MAX_OUTPUT_BYTES:
-                    return None
+                if proc.returncode != 0:
+                    return None, "backend exited %d" % proc.returncode, (
+                        time.perf_counter() - started) * 1000
+                if size > self.MAX_OUTPUT_BYTES:
+                    return None, "backend output exceeded limit", (
+                        time.perf_counter() - started) * 1000
                 stdout.seek(0)
-                payload = stdout.read(self.MAX_OUTPUT_BYTES + 1)
-        except (OSError, subprocess.SubprocessError):
+                result = stdout.read(self.MAX_OUTPUT_BYTES + 1)
+                return result, None, (
+                    time.perf_counter() - started) * 1000
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, "backend error: %s" % _display_text(exc, 120), (
+                time.perf_counter() - started) * 1000
+
+    def _command_embed(self, text):
+        if not self.argv:
+            return None
+        payload, error, _ = self._run_payload(
+            (text or "").encode("utf-8"), self.timeout)
+        if error is not None:
             return None
         return self._parse_vector(payload)
+
+    def _parse_batch(self, payload, expected):
+        try:
+            data = json.loads(payload.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, RecursionError):
+            return None, None, "invalid batch response"
+        model = None
+        if isinstance(data, dict):
+            if data.get("protocol") not in (None, "mind-embed-v1"):
+                return None, None, "unsupported batch protocol"
+            model = data.get("model")
+            vectors = data.get("vectors")
+        else:
+            vectors = data
+        if not isinstance(vectors, list) or len(vectors) != expected:
+            return None, None, "partial batch response"
+        clean = []
+        dimension = None
+        for raw in vectors:
+            if not isinstance(raw, list):
+                return None, None, "invalid vector in batch"
+            try:
+                vec = [float(value) for value in raw]
+            except (TypeError, ValueError, OverflowError):
+                return None, None, "invalid vector in batch"
+            vec = self._valid_vector(vec)
+            if vec is None:
+                return None, None, "invalid vector in batch"
+            if dimension is None:
+                dimension = len(vec)
+            if len(vec) != dimension:
+                return None, None, "inconsistent vector dimensions"
+            clean.append(vec)
+        return clean, (
+            _display_text(model, 120) if isinstance(model, str) else None
+        ), None
+
+    @staticmethod
+    def _cosine(va, vb):
+        dot = sum(x * y for x, y in zip(va, vb))
+        na = math.sqrt(sum(x * x for x in va)) or 1.0
+        nb = math.sqrt(sum(y * y for y in vb)) or 1.0
+        return max(0.0, dot / (na * nb))
+
+    def similarities(self, query, candidates):
+        """Return one metric for the whole ranking, never per-item fallback."""
+        candidates = list(candidates)
+        if not candidates:
+            return []
+        texts = [query] + candidates
+        if self.server_argv:
+            vectors, info, error, latency = self._server_embeddings(texts)
+            if vectors is not None:
+                query_vector = vectors[0]
+                self.last_report = {
+                    "backend": "server",
+                    "model": "%s@%s" % (
+                        info["model_id"], info["revision"]),
+                    "calls": 1,
+                    "latency_ms": latency,
+                    "fallback": False,
+                    "reason": None,
+                }
+                return [
+                    self._cosine(query_vector, candidate)
+                    for candidate in vectors[1:]
+                ]
+            self.last_report = {
+                "backend": "offline",
+                "model": None,
+                "calls": 1,
+                "latency_ms": latency,
+                "fallback": True,
+                "reason": error or "embedding server failed",
+            }
+            return [
+                self.fallback.similarity(query, text)
+                for text in candidates]
+        if not self.argv:
+            reason = self.configuration_error
+            self.last_report = {
+                "backend": "offline", "model": None, "calls": 0,
+                "latency_ms": 0.0, "fallback": bool(self.cmd),
+                "reason": reason,
+            }
+            return [self.fallback.similarity(query, text)
+                    for text in candidates]
+        request = json.dumps(
+            {"protocol": "mind-embed-v1", "texts": texts},
+            ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        payload, error, latency = self._run_payload(request, self.budget)
+        vectors, model, parse_error = (
+            self._parse_batch(payload, len(texts))
+            if payload is not None else (None, None, None)
+        )
+        reason = error or parse_error
+        if vectors is None:
+            self.last_report = {
+                "backend": "offline", "model": None, "calls": 1,
+                "latency_ms": latency, "fallback": True,
+                "reason": reason or "batch backend failed",
+            }
+            return [self.fallback.similarity(query, text)
+                    for text in candidates]
+        query_vector = vectors[0]
+        self.last_report = {
+            "backend": "command", "model": model, "calls": 1,
+            "latency_ms": latency, "fallback": False, "reason": None,
+        }
+        return [
+            self._cosine(query_vector, candidate)
+            for candidate in vectors[1:]
+        ]
 
     def _embed_with_source(self, text):
         text = text or ""
@@ -1196,8 +1798,13 @@ class CommandEmbed:
         else:
             source = "command"
             retry_at = float("inf")
-        if text in self._cache or len(self._cache) < 4096:
+        vector_bytes = len(vec) * 32
+        if text in self._cache:
             self._cache[text] = (source, vec, retry_at)
+        elif (len(self._cache) < 4096 and
+              self._cache_bytes + vector_bytes <= self.MAX_CACHE_BYTES):
+            self._cache[text] = (source, vec, retry_at)
+            self._cache_bytes += vector_bytes
         return source, vec
 
     def embed(self, text):
@@ -1214,10 +1821,7 @@ class CommandEmbed:
             or len(va) != len(vb)
         ):
             return self.fallback.similarity(a, b)
-        dot = sum(x * y for x, y in zip(va, vb))
-        na = math.sqrt(sum(x * x for x in va)) or 1.0
-        nb = math.sqrt(sum(y * y for y in vb)) or 1.0
-        return max(0.0, dot / (na * nb))
+        return self._cosine(va, vb)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -1236,22 +1840,11 @@ class Hippocampus:
         self.meta = {}    # small persisted strings (e.g. last_edge_decay)
         self.related = None
         self.embedder = HashEmbed()
-        self.reranker = CommandEmbed(fallback=self.embedder)
+        self.reranker = CommandEmbed(
+            fallback=self.embedder, project_root=self.path.parent.parent)
+        self.last_recall_explain = {}
         self._thread_lock = threading.RLock()
         self._transaction_state = threading.local()
-        self._deleted = set()
-        self._loaded_state_digest = None
-        # Mutation markers avoid hashing the whole graph on normal writes.
-        # Direct embedders that edit in-memory state without a marker are
-        # still detected by the state digest at transaction entry.
-        self._decayed = {}
-        self._bumped = {}
-        self._conf_raised = {}
-        self._dirty = set()
-        self._pruned_edges = set()
-        self._edge_updates = set()
-        self._edge_bumps = Counter()
-        self._last_edge_pruned = 0
         self._load()
 
     # -- persistence -------------------------------------------------
@@ -1400,6 +1993,30 @@ class Hippocampus:
             n["valid_from"] = self._iso_timestamp(
                 n.get("valid_from"), n["created"])
             n["valid_to"] = self._iso_timestamp(n.get("valid_to"), None)
+            memory_type = n.get("type", "semantic")
+            n["type"] = (
+                memory_type if memory_type in MEMORY_TYPES
+                else "semantic")
+            scope = n.get("scope", "project")
+            n["scope"] = (
+                scope if scope in MEMORY_SCOPES else "project")
+            source_trust = n.get("source_trust", "user")
+            n["source_trust"] = (
+                source_trust if source_trust in MEMORY_TRUST else "user")
+            sensitivity = n.get("sensitivity", "internal")
+            n["sensitivity"] = (
+                sensitivity if sensitivity in MEMORY_SENSITIVITY
+                else "internal")
+            n["authority"] = self._metadata_text(
+                n.get("authority"), n["origin"]["by"], 80)
+            n["expires_at"] = self._iso_timestamp(
+                n.get("expires_at"), None)
+            n["pinned"] = bool(n.get("pinned", False))
+            for field in ("entity", "attr"):
+                value = n.get(field)
+                n[field] = (
+                    self._metadata_text(value, None, 120)
+                    if value is not None else None)
             if not (n.get("superseded_by") is None or
                     isinstance(n.get("superseded_by"), str)):
                 n.pop("superseded_by", None)
@@ -1440,6 +2057,29 @@ class Hippocampus:
                 e["weight"] = self._finite(e.get("weight", 1.0), 1.0, 0.0, 1.0)
                 e["relation"] = self._metadata_text(
                     e.get("relation"), "related", 60)
+                e["directed"] = bool(e.get("directed", False))
+                if e["directed"]:
+                    e["inverse_relation"] = self._metadata_text(
+                        e.get("inverse_relation"), "related", 60)
+                else:
+                    e.pop("inverse_relation", None)
+                if e["relation"] == "possible-conflict":
+                    kind = e.get("conflict_kind", "legacy")
+                    e["conflict_kind"] = (
+                        kind if kind in ("slot", "lexical", "legacy")
+                        else "legacy")
+                    if e["conflict_kind"] == "slot":
+                        e["conflict_entity"] = self._metadata_text(
+                            e.get("conflict_entity"), None, 120)
+                        e["conflict_attr"] = self._metadata_text(
+                            e.get("conflict_attr"), None, 120)
+                    else:
+                        e.pop("conflict_entity", None)
+                        e.pop("conflict_attr", None)
+                else:
+                    e.pop("conflict_kind", None)
+                    e.pop("conflict_entity", None)
+                    e.pop("conflict_attr", None)
                 if "created" in e:
                     created = self._iso_timestamp(e.get("created"), None)
                     if created is None:
@@ -1457,7 +2097,6 @@ class Hippocampus:
             self.nodes = {}
             self.edges = {}
             self.meta = {}
-            self._snapshot_view()
             return
         try:
             data = json.loads(_read_text_retry(
@@ -1501,26 +2140,6 @@ class Hippocampus:
         today = str(_now().date())
         if self.meta.get("last_edge_decay", "") > today:
             self.meta["last_edge_decay"] = today
-        self._snapshot_view()
-
-    def _snapshot_view(self):
-        """Record the exact semantic state last read from or written to disk."""
-        self._loaded_state_digest = self._state_digest()
-
-    def _state_digest(self):
-        payload = json.dumps(
-            {"nodes": self.nodes, "edges": self.edges, "meta": self.meta},
-            ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    def _has_local_changes(self):
-        trackers = (
-            self._deleted, self._decayed, self._bumped, self._conf_raised,
-            self._dirty, self._pruned_edges, self._edge_updates,
-            self._edge_bumps,
-        )
-        return any(trackers) or \
-            self._loaded_state_digest != self._state_digest()
 
     @contextmanager
     def _graph_lock(self):
@@ -1628,7 +2247,7 @@ class Hippocampus:
         return bool(getattr(self._transaction_state, "depth", 0))
 
     @contextmanager
-    def _transaction(self):
+    def _transaction(self, preserve_local=False):
         """Run one semantic operation from a fresh snapshot to one commit."""
         with self._thread_lock:
             state = self._transaction_state
@@ -1647,19 +2266,18 @@ class Hippocampus:
                 state.signals = []
                 state.prunes = []
                 try:
-                    # Tests and embedders may deliberately mutate the loaded
-                    # graph before invoking a method. Preserve those explicit
-                    # local decisions; ordinary stale objects always reload.
-                    if not self._has_local_changes():
+                    # Public operations always decide from the newest disk
+                    # state while holding the graph lock. The only supported
+                    # local-edit path is an explicit direct `_save()`, which
+                    # opts into preserving the caller's in-memory graph.
+                    if not preserve_local:
                         self._load()
                         self.related = None
                     self._recover_prune_outbox()
                     yield
                     self._flush_transaction()
-                    for op, fields in state.journal:
-                        self._journal_immediate(op, **fields)
-                    for kind, content in state.signals:
-                        self._log_signal_immediate(kind, content)
+                    self._journal_batch_immediate(state.journal)
+                    self._log_signals_immediate(state.signals)
                 except BaseException:
                     # Do not let a failed operation poison reuse of this
                     # object with an uncommitted in-memory graph.
@@ -1688,16 +2306,6 @@ class Hippocampus:
         self._recover_prune_outbox()
         state.save_requested = False
 
-    def _clear_trackers(self):
-        self._deleted.clear()
-        self._pruned_edges.clear()
-        self._dirty.clear()
-        self._bumped.clear()
-        self._decayed.clear()
-        self._conf_raised.clear()
-        self._edge_updates.clear()
-        self._edge_bumps.clear()
-
     def _commit_current(self):
         """Persist the transaction's already-fresh graph exactly once."""
         if len(self.nodes) > MAX_NODES:
@@ -1712,14 +2320,17 @@ class Hippocampus:
                     len(history) > MAX_HISTORY_PER_NODE:
                 del history[:-MAX_HISTORY_PER_NODE]
         serialized = json.dumps(
-            {"nodes": self.nodes, "edges": self.edges, "meta": self.meta},
+            {
+                "format": 2,
+                "nodes": self.nodes,
+                "edges": self.edges,
+                "meta": self.meta,
+            },
             ensure_ascii=False, indent=2)
         if len(serialized.encode("utf-8")) > MAX_GRAPH_BYTES:
             raise FileLimitError("graph exceeds the %d-byte limit"
                                  % MAX_GRAPH_BYTES)
         _atomic_write(self.path, serialized, boundary=self.path.parent)
-        self._clear_trackers()
-        self._snapshot_view()
 
     def _save(self):
         """Request the transaction's single graph commit.
@@ -1730,7 +2341,7 @@ class Hippocampus:
         if self._transaction_active():
             self._transaction_state.save_requested = True
             return
-        with self._transaction():
+        with self._transaction(preserve_local=True):
             self._transaction_state.save_requested = True
 
     def decay_edges(self, dry_run=False):
@@ -1760,7 +2371,6 @@ class Hippocampus:
             if not self.edges[a]:
                 del self.edges[a]
         self.meta["last_edge_decay"] = today
-        self._last_edge_pruned = pruned
         self._save()
         return pruned
 
@@ -1768,7 +2378,7 @@ class Hippocampus:
     def _id(text):
         # content addressing only — no security property is derived from
         # the hash; md5[:12] keeps existing graphs' node ids stable
-        return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+        return _content_md5(text.encode("utf-8")).hexdigest()[:12]
 
     # -- key extraction ----------------------------------------------
     def _ensure_related(self):
@@ -1847,7 +2457,8 @@ class Hippocampus:
             facets = _facet_keys(text_tokens)
             for k in (facets or sorted(IDENTITY_KEYS)):
                 keys.setdefault(k)
-        self._ensure_related()
+        if is_query:
+            self._ensure_related()
         if is_query and self.related is not None:
             for w in list(keys):
                 # expand RARE terms only: a term already frequent in the
@@ -1906,11 +2517,79 @@ class Hippocampus:
         return cleaned
 
     # -- write path ---------------------------------------------------
-    def remember(self, text, confidence=1.0):
+    def remember(self, text, confidence=1.0, metadata=None):
         with self._transaction():
-            return self._remember(text, confidence)
+            return self._remember(text, confidence, metadata)
 
-    def _remember(self, text, confidence=1.0):
+    def remember_many(self, records):
+        """Store many facts with one lock, graph commit, and durable batch."""
+        records = list(records)
+        if not records:
+            return []
+        if len(records) > MAX_NODES:
+            raise FileLimitError("batch exceeds %d records" % MAX_NODES)
+        node_ids = []
+        with self._transaction():
+            for record in records:
+                if isinstance(record, str):
+                    text, confidence = record, 1.0
+                elif isinstance(record, dict):
+                    text = record.get("text")
+                    confidence = record.get("confidence", 1.0)
+                    metadata = {
+                        key: record[key] for key in (
+                            "type", "scope", "authority", "source_trust",
+                            "sensitivity", "expires_at", "pinned",
+                            "entity", "attr")
+                        if key in record
+                    }
+                else:
+                    raise ValueError(
+                        "batch records must be strings or objects")
+                node_ids.append(self._remember(
+                    text, confidence,
+                    metadata if isinstance(record, dict) else None))
+        return node_ids
+
+    @classmethod
+    def _memory_metadata(cls, metadata, by):
+        metadata = metadata if isinstance(metadata, dict) else {}
+        memory_type = metadata.get("type", "semantic")
+        if memory_type not in MEMORY_TYPES:
+            raise ValueError("invalid memory type: %s" % memory_type)
+        scope = metadata.get("scope", "project")
+        if scope not in MEMORY_SCOPES:
+            raise ValueError("invalid memory scope: %s" % scope)
+        trust = metadata.get("source_trust", "user")
+        if trust not in MEMORY_TRUST:
+            raise ValueError("invalid source trust: %s" % trust)
+        sensitivity = metadata.get("sensitivity", "internal")
+        if sensitivity not in MEMORY_SENSITIVITY:
+            raise ValueError(
+                "invalid sensitivity: %s" % sensitivity)
+        expires = metadata.get("expires_at")
+        if expires is not None:
+            expires = cls._iso_timestamp(expires, None)
+            if expires is None:
+                raise ValueError("expires_at must be an ISO timestamp")
+        return {
+            "type": memory_type,
+            "scope": scope,
+            "authority": cls._metadata_text(
+                metadata.get("authority"), by, 80),
+            "source_trust": trust,
+            "sensitivity": sensitivity,
+            "expires_at": expires,
+            "pinned": bool(metadata.get("pinned", False)),
+            "entity": cls._metadata_text(
+                metadata.get("entity"), None, 120)
+            if metadata.get("entity") is not None else None,
+            "attr": cls._metadata_text(
+                metadata.get("attr"), None, 120)
+            if metadata.get("attr") is not None else None,
+        }
+
+    def _remember(self, text, confidence=1.0, metadata=None):
         text = self._validated_text(text)
         confidence = self._finite(confidence, 1.0, 0.0, 1.0)
         nid = self._id(text)
@@ -1918,23 +2597,17 @@ class Hippocampus:
         is_new = nid not in self.nodes
         if nid in self.nodes:
             n = self.nodes[nid]
-            # the SAME boost the merge replays as a delta: the reopen
-            # (_dirty) path used to persist +0.2 while the plain path's
-            # replay persisted +0.15 — one action, two persisted boosts
-            # (auditor finding, 6.2.9)
+            # Reopening and ordinary duplicate reinforcement use the same
+            # constant, so one action has one persisted meaning.
             n["weight"] = min(1.0, n["weight"] + BOOST_PER_ACCESS)
             n["peak_weight"] = max(n.get("peak_weight", 1.0), n["weight"])
             n["access_count"] = n.get("access_count", 0) + 1
             n["last_accessed"] = now
             old_confidence = n.get("confidence", 1.0)
             n["confidence"] = max(old_confidence, confidence)
-            self._bumped[nid] = self._bumped.get(nid, 0) + 1
-            if n["confidence"] != old_confidence:
-                # field-level merge, NOT _dirty: dirty whole-copies this
-                # session's stale counters over a concurrent confirm
-                # (auditor finding, 6.2.9 — reproduced: B confirms while A
-                # re-remembers with higher confidence; B's increment died)
-                self._conf_raised[nid] = n["confidence"]
+            if metadata:
+                by = n.get("origin", {}).get("by", "agent")
+                n.update(self._memory_metadata(metadata, by))
             # a re-remembered superseded fact is an explicit re-assertion:
             # the user says it IS true again — reopen a NEW validity
             # segment starting now (the closed segment stays queryable in
@@ -1945,9 +2618,9 @@ class Hippocampus:
                 n.pop("superseded_by", None)
                 self._clear_supersession_edges(nid)
                 n["valid_from"] = now
-                self._dirty.add(nid)
         else:
             by, session = self._actor()
+            typed = self._memory_metadata(metadata, by)
             self.nodes[nid] = {
                 "text": text,
                 "weight": 1.0,
@@ -1963,15 +2636,24 @@ class Hippocampus:
                 "origin": {"by": by, "session": session, "via": "remember"},
                 "valid_from": now,
                 "valid_to": None,
+                **typed,
             }
             self.edges.setdefault(nid, {})
-            self._dirty.add(nid)
             self.related = None    # rebuild lazily; avoids O(N^2) per write
         self._save()
         # journal AFTER the save: the provenance log records only facts
         # that actually landed on disk
         if is_new:
-            self._journal("remember", id=nid, text=text)
+            node = self.nodes[nid]
+            self._journal(
+                "remember", id=nid, text=text,
+                type=node.get("type"), scope=node.get("scope"),
+                authority=node.get("authority"),
+                source_trust=node.get("source_trust"),
+                sensitivity=node.get("sensitivity"),
+                expires_at=node.get("expires_at"),
+                pinned=node.get("pinned", False),
+                entity=node.get("entity"), attr=node.get("attr"))
         else:
             self._journal("remember", id=nid, dup=True)
         self._log_signal("remember", text)
@@ -1987,6 +2669,8 @@ class Hippocampus:
         if not isinstance(relation, str):
             raise ValueError("relation must be a string")
         relation = " ".join(self._clean_text(relation).split())[:60] or "related"
+        inverse = DIRECTED_RELATIONS.get(relation)
+        directed = inverse is not None
         # hash the CLEANED text, exactly as remember() does, so the edge is
         # stored under the same id the node gets — otherwise the edge points
         # at a phantom id and is dropped on next load (auditor finding)
@@ -2008,16 +2692,111 @@ class Hippocampus:
         # without pretending they were recalled/confirmed.
         for nid in (id_a, id_b):
             self.nodes[nid]["last_accessed"] = now
-            self._dirty.add(nid)
-        self.edges.setdefault(id_a, {})[id_b] = {"relation": relation,
-                                                 "weight": 1.0, "created": now}
-        self.edges.setdefault(id_b, {})[id_a] = {"relation": relation,
-                                                 "weight": 1.0, "created": now}
-        self._edge_updates.update(((id_a, id_b), (id_b, id_a)))
+        forward = {
+            "relation": relation,
+            "weight": 1.0,
+            "created": now,
+            "directed": directed,
+        }
+        reverse = {
+            "relation": inverse if directed else relation,
+            "weight": 1.0,
+            "created": now,
+            "directed": directed,
+        }
+        if directed:
+            forward["inverse_relation"] = inverse
+            reverse["inverse_relation"] = relation
+        self.edges.setdefault(id_a, {})[id_b] = forward
+        self.edges.setdefault(id_b, {})[id_a] = reverse
         self._save()
         self._journal("link", id=id_a, other=id_b, relation=relation)
         self._log_signal("link", "%s --%s--> %s" % (text_a, relation, text_b))
-        return "linked: %s <-> %s" % (text_a, text_b)
+        arrow = "->" if directed else "<->"
+        return "linked: %s %s %s" % (text_a, arrow, text_b)
+
+    def _resolve_node_ref(self, value):
+        if isinstance(value, str) and value in self.nodes:
+            return value
+        text = self._validated_text(value, "memory reference")
+        node_id = self._id(text)
+        return node_id if node_id in self.nodes else None
+
+    def forget(self, node_id, reason="user requested"):
+        with self._transaction():
+            if node_id not in self.nodes:
+                return False
+            node = self.nodes[node_id]
+            node["forgotten_at"] = _now().isoformat()
+            node["forgotten_reason"] = self._metadata_text(
+                reason, "user requested", 160)
+            self._save()
+            self._journal(
+                "forget", id=node_id,
+                reason=node["forgotten_reason"])
+            return True
+
+    def unlink(self, a, b):
+        with self._transaction():
+            left = self._resolve_node_ref(a)
+            right = self._resolve_node_ref(b)
+            if left is None or right is None:
+                return False
+            changed = False
+            if right in self.edges.get(left, {}):
+                del self.edges[left][right]
+                changed = True
+            if left in self.edges.get(right, {}):
+                del self.edges[right][left]
+                changed = True
+            for node_id in (left, right):
+                if node_id in self.edges and not self.edges[node_id]:
+                    del self.edges[node_id]
+            if changed:
+                self._save()
+                self._journal("unlink", id=left, other=right)
+            return changed
+
+    def _redact_node(self, node_id, replacement, reason, digest):
+        node = self.nodes.get(node_id)
+        if node is None:
+            return []
+        originals = [node.get("text", "")]
+        for entry in node.get("history", []):
+            if isinstance(entry, dict) and isinstance(
+                    entry.get("text"), str):
+                originals.append(entry["text"])
+                entry["text"] = replacement
+        node["text"] = replacement
+        node["keys"] = []
+        node["redacted"] = {
+            "digest": digest,
+            "reason": self._metadata_text(reason, "redacted", 160),
+            "at": _now().isoformat(),
+        }
+        self.related = None
+        self._save()
+        return [text for text in originals if text]
+
+    def _purge_node(self, node_id):
+        node = self.nodes.get(node_id)
+        if node is None:
+            return []
+        originals = [node.get("text", "")]
+        originals.extend(
+            entry.get("text", "")
+            for entry in node.get("history", [])
+            if isinstance(entry, dict)
+        )
+        del self.nodes[node_id]
+        self.edges.pop(node_id, None)
+        for source in list(self.edges):
+            self.edges[source].pop(node_id, None)
+            if not self.edges[source]:
+                del self.edges[source]
+        self.related = None
+        self._save()
+        return [text for text in originals if text]
 
     @staticmethod
     def _content_tokens(text):
@@ -2035,11 +2814,9 @@ class Hippocampus:
         for nbr, e in list(self.edges.get(nid, {}).items()):
             if e.get("relation") == "superseded-by":
                 del self.edges[nid][nbr]
-                self._pruned_edges.add((nid, nbr))
                 rev = self.edges.get(nbr, {})
                 if rev.get(nid, {}).get("relation") == "supersedes":
                     del rev[nid]
-                    self._pruned_edges.add((nbr, nid))
                     if not rev:
                         del self.edges[nbr]
         if nid in self.edges and not self.edges[nid]:
@@ -2139,26 +2916,21 @@ class Hippocampus:
                 continue
             if nbr not in self.edges.setdefault(new_nid, {}):
                 self.edges[new_nid][nbr] = dict(e)
-                self._edge_updates.add((new_nid, nbr))
             rev = self.edges.get(nbr, {}).get(nid)
             if rev is not None and rev.get("relation") not in (
                     "supersedes", "superseded-by"):
                 if new_nid not in self.edges.setdefault(nbr, {}):
                     self.edges[nbr][new_nid] = dict(rev)
-                    self._edge_updates.add((nbr, new_nid))
         # the explicit, timestamped state transition
         self.edges.setdefault(new_nid, {})[nid] = {
             "relation": "supersedes", "weight": 0.5, "created": now}
         self.edges.setdefault(nid, {})[new_nid] = {
             "relation": "superseded-by", "weight": 0.5, "created": now}
-        self._edge_updates.update(((new_nid, nid), (nid, new_nid)))
         # close the old fact explicitly; this preserves lineage but is not
         # a general rollback mechanism and is distinct from attention decay
         node["last_accessed"] = now
         node["valid_to"] = now
         node["superseded_by"] = new_nid
-        self._dirty.add(nid)
-        self._dirty.add(new_nid)
         self.related = None
         self._save()
         self._journal("correct", old_id=nid, new_id=new_nid,
@@ -2180,6 +2952,7 @@ class Hippocampus:
         (`why`, `entity`, `recall --at <date>`) but are never returned
         as current answers."""
         query = self._validated_query(query)
+        self.last_recall_explain = {}
         top_k = max(1, min(50, int(self._finite(top_k, RECALL_TOP_K, 1, 50))))
         max_hops = max(0, min(10, int(self._finite(
             max_hops, RECALL_RADIUS, 0, 10))))
@@ -2196,7 +2969,10 @@ class Hippocampus:
         identity_q = bool(q_tokens & PRONOUN_FALLBACK) and len(q_content) <= 1
         keys = set(self._extract_keys(query, is_query=True))
         if not keys:
-            return [], 0.0, {}
+            self.last_recall_explain = {
+                "query": query, "reason": "no indexable keys",
+                "results": {}}
+            return [], (time.perf_counter() - t0) * 1000, {}
         expanded = set(keys)
         if self.related is not None:
             for w in list(keys):
@@ -2246,6 +3022,9 @@ class Hippocampus:
                 if sim >= 0.25:
                     direct[nid] = sim * FUZZY_ACTIVATION * node.get("weight", 1.0)
         if not direct:
+            self.last_recall_explain = {
+                "query": query, "reason": "no matching activation",
+                "results": {}}
             return [], (time.perf_counter() - t0) * 1000, {}
 
         # spreading channel: propagate activation over edges
@@ -2275,6 +3054,7 @@ class Hippocampus:
         for nid in set(direct) | set(spread):
             fused[nid] = (1.0 / (rrf_k + dr.get(nid, dr_default)) +
                           1.0 / (rrf_k + sr.get(nid, sr_default)))
+        fused_before_semantic = dict(fused)
 
         # lexical-semantic re-rank of the head (offline hash embeddings).
         # Defense in depth: activation can only reach ids absent from
@@ -2288,11 +3068,18 @@ class Hippocampus:
         # (auditor finding)
         if len(ranked) > 1 and not identity_q:
             reranked = []
-            for nid, base in ranked[:top_k * 3]:
-                sim = self.reranker.similarity(query, self.nodes[nid]["text"])
+            head = ranked[:top_k * 3]
+            similarities = self.reranker.similarities(
+                query, [self.nodes[nid]["text"] for nid, _ in head])
+            semantic_scores = dict(
+                (nid, similarity)
+                for (nid, _), similarity in zip(head, similarities))
+            for (nid, base), sim in zip(head, similarities):
                 reranked.append((nid, base * (1.0 + sim)))
             reranked.sort(key=lambda x: (-x[1], x[0]))
             ranked = reranked
+        else:
+            semantic_scores = {}
 
         # pattern separation: drop near-duplicate results from the head so
         # top-k answers cover distinct memories, not one memory five ways.
@@ -2312,6 +3099,23 @@ class Hippocampus:
         results = [(nid, score, self.nodes[nid]) for nid, score in selected]
         kinds = {nid: ("direct" if nid in direct else "trace")
                  for nid, _, _ in results}
+        self.last_recall_explain = {
+            "query": query,
+            "backend": dict(self.reranker.last_report),
+            "results": {
+                nid: {
+                    "direct": direct.get(nid, 0.0),
+                    "spread": spread.get(nid, 0.0),
+                    "fused": fused_before_semantic.get(nid, 0.0),
+                    "semantic": semantic_scores.get(nid),
+                    "final": score,
+                    "kind": kinds[nid],
+                    "valid_from": self.nodes[nid].get("valid_from"),
+                    "valid_to": self.nodes[nid].get("valid_to"),
+                }
+                for nid, score, _ in results
+            },
+        }
         return results, (time.perf_counter() - t0) * 1000, kinds
 
     def bump(self, node_ids):
@@ -2336,12 +3140,9 @@ class Hippocampus:
                 n["last_accessed"] = now.isoformat()
                 for nbr, e in self.edges.get(nid, {}).items():
                     e["weight"] = min(1.0, e.get("weight", 1.0) + EDGE_BOOST)
-                    self._edge_bumps[(nid, nbr)] += 1
                     rev = self.edges.get(nbr, {}).get(nid)
                     if rev is not None:
                         rev["weight"] = e["weight"]
-                        self._edge_bumps[(nbr, nid)] += 1
-                self._bumped[nid] = self._bumped.get(nid, 0) + 1
                 changed = True
         if changed:
             self._save()
@@ -2366,6 +3167,8 @@ class Hippocampus:
         pruned = []
         for nid in list(self.nodes.keys()):
             n = self.nodes[nid]
+            if n.get("pinned"):
+                continue
             # superseded facts are CLOSED states, not competing memories:
             # they don't decay against the living, and once their closure
             # ages past the grace window they archive regardless of
@@ -2393,14 +3196,21 @@ class Hippocampus:
             # weight unboundedly and permanently. Treat future as fresh.
             days = max(0, days)
             access = n.get("access_count", 0)
-            stability = STABILITY_BASE_DAYS + access * STABILITY_PER_ACCESS
+            type_factor = {
+                "semantic": 1.0,
+                "episodic": 0.75,
+                "procedural": 1.5,
+                "decision": 2.0,
+            }.get(n.get("type"), 1.0)
+            stability = (
+                STABILITY_BASE_DAYS + access * STABILITY_PER_ACCESS
+            ) * type_factor
             retention = math.exp(-days / stability)
             # clamp to [0,1] like every other weight-mutating path (auditor
             # finding: decay was the only one without an upper clamp)
             new_weight = max(0.0, min(1.0, n.get("peak_weight", 1.0) * retention))
             if not dry_run:
                 n["weight"] = new_weight
-                self._decayed[nid] = new_weight
             if new_weight < WEIGHT_THRESHOLD and access < 2 and days > GRACE_DAYS:
                 pruned.append((nid, n["text"]))
         bounded = []
@@ -2419,7 +3229,6 @@ class Hippocampus:
             if self._archive_preflight():
                 for nid, _ in pruned:
                     del self.nodes[nid]
-                    self._deleted.add(nid)
                     self.edges.pop(nid, None)
                     for other in self.edges.values():
                         other.pop(nid, None)
@@ -2443,9 +3252,36 @@ class Hippocampus:
                 info = os.lstat(str(arch))
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     return False
+                if not os.access(str(arch), os.W_OK):
+                    return False
             return True
         except OSError:
             return False
+
+    def _rotate_archive(self, arch, when):
+        """Move the active archive aside in O(1), retaining monthly names."""
+        month = when[:7] if isinstance(when, str) and re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}", when) else str(_now().date())[:7]
+        for index in range(1_000_000):
+            suffix = "" if index == 0 else "-%03d" % index
+            target = arch.with_name("archive-%s%s.md" % (month, suffix))
+            if target.exists() or target.is_symlink():
+                continue
+            _reject_symlinked_parents(target, self.path.parent)
+            os.replace(str(arch), str(target))
+            if os.name != "nt":
+                try:
+                    dfd = os.open(
+                        str(self.path.parent),
+                        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                    try:
+                        os.fsync(dfd)
+                    finally:
+                        os.close(dfd)
+                except OSError:
+                    pass
+            return target
+        raise OSError("could not allocate an archive segment name")
 
     def _queue_prune(self, pruned, now):
         state = self._transaction_state
@@ -2633,10 +3469,10 @@ class Hippocampus:
         marker = "<!-- mind-prune:%s -->" % tx if tx else None
         if marker and arch.exists():
             try:
-                if marker in _read_text_retry(
-                        arch, boundary=self.path.parent):
+                if marker in _read_tail_text(
+                        arch, RECEIPT_TAIL_BYTES, self.path.parent):
                     return True
-            except (OSError, UnicodeError):
+            except (OSError, UnicodeError, ValueError):
                 return False
         lines = ["\n## forgotten on %s\n" % when]
         lines += ["- %s" % t for t in texts]
@@ -2644,19 +3480,46 @@ class Hippocampus:
             lines.append(marker)
         header = "" if arch.exists() else \
             "# mind archive — memories pruned by decay (restore with `remember`)\n"
+        payload = (header + "\n".join(lines) + "\n").encode("utf-8")
+        try:
+            if arch.exists() and (
+                    os.lstat(str(arch)).st_size + len(payload)
+                    > ARCHIVE_ROTATE_BYTES):
+                self._rotate_archive(arch, when)
+                header = (
+                    "# mind archive — memories pruned by decay "
+                    "(restore with `remember`)\n"
+                )
+                payload = (header + "\n".join(lines) + "\n").encode("utf-8")
+        except (OSError, ValueError):
+            return False
         # APPEND, don't rewrite: the archive only grows, and rewriting the
         # whole file per prune batch is O(archive) forever (auditor
         # finding). Same trust-boundary checks as every other write.
         try:
             _append_regular(
-                arch, (header + "\n".join(lines) + "\n").encode("utf-8"),
+                arch, payload,
                 boundary=self.path.parent, durable=True)
         except (OSError, ValueError):
             return False
         return True
 
     def _journal_has_prune(self, tx):
-        for event in self.journal_entries():
+        path = self.path.parent / JOURNAL_FILE
+        if not path.exists() or path.is_symlink():
+            return False
+        try:
+            tail = _read_tail_text(
+                path, RECEIPT_TAIL_BYTES, self.path.parent)
+        except (OSError, ValueError, UnicodeError):
+            return False
+        for line in reversed(tail.splitlines()):
+            if tx not in line:
+                continue
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, RecursionError):
+                continue
             if event.get("op") == "prune" and event.get("tx") == tx:
                 return True
         return False
@@ -2668,20 +3531,34 @@ class Hippocampus:
         self._log_signal_immediate(kind, content)
 
     def _log_signal_immediate(self, kind, content):
+        self._log_signals_immediate([(kind, content)])
+
+    def _log_signals_immediate(self, records):
+        if not records:
+            return
         # same O_NOFOLLOW discipline as every other write path: the
         # is_symlink() check alone is TOCTOU-raceable (auditor finding,
         # 6.2.1 — this was the one append still using a plain open())
         sig_file = self.path.parent / SIGNALS_FILE
         if sig_file.is_symlink():
             return
-        try:
-            _append_regular(sig_file, (json.dumps(
+        payload = "".join(
+            json.dumps(
                 {"kind": kind, "content": content,
                  "ts": _now().isoformat()},
-                ensure_ascii=False) + "\n").encode("utf-8"),
-                boundary=self.path.parent)
+                ensure_ascii=False) + "\n"
+            for kind, content in records
+        ).encode("utf-8")
+        try:
+            _append_regular(
+                sig_file, payload, boundary=self.path.parent)
         except (OSError, ValueError):
             pass    # telemetry only — never block the write it rode on
+        try:
+            _scheduler_note_signals(self.path.parent, len(records))
+        except (OSError, ValueError):
+            print("warning: automatic-maintenance scheduler could not "
+                  "record a write signal.", file=sys.stderr)
 
     # -- provenance -----------------------------------------------------
     @classmethod
@@ -2707,6 +3584,11 @@ class Hippocampus:
         return self._journal_immediate(op, **fields)
 
     def _journal_immediate(self, op, **fields):
+        return self._journal_batch_immediate([(op, fields)])
+
+    def _journal_batch_immediate(self, records):
+        if not records:
+            return True
         jf = self.path.parent / JOURNAL_FILE
         # same trust boundary as every other write: a symlinked journal
         # OR a symlinked .mind root must never leak a file outside the
@@ -2722,17 +3604,35 @@ class Hippocampus:
                   "provenance entry.", file=sys.stderr)
             return False
         by, session = self._actor()
-        entry = {"ts": _now().isoformat(), "op": op, "by": by}
-        if session:
-            entry["session"] = session
-        entry.update(fields)
+        timestamp = _now().isoformat()
+        entries = []
+        for op, fields in records:
+            entry = {
+                "format": 2,
+                "ts": timestamp,
+                "ts_utc_ns": _utc_ns(),
+                "op": op,
+                "by": by,
+            }
+            if session:
+                entry["session"] = session
+            entry.update(fields)
+            identity_payload = json.dumps(
+                entry, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"))
+            entry["event_id"] = hashlib.sha256(
+                identity_payload.encode("utf-8")).hexdigest()[:24]
+            entries.append(entry)
+        payload = "".join(
+            json.dumps(entry, ensure_ascii=False) + "\n"
+            for entry in entries
+        ).encode("utf-8")
         try:
             # single O_APPEND os.write: concurrent writers cannot
             # interleave a line on a local filesystem (auditor finding:
             # the provenance log was the one unlocked write path)
             _append_regular(
-                jf, (json.dumps(entry, ensure_ascii=False)
-                     + "\n").encode("utf-8"),
+                jf, payload,
                 boundary=self.path.parent, durable=True)
             return True
         except (OSError, ValueError) as e:
@@ -2749,67 +3649,86 @@ class Hippocampus:
         return isinstance(ids, list) and node_id in ids
 
     def journal_entries(self, node_id=None, tail_bytes=10_000_000):
-        """Read the provenance log, optionally filtered to one node.
-        Targeted provenance scans up to the latest 100 MB incrementally and
-        retains at most 10,000 matching events. Unfiltered status reads stay
-        tail-capped to avoid loading an ever-growing journal into memory."""
+        """Read current and segmented provenance as one logical journal."""
         if node_id is not None:
             if not isinstance(node_id, str) or len(node_id) > 128:
                 return JournalEntries()
-        jf = self.path.parent / JOURNAL_FILE
-        if not jf.exists() or jf.is_symlink():
+        paths = []
+        segment_dir = self.path.parent / JOURNAL_DIR
+        if segment_dir.is_dir() and not segment_dir.is_symlink():
+            paths.extend(
+                path for path in sorted(segment_dir.glob("*.jsonl"))
+                if path.is_file() and not path.is_symlink())
+        current = self.path.parent / JOURNAL_FILE
+        if current.exists() and not current.is_symlink():
+            paths.append(current)
+        if not paths:
             return JournalEntries()
-        try:
-            fd = _open_regular(
-                jf, os.O_RDONLY, boundary=self.path.parent)
-        except (OSError, ValueError):
-            return JournalEntries()
-        with os.fdopen(fd, "rb") as f:
-            size = os.fstat(f.fileno()).st_size
-            if node_id is not None and size > MAX_JOURNAL_SCAN_BYTES:
-                f.seek(size - MAX_JOURNAL_SCAN_BYTES)
-                f.readline()
-                print("note: journal exceeds the targeted scan limit; "
-                      "reading the last 100 MB.", file=sys.stderr)
-            if node_id is None and size > tail_bytes:
-                f.seek(size - tail_bytes)
-                f.readline()
-                print("note: journal is %.1f MB; reading the last 10 MB."
-                      % (size / 1e6), file=sys.stderr)
-            out = deque(maxlen=MAX_JOURNAL_MATCHES)
-            total = 0
-            for raw in f:
+        if node_id is not None:
+            budget = MAX_JOURNAL_SCAN_BYTES
+            selected = []
+            for path in reversed(paths):
                 try:
-                    event = json.loads(raw.decode("utf-8", "replace"))
-                except (json.JSONDecodeError, UnicodeDecodeError,
-                        RecursionError):
+                    size = path.stat().st_size
+                except OSError:
                     continue
-                if not isinstance(event, dict):
-                    continue
-                op = event.get("op")
-                if not isinstance(op, str):
-                    continue
-                clean = {"op": _display_text(op, 40)}
-                for field in (
-                        "ts", "by", "session", "id", "old_id", "new_id",
-                        "other", "relation", "text", "old_text", "new_text",
-                        "tx"):
-                    value = event.get(field)
-                    if isinstance(value, str):
-                        clean[field] = _display_text(
-                            value, MAX_TEXT_CHARS if "text" in field else 160)
-                for field in ("ids", "texts"):
-                    value = event.get(field)
-                    if isinstance(value, list):
-                        clean[field] = [
-                            _display_text(v, MAX_TEXT_CHARS)
-                            for v in value if isinstance(v, str)
-                        ][:MAX_PRUNES_PER_CYCLE]
-                event = clean
-                if node_id is None or self._event_mentions(event, node_id):
-                    out.append(event)
-                    total += 1
-            return JournalEntries(out, total_count=total)
+                if selected and size > budget:
+                    break
+                selected.append(path)
+                budget -= min(size, budget)
+                if budget <= 0:
+                    break
+            paths = list(reversed(selected))
+        out = deque(maxlen=MAX_JOURNAL_MATCHES)
+        total = 0
+        for path in paths:
+            try:
+                fd = _open_regular(
+                    path, os.O_RDONLY, boundary=self.path.parent)
+            except (OSError, ValueError):
+                continue
+            with os.fdopen(fd, "rb") as handle:
+                size = os.fstat(handle.fileno()).st_size
+                if node_id is not None and len(paths) == 1 and \
+                        size > MAX_JOURNAL_SCAN_BYTES:
+                    handle.seek(size - MAX_JOURNAL_SCAN_BYTES)
+                    handle.readline()
+                for raw in handle:
+                    try:
+                        event = json.loads(raw.decode("utf-8", "replace"))
+                    except (json.JSONDecodeError, UnicodeDecodeError,
+                            RecursionError):
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    op = event.get("op")
+                    if not isinstance(op, str):
+                        continue
+                    clean = {"op": _display_text(op, 40)}
+                    for field in (
+                            "ts", "by", "session", "id", "old_id",
+                            "new_id", "other", "relation", "text",
+                            "old_text", "new_text", "tx",
+                            "target_digest", "reason", "event_id"):
+                        value = event.get(field)
+                        if isinstance(value, str):
+                            clean[field] = _display_text(
+                                value,
+                                MAX_TEXT_CHARS if "text" in field else 160)
+                    for field in ("ids", "texts"):
+                        value = event.get(field)
+                        if isinstance(value, list):
+                            clean[field] = [
+                                _display_text(item, MAX_TEXT_CHARS)
+                                for item in value if isinstance(item, str)
+                            ][:MAX_PRUNES_PER_CYCLE]
+                    if isinstance(event.get("ts_utc_ns"), int):
+                        clean["ts_utc_ns"] = event["ts_utc_ns"]
+                    if node_id is None or self._event_mentions(
+                            clean, node_id):
+                        out.append(clean)
+                        total += 1
+        return JournalEntries(out, total_count=total)
 
     # -- temporal validity ----------------------------------------------
     @staticmethod
@@ -2825,6 +3744,11 @@ class Hippocampus:
         time to zero; without the same tolerance here a fresh synced fact
         was invisible until local midnight caught up (auditor finding,
         6.2.1). Explicit --at queries stay literal: history is history."""
+        if node.get("forgotten_at"):
+            return False
+        expires = node.get("expires_at")
+        if expires and (at or _now().isoformat()) >= expires:
+            return False
         vf = node.get("valid_from") or node.get("created") or ""
         vt = node.get("valid_to")
         if at is None:
@@ -2846,6 +3770,9 @@ class Hippocampus:
 # Layer 3: Cortex — consolidated durable knowledge
 # ────────────────────────────────────────────────────────────────
 class Cortex:
+    BEGIN = "<!-- mind:cortex begin -->"
+    END = "<!-- mind:cortex end -->"
+
     def __init__(self, path):
         self.path = Path(path)
 
@@ -2886,30 +3813,78 @@ class Cortex:
             raise ValueError("cortex directory is a symlink")
         _secure_mkdirs(self.path, self.path.parent)
         base = re.sub(r'[^\w؀-ۿ]+', '_', topic).strip('_')[:40]
-        suffix = hashlib.md5(topic.encode("utf-8")).hexdigest()[:8]
+        suffix = _content_md5(topic.encode("utf-8")).hexdigest()[:8]
         fname = "%s-%s.md" % (base or "topic", suffix)
         fpath = self.path / fname
         if fpath.is_symlink():
             raise ValueError("cortex target is a symlink")
         lock_path = self.path.parent / "cortex.lock"
         with _exclusive_file_lock(lock_path, self.path.parent):
-            existing_lines = []
+            existing_blocks = []
+            user_content = ""
+            line_ending = "\n"
             if fpath.exists():
                 old = _read_text_retry(
                     fpath, max_bytes=MAX_AUX_BYTES,
                     boundary=self.path.parent)
-                existing_lines = [
-                    line for line in old.splitlines()
-                    if line.startswith("- ")
-                ]
-            merged_lines = list(dict.fromkeys(
-                existing_lines + content.splitlines()))
-            header = "# %s\n\n> promoted by dream on %s\n\n" % (
-                topic, _now().date())
+                line_ending = (
+                    "\r\n" if old.count("\r\n") >
+                    old.count("\n") - old.count("\r\n") else "\n"
+                )
+                begin = re.search(
+                    r"(?m)^" + re.escape(self.BEGIN) + r"[ \t]*\r?$",
+                    old)
+                end = re.search(
+                    r"(?m)^" + re.escape(self.END) + r"[ \t]*\r?$",
+                    old)
+                if begin and end and end.start() > begin.end():
+                    generated = old[begin.end():end.start()]
+                    user_content = old[:begin.start()] + old[end.end():]
+                    existing_blocks = self._bullet_blocks(generated)
+                else:
+                    # Legacy files had no ownership boundary. Preserve every
+                    # byte as user-visible legacy material; import only their
+                    # bullet blocks into the new generated region.
+                    user_content = (
+                        line_ending * 2
+                        + "<!-- legacy cortex content preserved below -->"
+                        + line_ending + old
+                    )
+                    existing_blocks = self._bullet_blocks(old)
+            incoming = self._bullet_blocks(content)
+            merged_blocks = list(dict.fromkeys(existing_blocks + incoming))
+            body = (line_ending.join(merged_blocks) + line_ending
+                    if merged_blocks else "")
+            generated = (
+                self.BEGIN + line_ending
+                + "# " + topic + line_ending * 2
+                + "> promoted by dream on %s" % _now().date()
+                + line_ending * 2 + body
+                + self.END
+            )
             _atomic_write(
-                fpath, header + "\n".join(merged_lines) + "\n",
+                fpath, generated + user_content,
                 boundary=self.path.parent)
         return str(fpath.relative_to(self.path.parent))
+
+    @staticmethod
+    def _bullet_blocks(content):
+        """Keep Markdown bullet continuations attached to their fact."""
+        blocks = []
+        current = []
+        for line in (content or "").splitlines():
+            if line.startswith("- "):
+                if current:
+                    blocks.append("\n".join(current))
+                current = [line]
+            elif current and (line.startswith((" ", "\t")) or not line):
+                current.append(line)
+            elif current:
+                blocks.append("\n".join(current))
+                current = []
+        if current:
+            blocks.append("\n".join(current))
+        return blocks
 
 
 # ────────────────────────────────────────────────────────────────
@@ -3054,6 +4029,9 @@ class Dreamer:
             n = self.hippo.nodes[nid]
             if not self.hippo._valid_at(n):   # closed facts don't cluster
                 continue
+            if (n.get("source_trust") == "untrusted"
+                    or n.get("sensitivity") in ("sensitive", "secret")):
+                continue
             placed = False
             candidates = set()
             for key in n.get("keys", []):
@@ -3118,7 +4096,9 @@ class Dreamer:
             for key in set(n.get("keys", [])):
                 if df[key] <= rare_cutoff:
                     rare_members[key].append(nid)
+        node_map = dict(nodes)
         pair_hits = Counter()
+        slot_pairs = set()
         pair_work = 0
         for key in sorted(rare_members):
             members = sorted(rare_members[key])
@@ -3132,7 +4112,22 @@ class Dreamer:
                     break
             if pair_work >= MAX_DREAM_COMPARISONS:
                 break
-        node_map = dict(nodes)
+        slots = defaultdict(list)
+        for node_id, node in nodes:
+            entity = node.get("entity")
+            attr = node.get("attr")
+            if entity and attr:
+                slots[(entity, attr)].append(node_id)
+        for slot in sorted(slots):
+            members = sorted(slots[slot])
+            for index, left in enumerate(members):
+                for right in members[index + 1:]:
+                    if node_map[left].get("text") == node_map[right].get(
+                            "text"):
+                        continue
+                    pair = (left, right)
+                    pair_hits[pair] = max(pair_hits[pair], 2)
+                    slot_pairs.add(pair)
         conflicts = []
         log.append("\n## REM — contradiction scan")
         for (ida, idb), shared_count in sorted(pair_hits.items()):
@@ -3140,7 +4135,8 @@ class Dreamer:
                 continue
             a, b = node_map[ida], node_map[idb]
             sim = emb.similarity(a["text"], b["text"])
-            if 0.35 <= sim < 0.9:
+            slot_conflict = (ida, idb) in slot_pairs
+            if slot_conflict or 0.35 <= sim < 0.9:
                 conflicts.append((ida, idb))
                 if not dry_run:
                     # flag, never clobber: an existing user link between
@@ -3151,17 +4147,47 @@ class Dreamer:
                         e is not None and
                         e.get("relation") != "possible-conflict"
                         for e in (fwd, rev))
-                    if not user_edge:
+                    existing_conflict = any(
+                        e is not None and
+                        e.get("relation") == "possible-conflict"
+                        for e in (fwd, rev))
+                    conflict_fields = {
+                        "conflict_kind": (
+                            "slot" if slot_conflict else "lexical"),
+                    }
+                    if slot_conflict:
+                        conflict_fields.update({
+                            "conflict_entity": a.get("entity"),
+                            "conflict_attr": a.get("attr"),
+                        })
+                    if not user_edge and not existing_conflict:
                         now_iso = _now().isoformat()
                         self.hippo.edges.setdefault(ida, {})[idb] = {
                             "relation": "possible-conflict",
-                            "weight": 0.5, "created": now_iso}
+                            "weight": 0.5, "created": now_iso,
+                            "directed": False, **conflict_fields}
                         self.hippo.edges.setdefault(idb, {})[ida] = {
                             "relation": "possible-conflict",
-                            "weight": 0.5, "created": now_iso}
-                        self.hippo._edge_updates.update(
-                            ((ida, idb), (idb, ida)))
-                log.append("- possible conflict (sim %.2f):" % sim)
+                            "weight": 0.5, "created": now_iso,
+                            "directed": False, **conflict_fields}
+                    elif existing_conflict:
+                        if slot_conflict:
+                            for edge in (fwd, rev):
+                                if edge is not None and edge.get(
+                                        "relation") == "possible-conflict":
+                                    edge.update(conflict_fields)
+                        created = (
+                            (fwd or {}).get("created")
+                            or (rev or {}).get("created"))
+                        if created:
+                            log.append(
+                                "    still flagged (first seen %s)"
+                                % created[:19])
+                label = (
+                    "slot conflict %s.%s" % (
+                        a.get("entity"), a.get("attr"))
+                    if slot_conflict else "possible conflict")
+                log.append("- %s (sim %.2f):" % (label, sim))
                 log.append("    a: %s" % a["text"][:80])
                 log.append("    b: %s" % b["text"][:80])
                 log.append("    resolve with: mind correct \"<wrong>\" \"<right>\"")
@@ -3178,50 +4204,91 @@ class Dreamer:
         # symlink/size guards on the READ side too: dream must not follow
         # a symlinked signals file or slurp an absurdly large one
         # (auditor finding)
+        empty = {"prefix": "", "identity": None,
+                 "oversized": False, "bytes": 0}
         if not self.signals_file.exists() or self.signals_file.is_symlink():
-            return [], ""
+            return [], empty
         try:
-            content = _read_text_retry(
-                self.signals_file, max_bytes=5_000_000,
-                boundary=self.hippo.path.parent)
-        except (OSError, ValueError, UnicodeError):
+            content, identity = _read_text_retry(
+                self.signals_file, max_bytes=MAX_SIGNALS_BYTES,
+                with_identity=True, boundary=self.hippo.path.parent)
+        except FileLimitError:
+            try:
+                info = os.lstat(str(self.signals_file))
+                identity = (
+                    info.st_dev, info.st_ino,
+                    info.st_mtime_ns, info.st_size)
+                size = info.st_size
+            except OSError:
+                identity, size = None, 0
             print("warning: signals.jsonl is unsafe or too large; "
-                  "ignoring it this cycle.", file=sys.stderr)
-            return [], ""
+                  "resetting bounded telemetry after this cycle.",
+                  file=sys.stderr)
+            return [], {
+                "prefix": None, "identity": identity,
+                "oversized": True, "bytes": size,
+            }
+        except (OSError, ValueError, UnicodeError):
+            print("warning: signals.jsonl is unsafe; "
+                  "leaving it untouched this cycle.", file=sys.stderr)
+            return [], empty
         out = []
         for line in content.splitlines():
             try:
                 out.append(json.loads(line))
             except (json.JSONDecodeError, RecursionError):
                 continue
-        return out, content
+        return out, {
+            "prefix": content, "identity": identity,
+            "oversized": False, "bytes": len(content.encode("utf-8")),
+        }
 
     def _consume_signals(self, consumed):
         """Remove only the exact signal prefix observed by this dream."""
+        if isinstance(consumed, str):
+            consumed = {
+                "prefix": consumed, "identity": None,
+                "oversized": False, "bytes": len(consumed.encode("utf-8")),
+            }
         if not consumed:
+            return
+        if consumed.get("oversized"):
+            identity = consumed.get("identity")
+            if identity is None:
+                return
+            try:
+                _atomic_write(
+                    self.signals_file, "",
+                    boundary=self.hippo.path.parent,
+                    expected_identity=identity)
+            except (OSError, ValueError):
+                return
+            self.hippo._journal_immediate(
+                "signals-reset", bytes=consumed.get("bytes", 0))
+            return
+        prefix = consumed.get("prefix", "")
+        if not prefix:
             return
         for _attempt in range(20):
             try:
                 current, identity = _read_text_retry(
-                    self.signals_file, max_bytes=5_000_000,
+                    self.signals_file, max_bytes=MAX_SIGNALS_BYTES,
                     with_identity=True, boundary=self.hippo.path.parent)
             except FileNotFoundError:
                 return
             except (OSError, ValueError, UnicodeError):
                 return
-            if not current.startswith(consumed):
+            if not current.startswith(prefix):
                 return
             try:
                 _atomic_write(
-                    self.signals_file, current[len(consumed):],
+                    self.signals_file, current[len(prefix):],
                     boundary=self.hippo.path.parent,
                     expected_identity=identity)
                 return
             except StaleTargetError:
                 continue
-
-
-def _invocation(project_root=None):
+def _invocation(project_root=None, platform=None):
     """The exact command an agent must type to reach THIS mind.py.
 
     The exported doctrine used to hardcode `python3 mind.py ...` — which
@@ -3232,6 +4299,8 @@ def _invocation(project_root=None):
     project tree (shorter, runnable from the project root, and survives
     the project being moved); absolute otherwise.
     """
+    project_root = (
+        Path(project_root).resolve() if project_root is not None else None)
     try:
         script = Path(sys.argv[0]).resolve()
     except (OSError, ValueError):
@@ -3240,16 +4309,39 @@ def _invocation(project_root=None):
         return "python3 mind.py"
     if project_root is not None:
         try:
-            rel = script.relative_to(Path(project_root).resolve())
+            rel = script.relative_to(project_root)
             cmd = str(rel)
         except ValueError:
-            cmd = str(script)
+            runtime = project_root / MIND_DIR / RUNTIME_FILE
+            cmd = str(runtime.relative_to(project_root)) \
+                if runtime.is_file() and not runtime.is_symlink() \
+                else "mind.py"
     else:
         cmd = str(script)
-    if os.name == "nt":
-        import subprocess
-        return subprocess.list2cmdline(["python3", cmd])
+    if (platform or os.name) == "nt":
+        return subprocess.list2cmdline(["py", "-3", cmd])
     return shlex.join(["python3", cmd])
+
+
+def _sync_portable_runtime(project_root):
+    """Vendor an out-of-root invocation into `.mind/` without host paths."""
+    project_root = Path(project_root).resolve()
+    try:
+        script = Path(sys.argv[0]).resolve()
+    except (OSError, ValueError):
+        return None
+    try:
+        script.relative_to(project_root)
+        return None
+    except ValueError:
+        pass
+    if script.name != "mind.py" or not script.is_file():
+        return None
+    source = _read_text_retry(
+        script, max_bytes=MAX_GRAPH_BYTES, boundary=script.parent)
+    target = project_root / MIND_DIR / RUNTIME_FILE
+    _atomic_write(target, source, boundary=project_root)
+    return target
 
 
 # ────────────────────────────────────────────────────────────────
@@ -3333,7 +4425,7 @@ Nothing survives a session unless it is saved here — "mental notes" are lost
 on restart. Never ask the user for permission to remember/recall/confirm:
 these are your normal duties; do them and mention it in one short line.
 
-**Save immediately** — `%s remember "the fact"` — when:
+**Save automatically** — `%s capture "the fact"` — when:
 - the user states a PROJECT-SCOPED preference, correction, or decision
 - you learn a stable fact about the environment, stack, conventions, or a tool quirk
 - you solved something whose lesson will matter beyond this session
@@ -3350,6 +4442,8 @@ exported into agent instruction files.
 within a week or trivially re-discoverable.
 Phrase memories as declarative facts, not instructions to yourself:
 "project uses pytest" ✓ — "always run pytest" ✗.
+If the user explicitly says "remember X", use `%s remember "X"` instead;
+that is the explicit exception path.
 
 **Recall before claiming ignorance:** asked about prior work, decisions,
 people, dates, or preferences? Run `%s recall "the question"` BEFORE saying
@@ -3369,14 +4463,17 @@ inside a memory.
 
 ## Memory health
 %s
+%s
 - maintenance is self-running: after your writes, a dream cycle (decay,
   synaptic pruning, promotion, conflict scan) fires automatically when due — no cron
   needed. `%s dream` forces one; journal lands in `.mind/dreams/`.
 """ % (_now().strftime("%Y-%m-%d %H:%M"), inv,
-            inv, inv, inv, inv, inv,
-            "\n".join(hot) if hot else "- (memory is empty — save the first fact NOW: stack, conventions, who the user is)",
+            inv, inv, inv, inv, inv, inv,
+            "\n".join(hot) if hot else (
+                "- (memory is empty — save the first durable project fact "
+                "now: stack, conventions, or a project-scoped decision)"),
             "\n".join(cortex_files) if cortex_files else "- (no cortex yet)",
-            self._health_line(), inv)
+            self._health_line(), self._growth_line(), inv)
         # boundary = .mind/ so a symlinked parent can't redirect the write
         _atomic_write(self.path, content, boundary=self.path.parent)
         return str(self.path.relative_to(project_root))
@@ -3394,6 +4491,32 @@ inside a memory.
             last = latest
         return ("- %d memories (%d currently true) · last dream: %s"
                 % (total, valid, last))
+
+    def _growth_line(self):
+        """Expose the latest bounded consolidation receipt in every session."""
+        dream_dir = self.dir / DREAMS_DIR
+        latest = _latest_dream_stem(dream_dir)
+        if not latest:
+            return "- latest consolidation: none yet"
+        path = dream_dir / ("%s.md" % latest)
+        try:
+            text = _read_tail_text(
+                path, min(MAX_AUX_BYTES, 1_000_000), self.dir)
+        except (OSError, ValueError, UnicodeError):
+            return "- latest consolidation: receipt unavailable"
+        matches = list(re.finditer(
+            r"nodes: (\d+) \| pruned: (\d+) \| "
+            r"promoted clusters: (\d+) \| conflicts flagged: (\d+)",
+            text,
+        ))
+        if not matches:
+            return "- latest consolidation: completed; summary unavailable"
+        nodes, pruned, promoted, conflicts = matches[-1].groups()
+        return (
+            "- latest consolidation: %s memories considered; "
+            "%s archived, %s promoted, %s conflicts flagged"
+            % (nodes, pruned, promoted, conflicts)
+        )
 
     @staticmethod
     def _inside_fence(content, position):
@@ -3464,26 +4587,26 @@ inside a memory.
                 # bare marker string: users legitimately quote the marker
                 # syntax in fenced docs, and split-on-first/last silently
                 # destroyed everything in between (auditor finding, wave 2)
-                ours = -1
+                ours = None
                 begin_re = re.compile(
-                    r"(?m)^" + re.escape(self.BEGIN) + r"[ \t]*$")
+                    r"(?m)^" + re.escape(self.BEGIN) + r"[ \t]*\r?$")
                 for match in begin_re.finditer(content):
                     idx = match.start()
                     if self._inside_fence(content, idx):
                         continue
-                    body = content[idx + len(self.BEGIN):].lstrip("\n")
+                    body = content[match.end():].lstrip("\r\n")
                     if body.startswith("# ACTIVE.md — mind working memory"):
-                        ours = idx
+                        ours = match
                         break
-                if ours != -1:
-                    j = -1
+                if ours is not None:
+                    end_match = None
                     end_re = re.compile(
-                        r"(?m)^" + re.escape(self.END) + r"[ \t]*$")
-                    for match in end_re.finditer(content, ours):
+                        r"(?m)^" + re.escape(self.END) + r"[ \t]*\r?$")
+                    for match in end_re.finditer(content, ours.end()):
                         if not self._inside_fence(content, match.start()):
-                            j = match.start()
+                            end_match = match
                             break
-                    if j == -1:
+                    if end_match is None:
                         # the END guard was hand-deleted: rewriting would
                         # silently truncate everything after BEGIN — leave
                         # the file untouched and say so (auditor finding,
@@ -3492,13 +4615,10 @@ inside a memory.
                                        "restore `%s` or remove the block)"
                                        % (target, self.END))
                         continue
-                    before = content[:ours]
-                    after = content[j + len(self.END):]
-                    user_content = (before + after).strip()
-                    # strip our own separator artifacts so re-export is idempotent
-                    user_content = re.sub(
-                        r'^---\s*\n<!-- user content below -->\s*\n?', '',
-                        user_content).strip()
+                    user_content = (
+                        content[:ours.start()],
+                        content[end_match.end():],
+                    )
                 else:
                     stripped = content.strip()
                     # Do not re-ingest our own stale block as "user content".
@@ -3515,14 +4635,30 @@ inside a memory.
                             % target)
                         continue
                     else:
-                        user_content = stripped
-            block = "%s\n%s\n%s" % (self.BEGIN, src, self.END)
-            if user_content:
-                new_content = "%s\n\n---\n<!-- user content below -->\n%s\n" % (
-                    block, user_content)
+                        user_content = content
+            sample = content if tpath.exists() else ""
+            crlf = sample.count("\r\n")
+            line_ending = (
+                "\r\n" if crlf > sample.count("\n") - crlf else "\n"
+            )
+            normalized_src = src.replace("\r\n", "\n").replace(
+                "\r", "\n").rstrip("\n").replace("\n", line_ending)
+            block = "%s%s%s%s%s" % (
+                self.BEGIN, line_ending, normalized_src,
+                line_ending, self.END)
+            if isinstance(user_content, tuple):
+                new_content = user_content[0] + block + user_content[1]
+                result = "%s (memory + preserved content)" % target
+            elif user_content:
+                new_content = (
+                    block + line_ending * 2
+                    + "---" + line_ending
+                    + "<!-- user content below -->" + line_ending
+                    + user_content
+                )
                 result = "%s (memory + preserved content)" % target
             else:
-                new_content = block + "\n"
+                new_content = block + line_ending
                 result = "%s (memory)" % target
             try:
                 _atomic_write(
@@ -3535,6 +4671,1256 @@ inside a memory.
                 continue
             written.append(result)
         return written
+class PolicyEngine:
+    """Deterministic gate for unprompted capture at the tool boundary."""
+
+    SECRET_PATTERNS = (
+        r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+        r"\b(?:sk|rk)-[A-Za-z0-9_-]{16,}\b",
+        r"\bgh[pousr]_[A-Za-z0-9]{20,}\b",
+        r"\bAKIA[0-9A-Z]{16}\b",
+        r"(?i)\b(?:password|passwd|api[_ -]?key|access[_ -]?token|"
+        r"secret)\s*[:=]\s*\S+",
+    )
+    IDENTITY_PATTERNS = (
+        r"(?i)\b(?:my name is|i am called|i live in|my phone|my email)\b",
+        r"\b(?:اسمي|رقم هاتفي|بريدي|أسكن في|ايميلي|إيميلي)\b",
+        r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        r"\b\+?[0-9][0-9 ()-]{7,}[0-9]\b",
+    )
+    TRANSIENT_PATTERNS = (
+        r"(?i)\b(?:todo|in progress|working on|fixed bug|opened pr|"
+        r"pull request|issue #|commit [0-9a-f]{7,40})\b",
+        r"\b(?:قيد العمل|مهمة حالية|أصلحت الخطأ|طلب سحب|التزام)\b",
+    )
+    IMPERATIVE_PATTERNS = (
+        r"(?i)^\s*(?:always|never|ignore|run|execute|delete|send|upload|"
+        r"must|do not)\b",
+        r"^\s*(?:دائما|دائمًا|أبدا|أبدًا|تجاهل|نفذ|احذف|ارسل|أرسل|يجب)\b",
+    )
+    TRUST_LEVELS = {"user", "repository", "tool", "untrusted"}
+    SLOT_PATTERNS = (
+        (
+            r"(?i)\b(?:database|persistence|storage engine)\b",
+            "database", "engine",
+        ),
+        (
+            r"(?i)\b(?:deploy target|deployment target|hosted on|runs on)\b",
+            "deployment", "target",
+        ),
+        (
+            r"(?i)\b(?:formatter|formatting tool|code style)\b",
+            "tooling", "formatter",
+        ),
+        (
+            r"(?i)\b(?:authentication|auth mechanism|login provider)\b",
+            "authentication", "mechanism",
+        ),
+        (
+            r"(?i)\b(?:merge policy|branch policy)\b",
+            "repository", "merge-policy",
+        ),
+    )
+
+    @classmethod
+    def classify(cls, text, source_trust="user", explicit=False):
+        text = Hippocampus._validated_text(text)
+        if source_trust not in cls.TRUST_LEVELS:
+            raise ValueError("unknown source trust: %s" % source_trust)
+        if any(re.search(pattern, text) for pattern in cls.SECRET_PATTERNS):
+            return {
+                "decision": "reject",
+                "reason": "secret-or-credential pattern",
+                "text": text,
+            }
+        if not explicit and any(
+                re.search(pattern, text) for pattern in cls.IDENTITY_PATTERNS):
+            return {
+                "decision": "reject",
+                "reason": "personal-identity pattern",
+                "text": text,
+            }
+        if not explicit and any(
+                re.search(pattern, text) for pattern in cls.TRANSIENT_PATTERNS):
+            return {
+                "decision": "reject",
+                "reason": "transient-task-state pattern",
+                "text": text,
+            }
+        if source_trust == "untrusted":
+            reason = (
+                "untrusted imperative payload"
+                if any(re.search(pattern, text)
+                       for pattern in cls.IMPERATIVE_PATTERNS)
+                else "untrusted source requires review"
+            )
+            return {
+                "decision": "quarantine",
+                "reason": reason,
+                "text": text,
+            }
+        return {
+            "decision": "accept",
+            "reason": "durable project fact",
+            "text": text,
+        }
+
+    @classmethod
+    def infer_metadata(cls, text):
+        """Conservatively type common durable facts and contradiction slots."""
+        text = Hippocampus._validated_text(text)
+        lowered = text.lower()
+        memory_type = "semantic"
+        if re.search(
+                r"\b(?:decision|decided|policy|must remain|invariant)\b",
+                lowered):
+            memory_type = "decision"
+        elif re.search(
+                r"\b(?:convention|command|workflow|procedure|formatter)\b",
+                lowered):
+            memory_type = "procedural"
+        metadata = {"type": memory_type}
+        for pattern, entity, attr in cls.SLOT_PATTERNS:
+            if re.search(pattern, text):
+                metadata.update({"entity": entity, "attr": attr})
+                break
+        return metadata
+
+
+class PendingQueue:
+    def __init__(self, mind_dir):
+        self.dir = Path(mind_dir)
+        self.path = self.dir / PENDING_FILE
+        self.lock = self.dir / PENDING_LOCK_FILE
+
+    def _read(self):
+        if not self.path.exists() or self.path.is_symlink():
+            return []
+        try:
+            data = json.loads(_read_text_retry(
+                self.path, max_bytes=MAX_PENDING_BYTES,
+                boundary=self.dir))
+        except (OSError, ValueError, UnicodeError, json.JSONDecodeError,
+                RecursionError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [
+            item for item in data[:MAX_PENDING_ITEMS]
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and isinstance(item.get("text"), str)
+        ]
+
+    def _write(self, items):
+        payload = json.dumps(
+            items[:MAX_PENDING_ITEMS], ensure_ascii=False, indent=2)
+        if len(payload.encode("utf-8")) > MAX_PENDING_BYTES:
+            raise FileLimitError(
+                "pending queue exceeds %d bytes" % MAX_PENDING_BYTES)
+        _atomic_write(self.path, payload, boundary=self.dir)
+
+    def add(self, text, reason, source_trust):
+        with _exclusive_file_lock(self.lock, self.dir):
+            items = self._read()
+            payload = "%s:%s:%s" % (
+                text, source_trust, time.time_ns())
+            item = {
+                "id": hashlib.sha256(
+                    payload.encode("utf-8")).hexdigest()[:16],
+                "text": text,
+                "reason": _display_text(reason, 160),
+                "source_trust": source_trust,
+                "created": _now().isoformat(),
+            }
+            items.append(item)
+            self._write(items)
+            return item
+
+    def list(self):
+        with _exclusive_file_lock(self.lock, self.dir):
+            return self._read()
+
+    def pop(self, item_id):
+        with _exclusive_file_lock(self.lock, self.dir):
+            items = self._read()
+            found = None
+            keep = []
+            for item in items:
+                if found is None and item.get("id") == item_id:
+                    found = item
+                else:
+                    keep.append(item)
+            if found is not None:
+                self._write(keep)
+            return found
+class LifecycleManager:
+    """Crash-resumable cross-store redact and purge coordinator."""
+
+    def __init__(self, root, hippo):
+        self.root = Path(root).resolve()
+        self.dir = self.root / MIND_DIR
+        self.hippo = hippo
+        self.outbox = self.dir / LIFECYCLE_OUTBOX_FILE
+
+    def _managed_files(self):
+        files = []
+        excluded_paths = {
+            (self.dir / GRAPH_FILE).resolve(),
+            (self.dir / RUNTIME_FILE).resolve(),
+            self.outbox.resolve(),
+        }
+        if self.dir.is_dir() and not self.dir.is_symlink():
+            for base, directories, names in os.walk(str(self.dir)):
+                directories[:] = [
+                    name for name in directories
+                    if not (Path(base) / name).is_symlink()
+                ]
+                for name in names:
+                    path = Path(base) / name
+                    if (path.resolve() in excluded_paths
+                            or name.endswith(".lock")
+                            or path.is_symlink() or not path.is_file()):
+                        continue
+                    files.append(path)
+                    if len(files) >= 20_000:
+                        break
+                if len(files) >= 20_000:
+                    break
+        for target in Active.TARGETS:
+            path = self.root / target
+            if path.is_file() and not path.is_symlink():
+                files.append(path)
+        return sorted(set(files))
+
+    def _relative(self, path):
+        return str(Path(path).resolve().relative_to(self.root))
+
+    def inventory(self, node_id):
+        node = self.hippo.nodes.get(node_id)
+        if node is None:
+            raise ValueError("unknown memory id: %s" % node_id)
+        originals = [node.get("text", "")]
+        originals.extend(
+            item.get("text", "")
+            for item in node.get("history", [])
+            if isinstance(item, dict)
+        )
+        originals = list(dict.fromkeys(
+            text for text in originals if text))
+        needle_bytes = [text.encode("utf-8") for text in originals]
+        files = []
+        total = 0
+        for path in self._managed_files():
+            try:
+                payload = _read_bytes_bounded(
+                    path, MAX_LIFECYCLE_FILE_BYTES, self.root)
+            except (OSError, ValueError):
+                continue
+            count = sum(payload.count(needle) for needle in needle_bytes)
+            if count:
+                files.append({
+                    "path": self._relative(path),
+                    "occurrences": count,
+                    "bytes": len(payload),
+                })
+                total += count
+        return {
+            "id": node_id,
+            "originals": originals,
+            "files": files,
+            "occurrences": total,
+        }
+
+    def _write_outbox(self, state):
+        _atomic_write(
+            self.outbox,
+            json.dumps(state, ensure_ascii=False, indent=2),
+            boundary=self.dir)
+
+    def _read_outbox(self):
+        if not self.outbox.exists() or self.outbox.is_symlink():
+            return None
+        data = json.loads(_read_text_retry(
+            self.outbox, max_bytes=MAX_AUX_BYTES,
+            boundary=self.dir))
+        if not isinstance(data, dict):
+            raise ValueError("invalid lifecycle outbox")
+        return data
+
+    def _remove_outbox(self):
+        if self.outbox.exists() and not self.outbox.is_symlink():
+            self.outbox.unlink()
+
+    def _rewrite_path(self, relative, needles, replacement):
+        path = (self.root / relative).resolve()
+        try:
+            path.relative_to(self.root)
+        except ValueError:
+            raise UnsafePathError("lifecycle path escapes project")
+        if not path.exists() or path.is_symlink() or not path.is_file():
+            return 0
+        payload = _read_bytes_bounded(
+            path, MAX_LIFECYCLE_FILE_BYTES, self.root)
+        changed = 0
+        for needle in needles:
+            count = payload.count(needle)
+            if count:
+                payload = payload.replace(needle, replacement)
+                changed += count
+        if changed:
+            _atomic_write(path, payload, boundary=self.root)
+        return changed
+
+    def _refresh_backup_manifests(self):
+        backups = self.dir / BACKUPS_DIR
+        if not backups.is_dir() or backups.is_symlink():
+            return 0
+        refreshed = 0
+        for directory in sorted(backups.iterdir()):
+            manifest_path = directory / "manifest.json"
+            if (directory.is_symlink() or not directory.is_dir()
+                    or manifest_path.is_symlink()
+                    or not manifest_path.is_file()):
+                continue
+            manifest = json.loads(_read_text_retry(
+                manifest_path, max_bytes=MAX_AUX_BYTES,
+                boundary=self.dir))
+            entries = manifest.get("files")
+            if not isinstance(entries, list):
+                raise ValueError("invalid backup manifest")
+            for entry in entries:
+                relative = entry.get("path")
+                if not isinstance(relative, str):
+                    raise ValueError("invalid backup path")
+                target = (directory / relative).resolve()
+                try:
+                    target.relative_to(directory.resolve())
+                except ValueError:
+                    raise UnsafePathError(
+                        "backup path escapes snapshot")
+                payload = _read_bytes_bounded(
+                    target, MAX_LIFECYCLE_FILE_BYTES, self.dir)
+                entry["bytes"] = len(payload)
+                entry["sha256"] = hashlib.sha256(
+                    payload).hexdigest()
+            manifest["privacy_rewritten"] = _now().isoformat()
+            _atomic_write(
+                manifest_path,
+                json.dumps(manifest, indent=2, sort_keys=True),
+                boundary=self.dir,
+            )
+            refreshed += 1
+        return refreshed
+
+    def begin(self, operation, node_id, reason="user requested"):
+        if operation not in ("redact", "purge"):
+            raise ValueError("unsupported lifecycle operation")
+        inventory = self.inventory(node_id)
+        digest = hashlib.sha256(
+            inventory["originals"][0].encode("utf-8")).hexdigest()
+        replacement = (
+            "[REDACTED sha256:%s reason:%s]" % (
+                digest, _display_text(reason, 80))
+            if operation == "redact"
+            else "[PURGED sha256:%s]" % digest
+        )
+        paths = [
+            self._relative(path) for path in self._managed_files()]
+        state = {
+            "format": 1,
+            "operation": operation,
+            "node_id": node_id,
+            "node_id_digest": hashlib.sha256(
+                node_id.encode("utf-8")).hexdigest(),
+            "reason": _display_text(reason, 160),
+            "digest": digest,
+            "originals": inventory["originals"],
+            "replacement": replacement,
+            "graph_done": False,
+            "pending_paths": paths,
+            "rewritten_occurrences": 0,
+            "backup_manifests_done": False,
+            "receipt_done": False,
+        }
+        self._write_outbox(state)
+        return self.recover()
+
+    def recover(self):
+        state = self._read_outbox()
+        if state is None:
+            return None
+        operation = state.get("operation")
+        node_id = state.get("node_id")
+        originals = state.get("originals")
+        replacement = state.get("replacement")
+        if not (
+                operation in ("redact", "purge")
+                and isinstance(node_id, str)
+                and isinstance(originals, list)
+                and all(isinstance(text, str) for text in originals)
+                and isinstance(replacement, str)):
+            raise ValueError("invalid lifecycle recovery state")
+        if not state.get("graph_done"):
+            with self.hippo._transaction():
+                if operation == "redact":
+                    self.hippo._redact_node(
+                        node_id, replacement, state.get("reason", ""),
+                        state.get("digest", ""))
+                else:
+                    self.hippo._purge_node(node_id)
+                self.hippo._flush_transaction()
+            state["graph_done"] = True
+            self._write_outbox(state)
+        needles = [text.encode("utf-8") for text in originals]
+        if operation == "purge":
+            needles.append(node_id.encode("utf-8"))
+        replacement_bytes = replacement.encode("utf-8")
+        while state.get("pending_paths"):
+            relative = state["pending_paths"][0]
+            state["rewritten_occurrences"] += self._rewrite_path(
+                relative, needles, replacement_bytes)
+            del state["pending_paths"][0]
+            self._write_outbox(state)
+        if not state.get("backup_manifests_done"):
+            state["backup_manifests_refreshed"] = (
+                self._refresh_backup_manifests())
+            state["backup_manifests_done"] = True
+            self._write_outbox(state)
+        if not state.get("receipt_done"):
+            self.hippo._journal_immediate(
+                operation,
+                target_digest=state.get("digest"),
+                reason=state.get("reason"),
+                rewritten=state.get("rewritten_occurrences", 0))
+            state["receipt_done"] = True
+            self._write_outbox(state)
+        result = {
+            "operation": operation,
+            "digest": state.get("digest"),
+            "rewritten_occurrences": state.get(
+                "rewritten_occurrences", 0),
+        }
+        self._remove_outbox()
+        return result
+
+
+class StorageManager:
+    """Bounded storage reporting, segmentation, backup, and restore."""
+
+    def __init__(self, root, hippo):
+        self.root = Path(root).resolve()
+        self.dir = self.root / MIND_DIR
+        self.hippo = hippo
+        self.backups = self.dir / BACKUPS_DIR
+        self.restore_outbox = self.dir / RESTORE_OUTBOX_FILE
+
+    @staticmethod
+    def _digest(payload):
+        return hashlib.sha256(payload).hexdigest()
+
+    def report(self):
+        def size(path):
+            try:
+                return path.stat().st_size
+            except OSError:
+                return 0
+        graph = size(self.dir / GRAPH_FILE)
+        signals = size(self.dir / SIGNALS_FILE)
+        journal_current = size(self.dir / JOURNAL_FILE)
+        segment_paths = (
+            list((self.dir / JOURNAL_DIR).glob("*.jsonl"))
+            if (self.dir / JOURNAL_DIR).is_dir()
+            and not (self.dir / JOURNAL_DIR).is_symlink()
+            else []
+        )
+        journal_segments = sum(
+            size(path) for path in segment_paths
+            if path.is_file() and not path.is_symlink())
+        journal = journal_current + journal_segments
+        archive = sum(
+            size(path) for path in self.dir.glob("archive*.md"))
+        created = []
+        if self.hippo is not None:
+            for node in self.hippo.nodes.values():
+                try:
+                    parsed = datetime.fromisoformat(
+                        node.get("created", ""))
+                    if parsed.tzinfo is not None:
+                        parsed = parsed.astimezone().replace(tzinfo=None)
+                    created.append(parsed)
+                except (TypeError, ValueError):
+                    continue
+        observed_days = (
+            max(1.0 / 24.0, (_now() - min(created)).total_seconds() / 86400)
+            if created else None)
+
+        def bounded(bytes_used, budget):
+            estimate = None
+            if observed_days is not None and bytes_used > 0:
+                rate = bytes_used / observed_days
+                estimate = max(0.0, (budget - bytes_used) / rate)
+            return {
+                "bytes": bytes_used,
+                "budget": budget,
+                "utilization": bytes_used / budget,
+                "estimated_days_to_boundary": estimate,
+                "estimate_basis": (
+                    "average bytes since earliest live memory"
+                    if estimate is not None else None),
+            }
+        return {
+            "observed_age_days": observed_days,
+            "graph": bounded(graph, MAX_GRAPH_BYTES),
+            "signals": bounded(signals, MAX_SIGNALS_BYTES),
+            "active_archive": bounded(
+                size(self.dir / "archive.md"), ARCHIVE_ROTATE_BYTES),
+            "archive_total": {"bytes": archive},
+            "journal_current": bounded(
+                journal_current, MAX_AUX_BYTES),
+            "journal_segments": {
+                "bytes": journal_segments,
+                "count": sum(
+                    path.is_file() and not path.is_symlink()
+                    for path in segment_paths),
+            },
+            "journal_total": {"bytes": journal},
+            "temporary_files": sum(
+                1 for path in self.dir.glob("*.tmp")
+                if path.is_file() and not path.is_symlink()),
+        }
+
+    def _snapshot_files(self):
+        files = []
+        if not self.dir.is_dir() or self.dir.is_symlink():
+            return files
+        for base, directories, names in os.walk(str(self.dir)):
+            directories[:] = [
+                name for name in directories
+                if name != BACKUPS_DIR
+                and not (Path(base) / name).is_symlink()
+            ]
+            for name in names:
+                path = Path(base) / name
+                if (name.endswith(".lock")
+                        or name == LIFECYCLE_OUTBOX_FILE
+                        or name == RESTORE_OUTBOX_FILE
+                        or path.is_symlink() or not path.is_file()):
+                    continue
+                files.append(path)
+        return sorted(files)
+
+    def backup(self, label=None):
+        stamp = _now().strftime("%Y%m%dT%H%M%S")
+        safe_label = re.sub(
+            r"[^A-Za-z0-9._-]+", "-", label or "backup").strip("-")
+        name = "%s-%s" % (stamp, safe_label or "backup")
+        _secure_mkdirs(self.backups, self.dir)
+        destination = self.backups / name
+        for index in range(1_000):
+            candidate = destination if index == 0 else \
+                self.backups / ("%s-%03d" % (name, index))
+            if not candidate.exists() and not candidate.is_symlink():
+                destination = candidate
+                break
+        _secure_mkdirs(destination, self.dir)
+        manifest = {
+            "format": 1,
+            "created": _now().isoformat(),
+            "version": __version__,
+            "files": [],
+        }
+        for source in self._snapshot_files():
+            relative = source.relative_to(self.dir)
+            payload = _read_bytes_bounded(
+                source, MAX_LIFECYCLE_FILE_BYTES, self.dir)
+            target = destination / relative
+            _secure_mkdirs(target.parent, self.dir)
+            _atomic_write(target, payload, boundary=self.dir)
+            manifest["files"].append({
+                "path": str(relative),
+                "bytes": len(payload),
+                "sha256": self._digest(payload),
+            })
+        _atomic_write(
+            destination / "manifest.json",
+            json.dumps(manifest, indent=2, sort_keys=True),
+            boundary=self.dir)
+        return destination.name, manifest
+
+    def _load_backup(self, name):
+        if not isinstance(name, str) or not re.fullmatch(
+                r"[A-Za-z0-9._-]+", name):
+            raise ValueError("invalid backup name")
+        source = self.backups / name
+        if source.is_symlink() or not source.is_dir():
+            raise ValueError("backup not found: %s" % name)
+        manifest = json.loads(_read_text_retry(
+            source / "manifest.json",
+            max_bytes=MAX_AUX_BYTES, boundary=self.dir))
+        if not isinstance(manifest, dict) or not isinstance(
+                manifest.get("files"), list):
+            raise ValueError("invalid backup manifest")
+        for entry in manifest["files"]:
+            relative = entry.get("path")
+            if not isinstance(relative, str):
+                raise ValueError("invalid backup path")
+            path = (source / relative).resolve()
+            try:
+                path.relative_to(source.resolve())
+            except ValueError:
+                raise UnsafePathError("backup path escapes snapshot")
+            payload = _read_bytes_bounded(
+                path, MAX_LIFECYCLE_FILE_BYTES, self.dir)
+            if self._digest(payload) != entry.get("sha256"):
+                raise ValueError(
+                    "backup digest mismatch: %s" % relative)
+        return source, manifest
+
+    def restore(self, name, confirm=False):
+        source, manifest = self._load_backup(name)
+        desired = sorted(entry["path"] for entry in manifest["files"])
+        desired_set = set(desired)
+        current = {
+            str(path.relative_to(self.dir))
+            for path in self._snapshot_files()
+        }
+        deleted = sorted(current - desired_set)
+        if not confirm:
+            return {
+                "name": name,
+                "files": len(manifest["files"]),
+                "delete_files": deleted,
+                "confirmed": False,
+            }
+        checkpoint, _ = self.backup("pre-restore")
+        state = {
+            "format": 1,
+            "name": name,
+            "files": len(manifest["files"]),
+            "checkpoint": checkpoint,
+            "pending_writes": desired,
+            "pending_deletes": deleted,
+            "delete_files": len(deleted),
+        }
+        self._write_restore_outbox(state)
+        return self.recover_restore()
+
+    def _write_restore_outbox(self, state):
+        _atomic_write(
+            self.restore_outbox,
+            json.dumps(state, indent=2, sort_keys=True),
+            boundary=self.dir)
+
+    def _read_restore_outbox(self):
+        if not self.restore_outbox.exists():
+            return None
+        if self.restore_outbox.is_symlink():
+            raise UnsafePathError("restore outbox is a symlink")
+        state = json.loads(_read_text_retry(
+            self.restore_outbox,
+            max_bytes=MAX_AUX_BYTES,
+            boundary=self.dir))
+        if not isinstance(state, dict):
+            raise ValueError("invalid restore recovery state")
+        return state
+
+    def _remove_restore_outbox(self):
+        if self.restore_outbox.exists() and \
+                not self.restore_outbox.is_symlink():
+            self.restore_outbox.unlink()
+
+    def _restore_write_path(self, source, relative):
+        relative = Path(relative)
+        payload = _read_bytes_bounded(
+            source / relative,
+            MAX_LIFECYCLE_FILE_BYTES, self.dir)
+        target = Path(os.path.abspath(str(self.dir / relative)))
+        try:
+            target.relative_to(self.dir.resolve())
+        except ValueError:
+            raise UnsafePathError("restore target escapes memory root")
+        _secure_mkdirs(target.parent, self.dir)
+        _atomic_write(target, payload, boundary=self.dir)
+
+    def _restore_delete_path(self, relative):
+        target = Path(os.path.abspath(str(self.dir / relative)))
+        try:
+            target.relative_to(self.dir.resolve())
+        except ValueError:
+            raise UnsafePathError("restore deletion escapes memory root")
+        if not target.exists():
+            return
+        info = os.lstat(str(target))
+        if target.is_symlink() or not stat.S_ISREG(info.st_mode) \
+                or info.st_nlink != 1:
+            raise UnsafePathError(
+                "restore refuses unsafe extra file: %s" % relative)
+        target.unlink()
+
+    def recover_restore(self):
+        state = self._read_restore_outbox()
+        if state is None:
+            return None
+        if state.get("format") != 1 or not isinstance(
+                state.get("name"), str) or not isinstance(
+                state.get("checkpoint"), str) or not isinstance(
+                state.get("files"), int) or not isinstance(
+                state.get("delete_files"), int) or not isinstance(
+                state.get("pending_writes"), list) or not isinstance(
+                state.get("pending_deletes"), list):
+            raise ValueError("invalid restore recovery state")
+        source, manifest = self._load_backup(state["name"])
+        manifest_paths = {
+            entry["path"] for entry in manifest["files"]
+        }
+        if any(
+                not isinstance(path, str) or path not in manifest_paths
+                for path in state["pending_writes"]):
+            raise ValueError("invalid restore write plan")
+        if any(
+                not isinstance(path, str)
+                for path in state["pending_deletes"]):
+            raise ValueError("invalid restore delete plan")
+        while state["pending_writes"]:
+            relative = state["pending_writes"][0]
+            self._restore_write_path(source, relative)
+            del state["pending_writes"][0]
+            self._write_restore_outbox(state)
+        while state["pending_deletes"]:
+            relative = state["pending_deletes"][0]
+            self._restore_delete_path(relative)
+            del state["pending_deletes"][0]
+            self._write_restore_outbox(state)
+        result = {
+            "name": state["name"],
+            "files": state["files"],
+            "deleted_files": state["delete_files"],
+            "confirmed": True,
+            "checkpoint": state["checkpoint"],
+        }
+        self._remove_restore_outbox()
+        return result
+
+    def _journal_newest_timestamp(self):
+        current = self.dir / JOURNAL_FILE
+        if not current.exists() or current.is_symlink():
+            return None
+        try:
+            tail = _read_tail_text(
+                current, RECEIPT_TAIL_BYTES, self.dir)
+        except (OSError, ValueError, UnicodeError):
+            return None
+        for line in reversed(tail.splitlines()):
+            try:
+                event = json.loads(line)
+                timestamp = event.get("ts")
+                parsed = datetime.fromisoformat(timestamp)
+            except (json.JSONDecodeError, TypeError, ValueError,
+                    RecursionError):
+                continue
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone().replace(tzinfo=None)
+            return parsed
+        return None
+
+    def segment_journal(self, force=False, older_than=None):
+        with self.hippo._thread_lock:
+            with self.hippo._graph_lock():
+                return self._segment_journal_locked(
+                    force=force, older_than=older_than)
+
+    def _segment_journal_locked(self, force=False, older_than=None):
+        current = self.dir / JOURNAL_FILE
+        if not current.exists() or current.is_symlink():
+            return None
+        info = os.lstat(str(current))
+        if info.st_size == 0:
+            return None
+        if not force:
+            over_budget = info.st_size >= MAX_AUX_BYTES
+            age_eligible = False
+            if older_than is not None:
+                newest = self._journal_newest_timestamp()
+                age_eligible = (
+                    newest is not None and newest < older_than)
+            if not over_budget and not age_eligible:
+                return None
+        segment_dir = self.dir / JOURNAL_DIR
+        _secure_mkdirs(segment_dir, self.dir)
+        stamp = _now().strftime("%Y-%m")
+        target = None
+        for index in range(1_000_000):
+            candidate = segment_dir / (
+                "%s-%04d.jsonl" % (stamp, index))
+            if not candidate.exists() and not candidate.is_symlink():
+                target = candidate
+                break
+        if target is None:
+            raise OSError("could not allocate journal segment")
+        payload = _read_bytes_bounded(
+            current, MAX_LIFECYCLE_FILE_BYTES, self.dir)
+        digest = self._digest(payload)
+        os.replace(str(current), str(target))
+        self.hippo._journal_immediate(
+            "journal-segment",
+            segment=target.name,
+            segment_sha256=digest,
+            segment_bytes=len(payload))
+        return {
+            "segment": str(target.relative_to(self.dir)),
+            "sha256": digest,
+            "bytes": len(payload),
+        }
+
+    def compact(self, dry_run=False, keep_journal_days=365):
+        report = self.report()
+        cutoff = _now() - timedelta(days=keep_journal_days)
+        newest = self._journal_newest_timestamp()
+        actions = {
+            "journal_segment": (
+                report["journal_current"]["bytes"] >= MAX_AUX_BYTES
+                or (newest is not None and newest < cutoff)),
+            "journal_newest": (
+                newest.isoformat() if newest is not None else None),
+            "journal_cutoff": cutoff.isoformat(),
+            "archive_rotation": (
+                report["active_archive"]["bytes"]
+                >= ARCHIVE_ROTATE_BYTES),
+            "temporary_files": report["temporary_files"],
+            "keep_journal_days": keep_journal_days,
+            "dry_run": dry_run,
+        }
+        if dry_run:
+            return actions
+        if actions["journal_segment"]:
+            actions["journal_result"] = self.segment_journal(
+                older_than=cutoff)
+        if actions["archive_rotation"]:
+            with self.hippo._thread_lock:
+                with self.hippo._graph_lock():
+                    actions["archive_result"] = str(
+                        self.hippo._rotate_archive(
+                            self.dir / "archive.md",
+                            str(_now().date())).relative_to(self.dir))
+        actions["temporary_removed"] = _sweep_tmp_files(
+            self.dir, min_age_seconds=0)
+        return actions
+
+
+class JournalMerger:
+    """Deterministic three-way journal merge and graph replay."""
+
+    @staticmethod
+    def read(path):
+        events = []
+        with open(path, "r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "invalid journal JSON at %s:%d: %s" % (
+                            path, line_number, exc))
+                if not isinstance(event, dict) or not isinstance(
+                        event.get("op"), str):
+                    raise ValueError(
+                        "invalid journal event at %s:%d" % (
+                            path, line_number))
+                events.append(event)
+        return events
+
+    @staticmethod
+    def event_id(event):
+        existing = event.get("event_id")
+        if isinstance(existing, str) and existing:
+            return existing
+        payload = dict(event)
+        payload.pop("event_id", None)
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()[:24]
+
+    @staticmethod
+    def event_time(event):
+        value = event.get("ts_utc_ns")
+        if isinstance(value, int):
+            return value
+        timestamp = event.get("ts")
+        if isinstance(timestamp, str):
+            try:
+                parsed = datetime.fromisoformat(timestamp)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return int(parsed.timestamp() * 1_000_000_000)
+            except (ValueError, OverflowError, OSError):
+                pass
+        return 0
+
+    @classmethod
+    def merge(cls, base_events, ours_events, theirs_events):
+        base_ids = [cls.event_id(event) for event in base_events]
+        base_set = set(base_ids)
+        suffix = {}
+        for event in list(ours_events) + list(theirs_events):
+            event_id = cls.event_id(event)
+            if event_id in base_set:
+                continue
+            normalized = dict(event)
+            normalized["event_id"] = event_id
+            normalized.setdefault("format", 2)
+            normalized.setdefault(
+                "ts_utc_ns", cls.event_time(normalized))
+            suffix[event_id] = normalized
+        merged_suffix = sorted(
+            suffix.values(),
+            key=lambda event: (
+                cls.event_time(event),
+                str(event.get("by", "")),
+                cls.event_id(event),
+            ),
+        )
+        merged = []
+        for event in base_events:
+            normalized = dict(event)
+            normalized["event_id"] = cls.event_id(normalized)
+            normalized.setdefault("format", 2)
+            normalized.setdefault(
+                "ts_utc_ns", cls.event_time(normalized))
+            merged.append(normalized)
+        merged.extend(merged_suffix)
+        return merged
+
+    @staticmethod
+    def write(path, events):
+        payload = "".join(
+            json.dumps(
+                event, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")) + "\n"
+            for event in events
+        )
+        destination = Path(path).resolve()
+        if destination.parent.is_symlink():
+            raise UnsafePathError("merge output parent is a symlink")
+        _atomic_write(
+            destination, payload, boundary=destination.parent)
+
+    @classmethod
+    def replay(cls, events, graph_out):
+        temp = Path(tempfile.mkdtemp(prefix="mind-merge-replay-"))
+        graph = temp / GRAPH_FILE
+        hippo = Hippocampus(graph)
+        original_now = globals()["_now"]
+        previous_by = os.environ.get("MIND_BY")
+        previous_session = os.environ.get("MIND_SESSION")
+        try:
+            for event in events:
+                timestamp = event.get("ts")
+                try:
+                    event_now = datetime.fromisoformat(timestamp)
+                except (TypeError, ValueError):
+                    event_now = original_now()
+                globals()["_now"] = lambda value=event_now: value
+                if isinstance(event.get("by"), str):
+                    os.environ["MIND_BY"] = event["by"]
+                if isinstance(event.get("session"), str):
+                    os.environ["MIND_SESSION"] = event["session"]
+                else:
+                    os.environ.pop("MIND_SESSION", None)
+                op = event.get("op")
+                if op == "remember" and isinstance(
+                        event.get("text"), str):
+                    metadata = {
+                        key: event[key] for key in (
+                            "type", "scope", "authority",
+                            "source_trust", "sensitivity",
+                            "expires_at", "pinned", "entity", "attr")
+                        if key in event and event[key] is not None
+                    }
+                    hippo.remember(
+                        event["text"], metadata=metadata)
+                elif op == "confirm" and isinstance(
+                        event.get("ids"), list):
+                    hippo.bump(event["ids"])
+                elif op == "link":
+                    left = hippo.nodes.get(event.get("id"))
+                    right = hippo.nodes.get(event.get("other"))
+                    if left and right:
+                        hippo.link(
+                            left["text"], right["text"],
+                            event.get("relation", "related"))
+                elif op == "correct" and isinstance(
+                        event.get("old_text"), str) and isinstance(
+                        event.get("new_text"), str):
+                    hippo.correct(
+                        event["old_text"], event["new_text"])
+                elif op == "forget" and isinstance(
+                        event.get("id"), str):
+                    hippo.forget(
+                        event["id"], event.get("reason", "merged"))
+                elif op == "unlink":
+                    hippo.unlink(
+                        event.get("id"), event.get("other"))
+                elif op == "prune" and isinstance(
+                        event.get("ids"), list):
+                    with hippo._transaction():
+                        for node_id in event["ids"]:
+                            if node_id in hippo.nodes:
+                                hippo._purge_node(node_id)
+            payload = _read_bytes_bounded(
+                graph, MAX_GRAPH_BYTES, temp)
+            destination = Path(graph_out).resolve()
+            if destination.parent.is_symlink():
+                raise UnsafePathError(
+                    "merge graph output parent is a symlink")
+            _atomic_write(
+                destination, payload, boundary=destination.parent)
+        finally:
+            globals()["_now"] = original_now
+            if previous_by is None:
+                os.environ.pop("MIND_BY", None)
+            else:
+                os.environ["MIND_BY"] = previous_by
+            if previous_session is None:
+                os.environ.pop("MIND_SESSION", None)
+            else:
+                os.environ["MIND_SESSION"] = previous_session
+            shutil.rmtree(temp, ignore_errors=True)
+
+    @classmethod
+    def merge_files(cls, base, ours, theirs, output=None,
+                    graph_out=None):
+        base_events = cls.read(base)
+        ours_events = cls.read(ours)
+        theirs_events = cls.read(theirs)
+        merged = cls.merge(base_events, ours_events, theirs_events)
+        destination = Path(output or ours)
+        cls.write(destination, merged)
+        if graph_out:
+            cls.replay(merged, graph_out)
+        return {
+            "base": len(base_events),
+            "ours": len(ours_events),
+            "theirs": len(theirs_events),
+            "merged": len(merged),
+            "output": str(destination),
+            "graph_out": str(graph_out) if graph_out else None,
+        }
+
+
+class Doctor:
+    """Deterministic integrity, operability, and personal recall checks."""
+
+    def __init__(self, root, hippo, active):
+        self.root = Path(root).resolve()
+        self.dir = self.root / MIND_DIR
+        self.hippo = hippo
+        self.active = active
+
+    @staticmethod
+    def _finding(severity, code, message):
+        return {
+            "severity": severity,
+            "code": code,
+            "message": message,
+        }
+
+    def run(self):
+        findings = []
+        storage = StorageManager(self.root, self.hippo).report()
+        for name in ("graph", "signals", "active_archive"):
+            utilization = storage[name]["utilization"]
+            estimate = storage[name].get(
+                "estimated_days_to_boundary")
+            estimate_text = (
+                "; about %.1f days at the observed average" % estimate
+                if estimate is not None else "")
+            if utilization >= 1.0:
+                findings.append(self._finding(
+                    "error", "storage-%s" % name,
+                    "%s is at or above its lifecycle boundary%s"
+                    % (name, estimate_text)))
+            elif utilization >= 0.8:
+                findings.append(self._finding(
+                    "warning", "storage-%s" % name,
+                    "%s is %.1f%% of its boundary%s" % (
+                        name, utilization * 100, estimate_text)))
+        for filename in (
+                PRUNE_OUTBOX_FILE, LIFECYCLE_OUTBOX_FILE,
+                RESTORE_OUTBOX_FILE):
+            if (self.dir / filename).exists():
+                findings.append(self._finding(
+                    "warning", "pending-recovery",
+                    "%s awaits recovery" % filename))
+        scheduler = _read_scheduler_state(self.dir)
+        if (scheduler["lease_token"]
+                and scheduler["lease_until_ns"] < time.time_ns()):
+            findings.append(self._finding(
+                "warning", "expired-dream-lease",
+                "automatic-maintenance lease expired before completion"))
+        for target in Active.TARGETS:
+            path = self.root / target
+            if not path.exists() or path.is_symlink():
+                continue
+            try:
+                payload = _read_bytes_bounded(
+                    path, MAX_AUX_BYTES, self.root)
+            except (OSError, ValueError) as exc:
+                findings.append(self._finding(
+                    "warning", "agent-file-unreadable",
+                    "%s: %s" % (target, _display_text(exc, 160))))
+                continue
+            text = payload.decode("utf-8", "replace")
+            count = text.count(Active.BEGIN)
+            if count != 1:
+                findings.append(self._finding(
+                    "error", "agent-guard-count",
+                    "%s contains %d memory guard blocks" % (
+                        target, count)))
+            if payload.startswith(b"\xef\xbb\xbf"):
+                findings.append(self._finding(
+                    "info", "agent-bom", "%s starts with a BOM" % target))
+            if b"\r\n" in payload:
+                findings.append(self._finding(
+                    "info", "agent-crlf",
+                    "%s uses CRLF and passed tolerant parsing" % target))
+        tmp_count = sum(
+            1 for path in self.dir.glob("*.tmp")
+            if path.is_file() and not path.is_symlink())
+        if tmp_count:
+            findings.append(self._finding(
+                "warning", "temporary-debris",
+                "%d temporary files await age-gated cleanup" % tmp_count))
+        reranker = self.hippo.reranker
+        if reranker.cmd and reranker.configuration_error:
+            findings.append(self._finding(
+                "error", "embed-backend",
+                reranker.configuration_error))
+        horizon = _now() + timedelta(hours=26)
+        for node_id, node in self.hippo.nodes.items():
+            try:
+                created = datetime.fromisoformat(node.get("created", ""))
+            except (TypeError, ValueError):
+                continue
+            if created > horizon:
+                findings.append(self._finding(
+                    "warning", "clock-anomaly",
+                    "memory %s is more than 26 hours in the future"
+                    % node_id))
+        return {
+            "ok": not any(
+                item["severity"] == "error" for item in findings),
+            "findings": findings,
+            "storage": storage,
+            "scheduler": scheduler,
+            "version": __version__,
+        }
+
+    def bench(self):
+        valid = [
+            (node_id, node)
+            for node_id, node in self.hippo.nodes.items()
+            if self.hippo._valid_at(node)
+        ]
+        at_1 = 0
+        at_5 = 0
+        probes = 0
+        for node_id, node in valid[:200]:
+            keys = [
+                key for key in node.get("keys", [])
+                if key not in IDENTITY_KEYS
+            ]
+            query = " ".join(keys[:3]) or node["text"][:120]
+            results, _, _ = self.hippo.recall(query, top_k=5)
+            ids = [result[0] for result in results]
+            probes += 1
+            if ids[:1] == [node_id]:
+                at_1 += 1
+            if node_id in ids:
+                at_5 += 1
+        result = {
+            "ts": _now().isoformat(),
+            "version": __version__,
+            "probes": probes,
+            "recall_at_1": at_1 / probes if probes else 0.0,
+            "recall_at_5": at_5 / probes if probes else 0.0,
+        }
+        _append_regular(
+            self.dir / "doctor.jsonl",
+            (json.dumps(result, sort_keys=True) + "\n").encode("utf-8"),
+            boundary=self.dir, durable=True)
+        return result
+
+
+class Growth:
+    def __init__(self, mind_dir, hippo, cortex):
+        self.dir = Path(mind_dir)
+        self.hippo = hippo
+        self.cortex = cortex
+
+    def digest(self, days=7):
+        cutoff = _now() - timedelta(days=days)
+        counts = Counter()
+        first_event = None
+        for event in self.hippo.journal_entries():
+            timestamp = event.get("ts")
+            try:
+                when = datetime.fromisoformat(timestamp)
+            except (TypeError, ValueError):
+                continue
+            if first_event is None or when < first_event:
+                first_event = when
+            if when >= cutoff:
+                counts[event.get("op", "unknown")] += 1
+        dream_cycles = 0
+        promoted = 0
+        pruned = 0
+        conflicts = 0
+        dream_dir = self.dir / DREAMS_DIR
+        if dream_dir.is_dir() and not dream_dir.is_symlink():
+            for path in sorted(dream_dir.glob("*.md")):
+                try:
+                    date = datetime.strptime(
+                        path.stem, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                if date < cutoff.replace(
+                        hour=0, minute=0, second=0, microsecond=0):
+                    continue
+                try:
+                    text = _read_text_retry(
+                        path, max_bytes=MAX_AUX_BYTES,
+                        boundary=self.dir)
+                except (OSError, ValueError, UnicodeError):
+                    continue
+                dream_cycles += text.count("# Dream journal")
+                for match in re.finditer(
+                        r"nodes: \d+ \| pruned: (\d+) \| "
+                        r"promoted clusters: (\d+) \| "
+                        r"conflicts flagged: (\d+)", text):
+                    pruned += int(match.group(1))
+                    promoted += int(match.group(2))
+                    conflicts += int(match.group(3))
+        return {
+            "days": days,
+            "facts_learned": counts["remember"],
+            "facts_confirmed": counts["confirm"],
+            "facts_corrected": counts["correct"],
+            "facts_forgotten": counts["forget"] + counts["prune"],
+            "dream_cycles": dream_cycles,
+            "promoted_clusters": promoted,
+            "conflicts_flagged": conflicts,
+            "current_memories": sum(
+                self.hippo._valid_at(node)
+                for node in self.hippo.nodes.values()),
+            "cortex_topics": len(self.cortex.files()),
+            "memory_age_days": (
+                max(0, (_now() - first_event).days)
+                if first_event is not None else 0),
+        }
 
 
 # ────────────────────────────────────────────────────────────────
@@ -3548,25 +5934,37 @@ class Mind:
         self.cortex = None
         self.dreamer = None
         self.active = None
+        self.pending_queue = None
+        self.lifecycle = None
+        self.storage = None
+        self.user_dir = None
+        self.user_hippo = None
 
     def init(self):
         # BEFORE any mkdir: a symlinked .mind would let init create
         # cortex/dreams directories outside the project (auditor finding)
         if self.dir.is_symlink():
             raise ValueError("refusing: .mind is a symlink")
-        existing = (self.dir / GRAPH_FILE).exists()
         for subdir in (CORTEX_DIR, DREAMS_DIR):
             if (self.dir / subdir).is_symlink():
                 raise ValueError("refusing: .mind/%s is a symlink" % subdir)
         _secure_mkdirs(self.dir, self.root)
         _secure_mkdirs(self.dir / CORTEX_DIR, self.root)
         _secure_mkdirs(self.dir / DREAMS_DIR, self.root)
+        _sweep_tmp_files(self.dir)
+        _sync_portable_runtime(self.root)
+        StorageManager(self.root, None).recover_restore()
+        existing = (self.dir / GRAPH_FILE).exists()
         self.hippo = Hippocampus(self.dir / GRAPH_FILE)
         if not existing:
             self.hippo._save()
         self.cortex = Cortex(self.dir / CORTEX_DIR)
         self.dreamer = Dreamer(self.dir, self.hippo, self.cortex)
         self.active = Active(self.dir, self.hippo, self.cortex)
+        self.pending_queue = PendingQueue(self.dir)
+        self.lifecycle = LifecycleManager(self.root, self.hippo)
+        self.lifecycle.recover()
+        self.storage = StorageManager(self.root, self.hippo)
         written = self._refresh_exports()
         verb = "repaired and refreshed" if existing else "created"
         print("""%s mind memory in %s
@@ -3602,10 +6000,37 @@ export results: %s""" % (
             print("no mind memory here. run: %s init"
                   % _invocation(self.root), file=sys.stderr)
             sys.exit(1)
+        _sweep_tmp_files(self.dir)
+        _sync_portable_runtime(self.root)
+        StorageManager(self.root, None).recover_restore()
         self.hippo = Hippocampus(self.dir / GRAPH_FILE)
         self.cortex = Cortex(self.dir / CORTEX_DIR)
         self.dreamer = Dreamer(self.dir, self.hippo, self.cortex)
         self.active = Active(self.dir, self.hippo, self.cortex)
+        self.pending_queue = PendingQueue(self.dir)
+        self.lifecycle = LifecycleManager(self.root, self.hippo)
+        self.lifecycle.recover()
+        self.storage = StorageManager(self.root, self.hippo)
+
+    def _ensure_user(self, create=False):
+        configured = os.environ.get("MIND_USER_HOME")
+        user_dir = (
+            Path(configured).expanduser().resolve()
+            if configured else (Path.home() / MIND_DIR).resolve())
+        if user_dir.is_symlink():
+            raise ValueError("refusing: user memory directory is a symlink")
+        if not user_dir.exists():
+            if not create:
+                return None
+            _secure_mkdirs(user_dir, user_dir.parent)
+        if create:
+            _secure_mkdirs(user_dir / CORTEX_DIR, user_dir.parent)
+            _secure_mkdirs(user_dir / DREAMS_DIR, user_dir.parent)
+        self.user_dir = user_dir
+        self.user_hippo = Hippocampus(user_dir / GRAPH_FILE)
+        if create and not (user_dir / GRAPH_FILE).exists():
+            self.user_hippo._save()
+        return self.user_hippo
 
     def _refresh_exports(self):
         """Publish derived files from the newest graph under the graph lock."""
@@ -3648,62 +6073,492 @@ export results: %s""" % (
         """
         if os.environ.get("MIND_AUTO_DREAM", "1").lower() in ("0", "false", "no"):
             return False
+        token = None
         try:
-            pending = 0
-            sig = self.dir / SIGNALS_FILE
-            if sig.exists() and not sig.is_symlink():
-                try:
-                    signal_text = _read_text_retry(
-                        sig, max_bytes=5_000_000, boundary=self.dir)
-                except (OSError, ValueError, UnicodeError):
-                    signal_text = ""
-                pending = sum(
-                    1 for ln in signal_text.splitlines() if ln.strip())
-            if pending == 0:
-                return False
-            last_date = None
-            ddir = self.dir / DREAMS_DIR
-            latest = _latest_dream_stem(ddir)
-            if latest:
-                try:
-                    last_date = datetime.strptime(
-                        latest, "%Y-%m-%d").date()
-                except ValueError:
-                    last_date = None
-            stale = (last_date is None or
-                     last_date <= (_now() - timedelta(hours=AUTO_DREAM_HOURS)).date())
-            if not (pending >= AUTO_DREAM_SIGNALS or stale):
+            token = _scheduler_claim(self.dir)
+            if token is None:
                 return False
             memo, _ = self.dreamer.dream(dry_run=False)
-            written = self._refresh_exports()
+            _scheduler_complete(self.dir, token)
             print("  🌙 auto-dream: memory consolidated (%s)"
                   % (memo or "journal skipped"))
-            print("  export: %s" % self._export_summary(written))
             return True
         except Exception as e:                       # noqa: BLE001
             # maintenance must never break the write it rode on
+            if token is not None:
+                try:
+                    _scheduler_release(self.dir, token)
+                except Exception:
+                    pass
             print("  (auto-dream skipped: %s)" % e, file=sys.stderr)
             return False
 
-    def remember(self, text):
+    def remember(self, text, metadata=None, confidence=1.0):
         self._ensure()
-        nid = self.hippo.remember(text)
+        metadata = dict(metadata or {})
+        policy = PolicyEngine.classify(
+            text,
+            source_trust=metadata.get("source_trust", "user"),
+            explicit=True)
+        if policy["decision"] == "reject":
+            raise ValueError("memory rejected: %s" % policy["reason"])
+        scope = metadata.get("scope", "project")
+        target = self.hippo
+        if scope == "user":
+            target = self._ensure_user(create=True)
+            metadata["scope"] = "user"
+        nid = target.remember(
+            policy["text"], confidence=confidence, metadata=metadata)
+        if scope == "user":
+            print("remembered in user memory: %s" % _display_text(
+                target.nodes[nid]["text"]))
+            print("  (node user:%s, total user nodes: %d)" % (
+                nid, len(target.nodes)))
+            return
+        self._auto_dream()
         written = self._refresh_exports()
         print("remembered: %s" % _display_text(self.hippo.nodes[nid]["text"]))
         print("  (node %s, total nodes: %d)" % (
             _display_text(nid, 128), len(self.hippo.nodes)))
         print("  export: %s" % self._export_summary(written))
+
+    def remember_many(self, records):
+        self._ensure()
+        for record in records:
+            text = record if isinstance(record, str) else record.get("text")
+            trust = (
+                record.get("source_trust", "user")
+                if isinstance(record, dict) else "user")
+            policy = PolicyEngine.classify(
+                text, source_trust=trust, explicit=True)
+            if policy["decision"] == "reject":
+                raise ValueError(
+                    "batch memory rejected: %s" % policy["reason"])
+            if isinstance(record, dict) and record.get(
+                    "scope", "project") != "project":
+                raise ValueError(
+                    "bulk ingest currently accepts project scope only")
+        node_ids = self.hippo.remember_many(records)
         self._auto_dream()
+        written = self._refresh_exports()
+        print("remembered batch: %d records (%d total nodes)" % (
+            len(node_ids), len(self.hippo.nodes)))
+        print("  export: %s" % self._export_summary(written))
+
+    def capture(self, text, source_trust="user"):
+        self._ensure()
+        decision = PolicyEngine.classify(
+            text, source_trust=source_trust, explicit=False)
+        if decision["decision"] == "accept":
+            metadata = {
+                "source_trust": source_trust,
+                "sensitivity": "internal",
+                "scope": "project",
+            }
+            metadata.update(
+                PolicyEngine.infer_metadata(decision["text"]))
+            self.remember(decision["text"], metadata=metadata)
+            return "accepted"
+        if decision["decision"] == "quarantine":
+            item = self.pending_queue.add(
+                decision["text"], decision["reason"], source_trust)
+            print("quarantined for review: %s (%s)" % (
+                item["id"], item["reason"]))
+            return "quarantined"
+        print("capture rejected: %s" % decision["reason"])
+        return "rejected"
+
+    def pending(self):
+        self._ensure()
+        items = self.pending_queue.list()
+        if not items:
+            print("pending queue is empty")
+            return
+        print("pending captures: %d" % len(items))
+        for item in items:
+            print("  %s [%s] %s" % (
+                _display_text(item["id"], 32),
+                _display_text(item.get("source_trust", "?"), 20),
+                _display_text(item["text"], 300)))
+            print("    reason: %s" % _display_text(
+                item.get("reason", "review required"), 160))
+
+    def approve(self, item_id):
+        self._ensure()
+        item = self.pending_queue.pop(item_id)
+        if item is None:
+            raise ValueError("unknown pending id: %s" % item_id)
+        self.remember(item["text"])
+        print("approved pending capture: %s" % item_id)
+
+    def reject(self, item_id):
+        self._ensure()
+        item = self.pending_queue.pop(item_id)
+        if item is None:
+            raise ValueError("unknown pending id: %s" % item_id)
+        print("rejected pending capture: %s" % item_id)
+
+    def context(self, as_json=False):
+        self._ensure()
+        nodes = sorted(
+            ((node_id, node) for node_id, node in self.hippo.nodes.items()
+             if self.hippo._valid_at(node)),
+            key=lambda item: (
+                item[1].get("weight", 0.0),
+                item[1].get("access_count", 0),
+                item[1].get("last_accessed", ""),
+                item[0],
+            ),
+            reverse=True,
+        )[:8]
+        data = {
+            "format": 1,
+            "version": __version__,
+            "project_root": ".",
+            "memories": [
+                {
+                    "id": node_id,
+                    "text": node["text"],
+                    "weight": node.get("weight", 1.0),
+                    "confidence": node.get("confidence", 1.0),
+                }
+                for node_id, node in nodes
+            ],
+            "cortex": [
+                path.name for path in self.cortex.files()[:6]
+            ],
+            "pending": len(self.pending_queue.list()),
+            "scheduler": _read_scheduler_state(self.dir),
+        }
+        user = self._ensure_user(create=False)
+        data["user_memories"] = (
+            [
+                {
+                    "id": "user:" + node_id,
+                    "text": node["text"],
+                    "weight": node.get("weight", 1.0),
+                }
+                for node_id, node in sorted(
+                    user.nodes.items(),
+                    key=lambda item: (
+                        item[1].get("weight", 0.0), item[0]),
+                    reverse=True)
+                if user._valid_at(node)
+            ][:8]
+            if user is not None else []
+        )
+        if as_json:
+            print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+        else:
+            for item in data["memories"]:
+                print("- %s" % _display_text(item["text"]))
+        return data
+
+    def suggest_user(self, as_json=False):
+        """Suggest strong project facts for explicit user-tier promotion."""
+        self._ensure()
+        user = self._ensure_user(create=False)
+        existing = set(user.nodes) if user is not None else set()
+        candidates = []
+        for node_id, node in self.hippo.nodes.items():
+            if node_id in existing or not self.hippo._valid_at(node):
+                continue
+            if node.get("scope", "project") != "project":
+                continue
+            if node.get("sensitivity") in ("sensitive", "secret"):
+                continue
+            if node.get("source_trust") in ("repository", "untrusted"):
+                continue
+            policy = PolicyEngine.classify(
+                node.get("text", ""),
+                source_trust=node.get("source_trust", "user"),
+                explicit=False,
+            )
+            if policy["decision"] != "accept":
+                continue
+            access = int(node.get("access_count", 0))
+            memory_type = node.get("type", "semantic")
+            pinned = bool(node.get("pinned", False))
+            if not (
+                    pinned or access >= 2 or
+                    (access >= 1 and memory_type in (
+                        "decision", "procedural"))):
+                continue
+            score = (
+                access * 10
+                + (8 if memory_type == "procedural" else 0)
+                + (6 if memory_type == "decision" else 0)
+                + (20 if pinned else 0)
+                + int(float(node.get("confidence", 1.0)) * 5)
+            )
+            candidates.append({
+                "id": node_id,
+                "text": node["text"],
+                "score": score,
+                "reason": (
+                    "pinned" if pinned else
+                    "%d confirmed uses; %s memory" % (
+                        access, memory_type)
+                ),
+                "promotion": {
+                    "scope": "user",
+                    "requires_explicit_write": True,
+                },
+            })
+        candidates.sort(key=lambda item: (
+            -item["score"], item["id"]))
+        candidates = candidates[:20]
+        result = {
+            "format": 1,
+            "suggestions": candidates,
+            "copied": 0,
+            "policy": (
+                "suggestions never copy project memory; use an explicit "
+                "user-tier write after reviewing the text"),
+        }
+        if as_json:
+            print(json.dumps(
+                result, ensure_ascii=False, sort_keys=True))
+            return result
+        if not candidates:
+            print("no user-tier promotion suggestions")
+            return result
+        print("user-tier promotion suggestions (%d; nothing copied):"
+              % len(candidates))
+        for item in candidates:
+            print("  %s [%s] %s" % (
+                item["id"], item["reason"],
+                _display_text(item["text"], 500)))
+        print("review a suggestion, then write it explicitly with:")
+        print('  %s remember --user "text"' % _invocation(self.root))
+        return result
+
+    def integrations(self, as_json=False):
+        """Emit portable argv recipes for host lifecycle integrations."""
+        invocation = _invocation(self.root)
+        prefix = CommandEmbed._split_command(invocation) or [invocation]
+        recipes = {
+            "format": 1,
+            "session_start": {
+                "argv": prefix + ["context", "--json"],
+                "purpose": "inject current project and user memory context",
+            },
+            "durable_capture": {
+                "argv": prefix + ["capture", "<durable-project-fact>"],
+                "purpose": "policy-gate one automatically extracted fact",
+            },
+            "pre_compaction": {
+                "argv": prefix + ["remember", "--batch"],
+                "stdin": (
+                    "JSONL strings or typed objects containing only durable "
+                    "facts extracted by the host before context compaction"),
+            },
+            "session_end": {
+                "argv": prefix + ["dream"],
+                "purpose": "run deterministic maintenance after the session",
+            },
+            "scheduled_backstop": {
+                "argv": prefix + ["dream"],
+                "purpose": (
+                    "optional maintenance backstop; the internal scheduler "
+                    "remains authoritative and lease-bounded"),
+            },
+            "protocol_server": {
+                "argv": prefix + ["mcp"],
+                "transport": "standard input and output",
+            },
+        }
+        if as_json:
+            print(json.dumps(
+                recipes, ensure_ascii=False, sort_keys=True))
+            return recipes
+        print("mind integration recipes")
+        for name in (
+                "session_start", "durable_capture", "pre_compaction",
+                "session_end", "scheduled_backstop", "protocol_server"):
+            recipe = recipes[name]
+            print("  %s: %s" % (
+                name, json.dumps(
+                    recipe["argv"], ensure_ascii=False)))
+        print("use argv arrays directly; do not interpolate untrusted text "
+              "through a shell")
+        return recipes
+
+    def forget(self, node_id, reason="user requested"):
+        self._ensure()
+        if not self.hippo.forget(node_id, reason):
+            raise ValueError("unknown memory id: %s" % node_id)
+        self._refresh_exports()
+        print("forgotten from retrieval: %s" % node_id)
+
+    def unlink(self, a, b):
+        self._ensure()
+        if not self.hippo.unlink(a, b):
+            raise ValueError("link not found")
+        self._refresh_exports()
+        print("unlinked memories")
+
+    def redact(self, node_id, reason):
+        self._ensure()
+        result = self.lifecycle.begin(
+            "redact", node_id, reason=reason)
+        self._refresh_exports()
+        print("redacted %s across managed stores (%d replacements)" % (
+            result["digest"][:12],
+            result["rewritten_occurrences"]))
+
+    def purge(self, node_id, confirm=False):
+        self._ensure()
+        inventory = self.lifecycle.inventory(node_id)
+        print("purge inventory for %s:" % node_id)
+        print("  payload variants: %d" % len(inventory["originals"]))
+        print("  files with payload: %d" % len(inventory["files"]))
+        print("  byte occurrences: %d" % inventory["occurrences"])
+        for item in inventory["files"]:
+            print("  - %s: %d occurrence(s)" % (
+                _display_text(item["path"], 300),
+                item["occurrences"]))
+        if not confirm:
+            print("dry run only; rerun with --confirm --all-traces")
+            return inventory
+        result = self.lifecycle.begin(
+            "purge", node_id, reason="irreversible user-confirmed purge")
+        self._refresh_exports()
+        print("purged %s across all managed stores (%d replacements)" % (
+            result["digest"][:12],
+            result["rewritten_occurrences"]))
+        return result
+
+    def find_memory_ids(self, match):
+        self._ensure()
+        match = Hippocampus._validated_query(match, "purge match")
+        return [
+            node_id for node_id, node in self.hippo.nodes.items()
+            if match in node.get("text", "")
+        ]
+
+    def backup(self, label=None):
+        self._ensure()
+        name, manifest = self.storage.backup(label)
+        print("backup created: %s (%d files)" % (
+            name, len(manifest["files"])))
+        return name
+
+    def checkpoint(self, label=None):
+        return self.backup(label or "checkpoint")
+
+    def restore(self, name, confirm=False):
+        self._ensure()
+        result = self.storage.restore(name, confirm=confirm)
+        if not confirm:
+            print("restore plan: %s contains %d files" % (
+                name, result["files"]))
+            print("dry run only; rerun with --confirm")
+            return result
+        self._ensure()
+        self._refresh_exports()
+        print("restored %s (%d files); pre-restore checkpoint: %s" % (
+            name, result["files"], result["checkpoint"]))
+        return result
+
+    def compact(self, dry_run=False, keep_journal_days=365):
+        self._ensure()
+        result = self.storage.compact(
+            dry_run=dry_run,
+            keep_journal_days=keep_journal_days)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return result
+
+    def doctor(self, run_bench=False, as_json=False):
+        self._ensure()
+        doctor = Doctor(self.root, self.hippo, self.active)
+        result = doctor.run()
+        if run_bench:
+            result["bench"] = doctor.bench()
+        if as_json:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return result
+        print("mind doctor: %s" % ("PASS" if result["ok"] else "FAIL"))
+        if not result["findings"]:
+            print("  no integrity or operability findings")
+        for finding in result["findings"]:
+            print("  %s %s: %s" % (
+                finding["severity"].upper(),
+                finding["code"], finding["message"]))
+        if run_bench:
+            bench = result["bench"]
+            print("  personal recall: @1 %.3f | @5 %.3f (%d probes)" % (
+                bench["recall_at_1"], bench["recall_at_5"],
+                bench["probes"]))
+        return result
+
+    def growth(self, days=7, as_json=False):
+        self._ensure()
+        result = Growth(
+            self.dir, self.hippo, self.cortex).digest(days=days)
+        if as_json:
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return result
+        print("mind growth - last %d days" % days)
+        print("  learned %d | confirmed %d | corrected %d | forgotten %d" % (
+            result["facts_learned"], result["facts_confirmed"],
+            result["facts_corrected"], result["facts_forgotten"]))
+        print("  dreams %d | promoted %d | conflicts %d" % (
+            result["dream_cycles"], result["promoted_clusters"],
+            result["conflicts_flagged"]))
+        print("  now %d current memories across %d cortex topics" % (
+            result["current_memories"], result["cortex_topics"]))
+        return result
 
     def link(self, a, b, relation="related"):
         self._ensure()
-        print(_display_text(self.hippo.link(a, b, relation)))
-        self._refresh_exports()
+        result = self.hippo.link(a, b, relation)
         self._auto_dream()
+        self._refresh_exports()
+        print(_display_text(result))
 
-    def recall(self, query, at=None):
+    def recall(self, query, at=None, explain=False):
         self._ensure()
         results, latency, kinds = self.hippo.recall(query, at=at)
+        user_results = []
+        user_latency = 0.0
+        user = self._ensure_user(create=False)
+        if user is not None:
+            user_results, user_latency, user_kinds = user.recall(
+                query, at=at)
+            seen = {node_id for node_id, _, _ in results}
+            user_results = [
+                (node_id, score, node)
+                for node_id, score, node in user_results
+                if node_id not in seen
+            ]
+            if user_results:
+                combined = [
+                    ("project", node_id, score * 1.05, node)
+                    for node_id, score, node in results
+                ]
+                combined.extend(
+                    ("user", node_id, score, node)
+                    for node_id, score, node in user_results)
+                combined.sort(key=lambda item: (
+                    -item[2], 0 if item[0] == "project" else 1,
+                    item[1]))
+                combined = combined[:RECALL_TOP_K]
+                results = [
+                    (("user:" + node_id) if tier == "user" else node_id,
+                     score, node)
+                    for tier, node_id, score, node in combined
+                ]
+                kinds = {
+                    (("user:" + node_id) if tier == "user" else node_id):
+                    "%s/%s" % (
+                        tier,
+                        user_kinds.get(node_id, "trace")
+                        if tier == "user" else kinds.get(
+                            node_id, "trace"))
+                    for tier, node_id, _, _ in combined
+                }
+        latency += user_latency
         if not results:
             print("no results for \"%s\"%s (empty graph or no match)"
                   % (_display_text(query), " at %s" % _display_text(
@@ -3720,6 +6575,20 @@ export results: %s""" % (
             print("     (confidence %.1f, recalled %dx, weight %.2f, id %s)"
                   % (n.get("confidence", 1), n.get("access_count", 0),
                      n["weight"], _display_text(nid, 128)))
+            if explain:
+                source = self.user_hippo if nid.startswith(
+                    "user:") and self.user_hippo is not None else self.hippo
+                lookup = nid[5:] if nid.startswith("user:") else nid
+                receipt = source.last_recall_explain.get(
+                    "results", {}).get(lookup, {})
+                print("     explain: %s" % json.dumps(
+                    receipt, ensure_ascii=False, sort_keys=True))
+        if explain:
+            reports = {"project": self.hippo.reranker.last_report}
+            if self.user_hippo is not None:
+                reports["user"] = self.user_hippo.reranker.last_report
+            print("\n  backend receipts: %s" % json.dumps(
+                reports, ensure_ascii=False, sort_keys=True))
         # path-aware like the exported contract: agents copy this hint
         # literally, and a bare `mind.py` mis-fires outside the project
         # root — the same field-failure class _invocation() exists to kill
@@ -3730,15 +6599,28 @@ export results: %s""" % (
     def confirm(self, node_ids):
         self._ensure()
         unique_ids = list(dict.fromkeys(node_ids))
-        changed = self.hippo.bump(unique_ids)
-        known = [nid for nid in unique_ids if nid in self.hippo.nodes]
-        unknown = [nid for nid in unique_ids if nid not in self.hippo.nodes]
+        project_ids = [
+            node_id for node_id in unique_ids
+            if not node_id.startswith("user:")]
+        user_ids = [
+            node_id[5:] for node_id in unique_ids
+            if node_id.startswith("user:")]
+        changed = self.hippo.bump(project_ids)
+        user = self._ensure_user(create=False)
+        user_changed = user.bump(user_ids) if user is not None else False
+        changed = changed or user_changed
+        known = [nid for nid in project_ids if nid in self.hippo.nodes]
+        known.extend(
+            "user:" + nid for nid in user_ids
+            if user is not None and nid in user.nodes)
+        unknown = [nid for nid in unique_ids if nid not in known]
         if changed and known:
-            self._refresh_exports()
+            if project_ids:
+                self._auto_dream()
+                self._refresh_exports()
             print("reinforced %d memor%s — stability +%d days each, edges "
                   "restrengthened" % (len(known), "y" if len(known) == 1 else "ies",
                                       int(STABILITY_PER_ACCESS)))
-            self._auto_dream()
         for nid in unknown:
             print("unknown id: %s (get ids from `recall` output)"
                   % _display_text(nid, 128),
@@ -3756,13 +6638,13 @@ export results: %s""" % (
         if self.hippo._clean_text(new_text) == old:
             print("already current — nothing changed.")
             return
+        self._auto_dream()
         self._refresh_exports()
         print("reconsolidated:")
         print("  was: %s" % _display_text(old))
         print("  now: %s" % _display_text(
             self.hippo._clean_text(new_text)))
         print("  (old fact CLOSED, not erased — `why` and `--at` can still reach it)")
-        self._auto_dream()
 
     def why(self, nid):
         """Bounded provenance answer: origin, validity, and latest events."""
@@ -3818,6 +6700,26 @@ export results: %s""" % (
             other = self.hippo.nodes.get(nbr, {})
             print("  %s: %s (%s)" % (
                 _display_text(e["relation"], 60),
+                _display_text(nbr, 128),
+                _display_text(other.get("text", "?"), 60)))
+        for nbr, edge in self.hippo.edges.get(nid, {}).items():
+            if edge.get("relation") in ("supersedes", "superseded-by"):
+                continue
+            other = self.hippo.nodes.get(nbr, {})
+            direction = " -> " if edge.get("directed") else " <-> "
+            conflict = ""
+            if edge.get("relation") == "possible-conflict":
+                conflict = " [%s%s]" % (
+                    edge.get("conflict_kind", "legacy"),
+                    " %s.%s" % (
+                        edge.get("conflict_entity"),
+                        edge.get("conflict_attr"))
+                    if edge.get("conflict_kind") == "slot" else "",
+                )
+            print("  relation:   %s%s%s%s (%s)" % (
+                _display_text(edge.get("relation", "related"), 60),
+                _display_text(conflict, 260),
+                direction,
                 _display_text(nbr, 128),
                 _display_text(other.get("text", "?"), 60)))
         events = self.hippo.journal_entries(nid)
@@ -3911,22 +6813,29 @@ export results: %s""" % (
         active_size = (active_path.stat().st_size
                        if active_path.exists() and not active_path.is_symlink()
                        else 0)
-        pending = 0
-        sig = self.dir / SIGNALS_FILE
-        if sig.exists() and not sig.is_symlink():
-            try:
-                signal_text = _read_text_retry(
-                    sig, max_bytes=5_000_000, boundary=self.dir)
-            except (OSError, ValueError, UnicodeError):
-                signal_text = ""
-            pending = sum(
-                1 for ln in signal_text.splitlines() if ln.strip())
-        journal_path = self.dir / JOURNAL_FILE
-        journal_n = len(self.hippo.journal_entries())
-        journal_display = str(journal_n)
-        if journal_path.exists() and not journal_path.is_symlink() \
-                and journal_path.stat().st_size > 10_000_000:
-            journal_display += " (events parsed from the last 10 MB)"
+        scheduler = _read_scheduler_state(self.dir)
+        pending = scheduler["pending"]
+        journal_entries = self.hippo.journal_entries()
+        journal_n = journal_entries.total_count
+        journal_retained = len(journal_entries)
+        storage = self.storage.report()
+        journal_current_bytes = storage["journal_current"]["bytes"]
+        journal_segment_bytes = storage["journal_segments"]["bytes"]
+        journal_segment_count = storage["journal_segments"]["count"]
+        signal_path = self.dir / SIGNALS_FILE
+        signal_bytes = (
+            signal_path.stat().st_size
+            if signal_path.exists() and not signal_path.is_symlink()
+            else 0)
+        graph_bytes = (
+            (self.dir / GRAPH_FILE).stat().st_size
+            if (self.dir / GRAPH_FILE).exists() else 0)
+        archive_bytes = sum(
+            path.stat().st_size for path in self.dir.glob("archive*.md")
+            if path.is_file() and not path.is_symlink())
+        tmp_debris = sum(
+            1 for path in self.dir.glob("*.tmp")
+            if path.is_file() and not path.is_symlink())
         print("""=== mind memory health ===
 path:            %s
 nodes:           %d (%d currently true, %d superseded)
@@ -3935,11 +6844,475 @@ avg weight:      %.3f
 cortex files:    %d
 working memory:  %d bytes (~%d estimated tokens)
 pending signals: %d
-journal events:  %s (append-only provenance)
+journal events:  %d total (%d retained from the bounded read window)
+journal storage: current %d B | %d segments / %d B
+storage:         graph %d B | archive %d B | signals %d B
+temporary files: %d stale candidates
 version:         %s""" % (self.dir, n_nodes, n_valid, n_nodes - n_valid,
                           n_edges, avg_w, cortex_n,
                           active_size, active_size // 4, pending,
-                          journal_display, __version__))
+                          journal_n, journal_retained,
+                          journal_current_bytes, journal_segment_count,
+                          journal_segment_bytes,
+                          graph_bytes, archive_bytes,
+                          signal_bytes, tmp_debris, __version__))
+
+
+class MCPServer:
+    """Minimal stdio MCP server using newline-delimited JSON-RPC 2.0."""
+
+    def __init__(self, project_root=None):
+        self.root = Path(project_root or os.getcwd()).resolve()
+        self.mind = Mind(self.root)
+        self.initialized = False
+
+    @staticmethod
+    def _schema(properties=None, required=None):
+        return {
+            "type": "object",
+            "properties": properties or {},
+            "required": required or [],
+            "additionalProperties": False,
+        }
+
+    @classmethod
+    def tools(cls):
+        string = {"type": "string"}
+        boolean = {"type": "boolean"}
+        array = {"type": "array", "items": string, "minItems": 1}
+        return [
+            {
+                "name": "remember",
+                "description": "Store one durable project fact.",
+                "inputSchema": cls._schema(
+                    {
+                        "text": string,
+                        "automatic": {
+                            "type": "boolean",
+                            "default": False,
+                        },
+                        "source_trust": {
+                            "type": "string",
+                            "enum": sorted(PolicyEngine.TRUST_LEVELS),
+                        },
+                        "type": {
+                            "type": "string",
+                            "enum": sorted(MEMORY_TYPES),
+                        },
+                        "scope": {
+                            "type": "string",
+                            "enum": sorted(MEMORY_SCOPES),
+                        },
+                        "sensitivity": {
+                            "type": "string",
+                            "enum": sorted(MEMORY_SENSITIVITY),
+                        },
+                        "authority": string,
+                        "expires_at": string,
+                        "pinned": boolean,
+                        "entity": string,
+                        "attr": string,
+                    },
+                    ["text"]),
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": False,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "recall",
+                "description": "Recall project facts for a question.",
+                "inputSchema": cls._schema(
+                    {"query": string, "at": string}, ["query"]),
+                "annotations": {
+                    "readOnlyHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "confirm",
+                "description": "Reinforce recalled memories that answered.",
+                "inputSchema": cls._schema(
+                    {"ids": array}, ["ids"]),
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": False,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "correct",
+                "description": "Supersede an incorrect fact with a new fact.",
+                "inputSchema": cls._schema(
+                    {"old_hint": string, "new_text": string},
+                    ["old_hint", "new_text"]),
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "link",
+                "description": "Link two facts with a typed relation.",
+                "inputSchema": cls._schema(
+                    {"a": string, "b": string, "relation": string},
+                    ["a", "b"]),
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": False,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "why",
+                "description": "Explain one memory's provenance and history.",
+                "inputSchema": cls._schema({"id": string}, ["id"]),
+                "annotations": {
+                    "readOnlyHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "entity",
+                "description": "List current and historical facts for a term.",
+                "inputSchema": cls._schema({"term": string}, ["term"]),
+                "annotations": {
+                    "readOnlyHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "dream",
+                "description": "Run deterministic memory maintenance.",
+                "inputSchema": cls._schema(
+                    {"dry_run": boolean}),
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "status",
+                "description": "Return memory and storage health.",
+                "inputSchema": cls._schema(),
+                "annotations": {
+                    "readOnlyHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "context",
+                "description": "Return structured hot project and user context.",
+                "inputSchema": cls._schema(),
+                "annotations": {
+                    "readOnlyHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "suggest_user",
+                "description": (
+                    "Suggest reviewed project facts for explicit user-tier "
+                    "promotion without copying them."),
+                "inputSchema": cls._schema(),
+                "annotations": {
+                    "readOnlyHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "doctor",
+                "description": "Run deterministic integrity and operability checks.",
+                "inputSchema": cls._schema({"bench": boolean}),
+                "annotations": {
+                    "readOnlyHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "growth",
+                "description": "Return the journal-grounded memory growth digest.",
+                "inputSchema": cls._schema({
+                    "days": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 36500,
+                    },
+                }),
+                "annotations": {
+                    "readOnlyHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "forget",
+                "description": (
+                    "Tombstone one memory out of retrieval while retaining "
+                    "its provenance."),
+                "inputSchema": cls._schema(
+                    {"id": string, "reason": string}, ["id"]),
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "unlink",
+                "description": "Remove a relation without deleting either memory.",
+                "inputSchema": cls._schema(
+                    {"a": string, "b": string}, ["a", "b"]),
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "redact",
+                "description": (
+                    "Replace a memory payload across managed stores with a "
+                    "digest receipt."),
+                "inputSchema": cls._schema(
+                    {"id": string, "reason": string}, ["id", "reason"]),
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "openWorldHint": False,
+                },
+            },
+            {
+                "name": "purge",
+                "description": (
+                    "Inventory or irreversibly remove all managed traces. "
+                    "confirm=false is always a dry run."),
+                "inputSchema": cls._schema(
+                    {"id": string, "confirm": boolean}, ["id"]),
+                "annotations": {
+                    "readOnlyHint": False,
+                    "destructiveHint": True,
+                    "openWorldHint": False,
+                },
+            },
+        ]
+
+    @staticmethod
+    def _response(request_id, result=None, error=None):
+        response = {"jsonrpc": "2.0", "id": request_id}
+        if error is not None:
+            response["error"] = error
+        else:
+            response["result"] = result if result is not None else {}
+        return response
+
+    @staticmethod
+    def _error(code, message, data=None):
+        error = {"code": code, "message": message}
+        if data is not None:
+            error["data"] = data
+        return error
+
+    def _capture(self, method, *args, **kwargs):
+        from contextlib import redirect_stderr, redirect_stdout
+        from io import StringIO
+        output, error = StringIO(), StringIO()
+        try:
+            with redirect_stdout(output), redirect_stderr(error):
+                if not self.mind.dir.exists():
+                    self.mind.init()
+                method(*args, **kwargs)
+        except SystemExit as exc:
+            raise ValueError(
+                error.getvalue().strip() or
+                "tool exited with status %s" % exc.code)
+        text = output.getvalue().strip()
+        warning = error.getvalue().strip()
+        if warning:
+            text = (text + "\n" if text else "") + warning
+        return text
+
+    def _call_tool(self, name, arguments):
+        if not isinstance(arguments, dict):
+            raise ValueError("tool arguments must be an object")
+        if name == "remember":
+            if arguments.get("automatic", False):
+                return self._capture(
+                    self.mind.capture, arguments.get("text"),
+                    source_trust=arguments.get(
+                        "source_trust", "user"))
+            metadata = {
+                key: arguments[key] for key in (
+                    "type", "scope", "sensitivity", "authority",
+                    "expires_at", "pinned", "entity", "attr",
+                    "source_trust")
+                if key in arguments
+            }
+            return self._capture(
+                self.mind.remember, arguments.get("text"),
+                metadata=metadata)
+        if name == "recall":
+            return self._capture(
+                self.mind.recall, arguments.get("query"),
+                at=arguments.get("at"))
+        if name == "confirm":
+            return self._capture(
+                self.mind.confirm, arguments.get("ids"))
+        if name == "correct":
+            return self._capture(
+                self.mind.correct, arguments.get("old_hint"),
+                arguments.get("new_text"))
+        if name == "link":
+            return self._capture(
+                self.mind.link, arguments.get("a"), arguments.get("b"),
+                arguments.get("relation", "related"))
+        if name == "why":
+            return self._capture(
+                self.mind.why, arguments.get("id"))
+        if name == "entity":
+            return self._capture(
+                self.mind.entity, arguments.get("term"))
+        if name == "dream":
+            return self._capture(
+                self.mind.dream,
+                dry_run=bool(arguments.get("dry_run", False)))
+        if name == "status":
+            return self._capture(self.mind.status)
+        if name == "context":
+            return self._capture(
+                self.mind.context, as_json=True)
+        if name == "suggest_user":
+            return self._capture(
+                self.mind.suggest_user, as_json=True)
+        if name == "doctor":
+            return self._capture(
+                self.mind.doctor,
+                run_bench=bool(arguments.get("bench", False)),
+                as_json=True)
+        if name == "growth":
+            days = arguments.get("days", 7)
+            if not isinstance(days, int) or not (1 <= days <= 36500):
+                raise ValueError("growth days must be between 1 and 36500")
+            return self._capture(
+                self.mind.growth, days=days, as_json=True)
+        if name == "forget":
+            return self._capture(
+                self.mind.forget, arguments.get("id"),
+                arguments.get("reason", "agent requested"))
+        if name == "unlink":
+            return self._capture(
+                self.mind.unlink,
+                arguments.get("a"), arguments.get("b"))
+        if name == "redact":
+            return self._capture(
+                self.mind.redact,
+                arguments.get("id"), arguments.get("reason"))
+        if name == "purge":
+            return self._capture(
+                self.mind.purge, arguments.get("id"),
+                confirm=bool(arguments.get("confirm", False)))
+        raise KeyError(name)
+
+    def handle(self, request):
+        if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
+            return self._response(
+                request.get("id") if isinstance(request, dict) else None,
+                error=self._error(-32600, "Invalid Request"))
+        method = request.get("method")
+        request_id = request.get("id")
+        notification = "id" not in request
+        if not isinstance(method, str):
+            return None if notification else self._response(
+                request_id, error=self._error(
+                    -32600, "Invalid Request"))
+        if method == "notifications/initialized":
+            self.initialized = True
+            return None
+        if method == "notifications/cancelled":
+            return None
+        if method == "initialize":
+            params = request.get("params", {})
+            requested = (
+                params.get("protocolVersion")
+                if isinstance(params, dict) else None)
+            supported = (
+                requested if requested in (
+                    MCP_PROTOCOL_VERSION, "2025-06-18")
+                else MCP_PROTOCOL_VERSION)
+            return self._response(request_id, {
+                "protocolVersion": supported,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {
+                    "name": "mind",
+                    "title": "mind local agent memory",
+                    "version": __version__,
+                },
+                "instructions": (
+                    "Use remember for durable project facts, recall before "
+                    "claiming ignorance, and confirm useful hits."),
+            })
+        if method == "ping":
+            return self._response(request_id, {})
+        if not self.initialized:
+            return None if notification else self._response(
+                request_id, error=self._error(
+                    -32002, "Server not initialized"))
+        if method == "tools/list":
+            return self._response(
+                request_id, {"tools": self.tools()})
+        if method == "tools/call":
+            params = request.get("params")
+            if not isinstance(params, dict) or not isinstance(
+                    params.get("name"), str):
+                return self._response(
+                    request_id, error=self._error(
+                        -32602, "Invalid tools/call parameters"))
+            try:
+                text = self._call_tool(
+                    params["name"], params.get("arguments", {}))
+            except KeyError:
+                return self._response(
+                    request_id, error=self._error(
+                        -32602, "Unknown tool: %s" % params["name"]))
+            except Exception as exc:
+                return self._response(request_id, {
+                    "content": [{
+                        "type": "text",
+                        "text": _display_text(exc, 1000),
+                    }],
+                    "isError": True,
+                })
+            return self._response(request_id, {
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": {"text": text},
+                "isError": False,
+            })
+        return None if notification else self._response(
+            request_id, error=self._error(
+                -32601, "Method not found: %s" % method))
+
+    def run_stdio(self, stdin=None, stdout=None):
+        stdin = stdin or sys.stdin
+        stdout = stdout or sys.stdout
+        for raw in stdin:
+            if not raw.strip():
+                continue
+            try:
+                request = json.loads(raw)
+            except (json.JSONDecodeError, RecursionError) as exc:
+                response = self._response(
+                    None, error=self._error(
+                        -32700, "Parse error", _display_text(exc, 200)))
+            else:
+                response = self.handle(request)
+            if response is not None:
+                stdout.write(json.dumps(
+                    response, ensure_ascii=False,
+                    separators=(",", ":")) + "\n")
+                stdout.flush()
+        return 0
 
 
 USAGE_TEMPLATE = """mind — brain-like memory for any coding agent (v%s)
@@ -3949,9 +7322,37 @@ usage: %s <command> [args]
 commands:
   init                    create .mind/ memory in this project
   remember "text"         add a memory
+  remember --user "text"  add an explicit user-global memory
+  remember --json         read one typed memory object from stdin
+  remember --batch        read JSONL strings/objects from stdin atomically
+  capture "text"          policy-gated automatic project-fact capture
+  pending                 list quarantined automatic captures
+  approve <id>            approve and remember a quarantined capture
+  reject <id>             discard a quarantined capture
+  context [--json]        emit hook/session context
+  suggest-user [--json]   review strong facts for explicit user promotion
+  integrations [--json]   emit portable lifecycle-hook argv recipes
+  forget <id>             tombstone a memory out of retrieval
+  unlink <a> <b>          remove a relation
+  redact <id> --reason X  replace payloads with a digest and reason
+  purge <id> --all-traces [--confirm]
+                          inventory or irreversibly remove every payload trace
+  backup [label]          create a verified plain-file snapshot
+  checkpoint [label]      create a named pre-change snapshot
+  restore <name> [--confirm]
+                          verify or restore a snapshot
+  compact [--dry-run] [--keep-journal-days N]
+                          segment growth and collect stale temporary files
+  merge BASE OURS THEIRS [--output PATH] [--graph-out PATH]
+                          deterministically merge journal suffixes and replay
+  doctor [--bench] [--json]
+                          integrity, boundary, backend, and recall checks
+  growth [--days N] [--json]
+                          summarize learned and consolidated memory
   link "a" "b" [rel]      connect two memories
   recall "question"       spreading-activation recall (prints memory ids)
   recall "q" --at DATE    what was true then (bare date = end of that day)
+  recall "q" --explain    include channel and backend receipts
   confirm <id> [...]      reinforce memories that actually answered you
   correct "old" "new"     supersede a wrong fact (transition kept in graph)
   why <id>                provenance: where a fact came from, is it still true
@@ -3962,6 +7363,7 @@ commands:
                           disables)
   export                  regenerate agent files
   status                  health report
+  mcp                     serve MCP over stdin/stdout
 """
 
 
@@ -3970,7 +7372,24 @@ def _usage(project_root=None):
         __version__, _invocation(project_root), AUTO_DREAM_SIGNALS)
 
 
-USAGE = _usage()
+def _source_identity():
+    try:
+        source = Path(__file__).resolve()
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    except (OSError, ValueError):
+        digest = "unknown"
+    commit = "unknown"
+    try:
+        root = Path(__file__).resolve().parent
+        head = (root / ".git" / "HEAD").read_text("utf-8").strip()
+        if head.startswith("ref: "):
+            ref = root / ".git" / head[5:]
+            commit = ref.read_text("utf-8").strip()
+        elif re.fullmatch(r"[0-9a-fA-F]{40}", head):
+            commit = head.lower()
+    except (OSError, ValueError):
+        pass
+    return commit, digest
 
 
 def _die(msg, code=2):
@@ -3987,36 +7406,107 @@ def main(argv=None):
         print(usage)
         return 0
     if argv[0] in ("-v", "--version", "version"):
-        if len(argv) != 1:
-            _die("version takes no arguments")
-        print(__version__)
+        if len(argv) > 2 or (
+                len(argv) == 2 and argv[1] != "--verbose"):
+            _die("version accepts only --verbose")
+        if "--verbose" in argv[1:]:
+            commit, digest = _source_identity()
+            print("%s commit=%s sha256=%s" % (
+                __version__, commit, digest))
+        else:
+            print(__version__)
         return 0
     import difflib
     cmd = argv[0]
     COMMANDS = {"init", "remember", "link", "recall", "confirm", "correct",
-                "why", "entity", "dream", "export", "status"}
+                "why", "entity", "dream", "export", "status", "mcp",
+                "capture", "pending", "approve", "reject", "context",
+                "suggest-user", "integrations",
+                "forget", "unlink", "redact", "purge", "backup",
+                "checkpoint", "restore", "compact", "merge",
+                "doctor", "growth"}
     if cmd not in COMMANDS:
         sug = difflib.get_close_matches(cmd, COMMANDS, n=1, cutoff=0.6)
         hint = " did you mean `%s`?" % sug[0] if sug else ""
         _die("unknown command: %s.%s\n\n%s" % (cmd, hint, usage))
     # reject unknown flags: a typo like `dream --dryrun` must never fall
     # through to the destructive default
-    KNOWN_FLAGS = {"dream": {"--dry-run"}, "recall": {"--at"}}
+    KNOWN_FLAGS = {
+        "dream": {"--dry-run"},
+        "recall": {"--at", "--explain", "--"},
+        "capture": {"--trust"},
+        "context": {"--json"},
+        "suggest-user": {"--json"},
+        "integrations": {"--json"},
+        "forget": {"--reason"},
+        "redact": {"--reason"},
+        "purge": {"--match", "--all-traces", "--confirm"},
+        "restore": {"--confirm"},
+        "compact": {"--dry-run", "--keep-journal-days"},
+        "merge": {"--output", "--graph-out"},
+        "doctor": {"--bench", "--json"},
+        "growth": {"--days", "--json"},
+    }
     if cmd in KNOWN_FLAGS:
         # strict scan ONLY for commands with flags: a typo like `dream
         # --dryrun` must never fall through to the destructive default —
         # but free-text commands must accept text that merely starts
         # with dashes (auditor finding)
         skip_value = False
+        end_options = False
         for a in argv[1:]:
+            if a == "--":
+                end_options = True
+                continue
+            if end_options:
+                continue
             if skip_value:
                 skip_value = False
                 continue
             if a == "--at":
                 skip_value = True
+            if a == "--trust":
+                skip_value = True
+            if a in ("--reason", "--match"):
+                skip_value = True
+            if a == "--keep-journal-days":
+                skip_value = True
+            if a in ("--output", "--graph-out"):
+                skip_value = True
+            if a == "--days":
+                skip_value = True
             if a.startswith("--") and a not in KNOWN_FLAGS[cmd]:
                 _die("unknown option %s for `%s` (allowed: %s)" % (
                     a, cmd, ", ".join(sorted(KNOWN_FLAGS[cmd]))))
+    if cmd == "mcp":
+        if len(argv) != 1:
+            _die("usage: %s mcp" % invocation)
+        return MCPServer(project_root).run_stdio()
+    if cmd == "merge":
+        args = argv[1:]
+        output = None
+        graph_out = None
+        for flag in ("--output", "--graph-out"):
+            if args.count(flag) > 1:
+                _die("merge accepts at most one %s" % flag)
+            if flag in args:
+                index = args.index(flag)
+                if index + 1 >= len(args):
+                    _die("%s requires a path" % flag)
+                value = args[index + 1]
+                args = args[:index] + args[index + 2:]
+                if flag == "--output":
+                    output = value
+                else:
+                    graph_out = value
+        if len(args) != 3:
+            _die("usage: %s merge BASE OURS THEIRS "
+                 "[--output PATH] [--graph-out PATH]" % invocation)
+        result = JournalMerger.merge_files(
+            args[0], args[1], args[2],
+            output=output, graph_out=graph_out)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     m = Mind()
     try:
         if cmd == "init":
@@ -4024,11 +7514,190 @@ def main(argv=None):
                 _die("usage: %s init" % invocation)
             m.init()
         elif cmd == "remember":
-            text = " ".join(argv[1:]).strip()
+            if argv[1:2] == ["--user"]:
+                text = " ".join(argv[2:]).strip()
+                if not text:
+                    _die('usage: %s remember --user "text"'
+                         % invocation)
+                m.remember(text, metadata={"scope": "user"})
+            elif argv[1:] == ["--json"]:
+                try:
+                    record = json.load(sys.stdin)
+                except json.JSONDecodeError as exc:
+                    _die("invalid remember JSON: %s" % exc)
+                if not isinstance(record, dict) or not isinstance(
+                        record.get("text"), str):
+                    _die("remember --json requires an object with text")
+                metadata = {
+                    key: record[key] for key in (
+                        "type", "scope", "authority", "source_trust",
+                        "sensitivity", "expires_at", "pinned",
+                        "entity", "attr")
+                    if key in record
+                }
+                m.remember(
+                    record["text"], metadata=metadata,
+                    confidence=record.get("confidence", 1.0))
+            elif argv[1:] == ["--batch"]:
+                records = []
+                for line_number, line in enumerate(sys.stdin, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError as exc:
+                        _die("invalid JSONL record on line %d: %s" % (
+                            line_number, exc))
+                if not records:
+                    _die("remember --batch requires at least one JSONL record")
+                m.remember_many(records)
+            else:
+                text = " ".join(argv[1:]).strip()
+                if not text:
+                    _die('usage: %s remember "text" (text must not be empty)'
+                         % invocation)
+                m.remember(text)
+        elif cmd == "capture":
+            args = argv[1:]
+            trust = "user"
+            if args.count("--trust") > 1:
+                _die("capture accepts at most one --trust value")
+            if "--trust" in args:
+                index = args.index("--trust")
+                if index + 1 >= len(args):
+                    _die("--trust needs user|repository|tool|untrusted")
+                trust = args[index + 1]
+                args = args[:index] + args[index + 2:]
+            text = " ".join(args).strip()
             if not text:
-                _die('usage: %s remember "text" (text must not be empty)'
+                _die('usage: %s capture "text" [--trust LEVEL]'
                      % invocation)
-            m.remember(text)
+            m.capture(text, source_trust=trust)
+        elif cmd == "pending":
+            if len(argv) != 1:
+                _die("usage: %s pending" % invocation)
+            m.pending()
+        elif cmd == "approve":
+            if len(argv) != 2:
+                _die("usage: %s approve <pending-id>" % invocation)
+            m.approve(argv[1])
+        elif cmd == "reject":
+            if len(argv) != 2:
+                _die("usage: %s reject <pending-id>" % invocation)
+            m.reject(argv[1])
+        elif cmd == "context":
+            if len(argv) > 2 or (
+                    len(argv) == 2 and argv[1] != "--json"):
+                _die("usage: %s context [--json]" % invocation)
+            m.context(as_json="--json" in argv[1:])
+        elif cmd == "suggest-user":
+            if len(argv) > 2 or (
+                    len(argv) == 2 and argv[1] != "--json"):
+                _die("usage: %s suggest-user [--json]" % invocation)
+            m.suggest_user(as_json="--json" in argv[1:])
+        elif cmd == "integrations":
+            if len(argv) > 2 or (
+                    len(argv) == 2 and argv[1] != "--json"):
+                _die("usage: %s integrations [--json]" % invocation)
+            m.integrations(as_json="--json" in argv[1:])
+        elif cmd == "forget":
+            args = argv[1:]
+            reason = "user requested"
+            if "--reason" in args:
+                index = args.index("--reason")
+                if index + 1 >= len(args):
+                    _die("--reason requires text")
+                reason = args[index + 1]
+                args = args[:index] + args[index + 2:]
+            if len(args) != 1:
+                _die("usage: %s forget <id> [--reason TEXT]"
+                     % invocation)
+            m.forget(args[0], reason)
+        elif cmd == "unlink":
+            if len(argv) != 3:
+                _die("usage: %s unlink <id-or-text> <id-or-text>"
+                     % invocation)
+            m.unlink(argv[1], argv[2])
+        elif cmd == "redact":
+            args = argv[1:]
+            if args.count("--reason") != 1:
+                _die("redact requires exactly one --reason")
+            index = args.index("--reason")
+            if index + 1 >= len(args):
+                _die("--reason requires text")
+            reason = args[index + 1]
+            args = args[:index] + args[index + 2:]
+            if len(args) != 1:
+                _die("usage: %s redact <id> --reason TEXT"
+                     % invocation)
+            m.redact(args[0], reason)
+        elif cmd == "purge":
+            args = argv[1:]
+            if "--all-traces" not in args:
+                _die("purge requires --all-traces")
+            args.remove("--all-traces")
+            confirm = "--confirm" in args
+            if confirm:
+                args.remove("--confirm")
+            if "--match" in args:
+                index = args.index("--match")
+                if index + 1 >= len(args):
+                    _die("--match requires text")
+                match = args[index + 1]
+                args = args[:index] + args[index + 2:]
+                if args:
+                    _die("purge accepts either an id or --match")
+                node_ids = m.find_memory_ids(match)
+                if not node_ids:
+                    raise ValueError("no memories match the purge text")
+            else:
+                if len(args) != 1:
+                    _die("usage: %s purge <id>|--match TEXT "
+                         "--all-traces [--confirm]" % invocation)
+                node_ids = args
+            if confirm and len(node_ids) > 1:
+                print("confirmed purge matches %d memories"
+                      % len(node_ids))
+            for node_id in list(node_ids):
+                m.purge(node_id, confirm=confirm)
+        elif cmd == "backup":
+            if len(argv) > 2:
+                _die("usage: %s backup [label]" % invocation)
+            m.backup(argv[1] if len(argv) == 2 else None)
+        elif cmd == "checkpoint":
+            if len(argv) > 2:
+                _die("usage: %s checkpoint [label]" % invocation)
+            m.checkpoint(argv[1] if len(argv) == 2 else None)
+        elif cmd == "restore":
+            args = argv[1:]
+            confirm = "--confirm" in args
+            if confirm:
+                args.remove("--confirm")
+            if len(args) != 1:
+                _die("usage: %s restore <name> [--confirm]"
+                     % invocation)
+            m.restore(args[0], confirm=confirm)
+        elif cmd == "compact":
+            args = argv[1:]
+            dry_run = "--dry-run" in args
+            if dry_run:
+                args.remove("--dry-run")
+            keep_days = 365
+            if "--keep-journal-days" in args:
+                index = args.index("--keep-journal-days")
+                if index + 1 >= len(args):
+                    _die("--keep-journal-days requires a positive integer")
+                try:
+                    keep_days = int(args[index + 1])
+                except ValueError:
+                    _die("--keep-journal-days requires a positive integer")
+                if keep_days <= 0:
+                    _die("--keep-journal-days requires a positive integer")
+                args = args[:index] + args[index + 2:]
+            if args:
+                _die("usage: %s compact [--dry-run] "
+                     "[--keep-journal-days N]" % invocation)
+            m.compact(dry_run=dry_run, keep_journal_days=keep_days)
         elif cmd == "link":
             if len(argv) not in (3, 4):
                 _die('usage: %s link "a" "b" ["relation"]' % invocation)
@@ -4036,6 +7705,14 @@ def main(argv=None):
         elif cmd == "recall":
             args = argv[1:]
             at = None
+            explain = "--explain" in args
+            if explain:
+                args.remove("--explain")
+            literal = []
+            if "--" in args:
+                sentinel = args.index("--")
+                literal = args[sentinel + 1:]
+                args = args[:sentinel]
             if args.count("--at") > 1:
                 _die("`recall` accepts at most one --at value")
             if "--at" in args:
@@ -4060,11 +7737,11 @@ def main(argv=None):
                     at = parsed.date().isoformat() + "T23:59:59"
                 else:                      # bare date → inclusive end of day
                     at = parsed.isoformat()
-            q = " ".join(args).strip()
+            q = " ".join(args + literal).strip()
             if not q:
                 _die('usage: %s recall "question" [--at YYYY-MM-DD]'
                      % invocation)
-            m.recall(q, at=at)
+            m.recall(q, at=at, explain=explain)
         elif cmd == "why":
             if len(argv) != 2 or not argv[1].strip():
                 _die('usage: %s why <id> (ids come from recall/entity output)'
@@ -4093,6 +7770,41 @@ def main(argv=None):
             if len(argv) != 1:
                 _die("usage: %s export" % invocation)
             m.export()
+        elif cmd == "doctor":
+            args = argv[1:]
+            run_bench = "--bench" in args
+            as_json = "--json" in args
+            args = [
+                value for value in args
+                if value not in ("--bench", "--json")]
+            if args:
+                _die("usage: %s doctor [--bench] [--json]"
+                     % invocation)
+            result = m.doctor(
+                run_bench=run_bench, as_json=as_json)
+            if not result["ok"]:
+                return 1
+        elif cmd == "growth":
+            args = argv[1:]
+            as_json = "--json" in args
+            if as_json:
+                args.remove("--json")
+            days = 7
+            if "--days" in args:
+                index = args.index("--days")
+                if index + 1 >= len(args):
+                    _die("--days requires a positive integer")
+                try:
+                    days = int(args[index + 1])
+                except ValueError:
+                    _die("--days requires a positive integer")
+                if days <= 0:
+                    _die("--days requires a positive integer")
+                args = args[:index] + args[index + 2:]
+            if args:
+                _die("usage: %s growth [--days N] [--json]"
+                     % invocation)
+            m.growth(days=days, as_json=as_json)
         elif cmd == "status":
             if len(argv) != 1:
                 _die("usage: %s status" % invocation)

@@ -1,93 +1,133 @@
-# mind — design rationale
+# mind Design
 
-## The idea in one sentence
+## Invariants
 
-A memory for coding agents that imitates the brain: layered, recalled by
-trace and spreading activation (not flat search), self-organizing through
-dreams between sessions, and portable to any agent through one standard file.
+1. Offline deterministic behavior is the default.
+2. The default runtime is standard-library only.
+3. Distribution remains one auditable Python file.
+4. Development source is modular and builds that file deterministically.
+5. Recall is a pure read.
+6. Durable mutations are serialized, atomic, recoverable, and journaled.
+7. Current and immediately previous storage formats remain readable.
+8. Optional semantic acceleration cannot mix ranking spaces.
+9. Project memory never enters the user-global tier silently.
+10. Generated agent content has explicit ownership boundaries.
 
-## Binding principles
+## Source And Distribution
 
-1. **Three layers** mirroring the brain: working (always injected) +
-   hippocampus (light graph) + cortex (consolidated files).
-2. **Local trace recall** (radius ≤ 3 hops) + caching — never a full
-   PageRank over the whole graph. Cheap by construction.
-3. **Forgetting by decay** — every node weakens over time
-   (Ebbinghaus: `R = e^(−t/S)`), pruned below a threshold — but never
-   within a 45-day grace window of its last access (soak-test finding:
-   monthly-cadence facts must survive to their first recall), and pruned
-   texts are archived, not destroyed. Stability `S` grows by ~two weeks
-   per confirmed recall, so important memories harden and trivia fades.
-   This prevents garbage accumulation: in the 180-day soak, junk older
-   than the grace window survived 0/256 while core facts survived 15/15.
-4. **Truth is not attention** (6.0.0) — `weight` (Ebbinghaus salience)
-   and `valid_from`/`valid_to` (fact validity) are separate axes: decay
-   never falsifies, and only an explicit `correct` closes a fact —
-   creating a `supersedes` edge instead of erasing (temporal fusion).
-   Conflicts are *flagged*, never auto-deleted.
-5. **Provenance at write time** (6.0.0) — every node carries `origin`
-   (who/via/session), and every mutation appends to `journal.jsonl`,
-   which is never cleared — "where did this fact come from" stays
-   answerable after pruning, unlike the session telemetry in
-   `signals.jsonl`. Targeted `why` scans up to the latest 100 MB as a
-   stream and retains at most 10,000 matches; unfiltered `status` reads
-   only the last 10 MB.
-6. **One `init` + automatic export** for every agent
-   (`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`) behind guard markers.
-7. **Writes during the session, dreams between sessions** — the agent
-   itself is the live half of the loop; the dreamer is the offline half.
-8. **Measure before claiming** — accuracy/latency/size are benchmarked
-   (`bench/bench.py`) and published; misses are documented. The same
-   principle applies to the tests themselves: a seeded fuzzer
-   (`bench/fuzz.py`, in CI) attacks the file formats and the CLI, and a
-   mutation tester (`bench/mutate.py`) checks that the suite actually
-   catches injected defects — both found real bugs on their first run.
+`src/mind/source.json` orders ten domain fragments:
 
-## Recall algorithm (the heart)
+- prelude/filesystem;
+- language and lexical retrieval;
+- optional embedding protocols;
+- graph and provenance;
+- cortex;
+- dreams;
+- export and portable invocation;
+- policy and pending queue;
+- lifecycle, storage, merge, doctor, and growth;
+- command line and protocol server.
 
-Five cooperating stages, each added to fix a defect found by live testing:
+`tools/build_single.py` compiles every fragment, concatenates exact bytes, and
+either writes or verifies `mind.py`. Tests import both modular source and the
+artifact and compare behavior.
 
-| stage | technique | fixes |
-|---|---|---|
-| 1. normalization | script-aware tokenizer (whole words for spaced scripts, character bigrams for CJK/kana/Hangul/Thai) + bilingual stemming + AR↔EN seed map | "بايثون" ↔ "python"; Chinese/Japanese recall at all (was 3/6, now measured 3/3 per language — 24/24 overall in bench/multilang.py) |
-| 2. concept seed | 83 curated tool→category mappings, applied to memories AND queries | category questions ("what css framework") reaching tool-only memories ("tailwind") — the benchmark's one standing miss before 5.5.0. Polysemous words excluded by design |
-| 3. auto-expansion | co-occurrence index + constrained 2-hop PageRank | unknown-unknowns ("database" finds the sqlite node) |
-| 4. fusion | **RRF + IDF** over direct & spreading channels | rank ties in multi-hop recall |
-| 5. head shaping | hash-embedding re-rank + pattern separation | near-duplicate results crowding top-k |
+## Transaction Model
 
-Plus **pattern completion**: when no direct key matches, fuzzy similarity
-over node texts reactivates memories from partial or misspelled cues.
+Every public graph mutation:
 
-`recall` is a **pure read**: it never writes to disk, so health checks and
-repeated queries cannot skew weights. Reinforcement is explicit — recall
-prints memory ids and the agent runs `confirm <id>` for hits that actually
-answered the question; that hardens the node (Ebbinghaus stability) and
-restrengthens its edges, while every dream weakens all edges slightly
-(synaptic homeostasis), so unconfirmed connections decay and prune.
+1. acquires the per-object thread lock;
+2. acquires the cross-process graph lock;
+3. reloads the newest graph;
+4. makes the semantic decision;
+5. commits the graph once;
+6. appends one durable journal batch;
+7. appends one telemetry batch.
 
-## The dream cycle
+Direct in-memory edits are unsupported public behavior. Internal tests that
+construct a state explicitly call `_save()` before invoking a public
+operation. This removed legacy mutation trackers and repeated full-graph
+digests.
 
-| phase | biological analogue | what it does |
-|---|---|---|
-| light sleep | session telemetry | count and consume the observed prefix of session write signals (remember/link/correct), preserving concurrent suffixes — telemetry the journal reports, not a replay that feeds consolidation; consolidation inputs are the node/edge weights themselves |
-| deep sleep | slow-wave consolidation + synaptic homeostasis | Ebbinghaus decay; prune weak nodes and weak edges |
-| REM | recombination | deterministic clustering of related memories → promote recurring clusters to cortex; scan for contradictions and *flag* them |
+## Recall
 
-Everything is deterministic (offline hash embeddings, fixed thresholds,
-sorted node traversal, explicit tie-breakers): the same memory state always
-yields the same plan and recall order. `--dry-run` previews it, and the journal
-explains every action. No LLM is consulted — consolidation costs zero tokens.
+Direct retrieval uses IDF-scored keys. Related-term expansion and bounded
+spreading activation add graph evidence. Reciprocal-rank fusion stabilizes
+heterogeneous channels. The optional semantic stage reranks only the bounded
+head.
 
-## Failure modes we accept (and why)
+One ranking elects one backend:
 
-- **No true semantic embeddings by default.** Cross-domain synonymy with no
-  concept-seed or corpus evidence can still be missed. The
-  alternative — bundling a model or requiring API keys — breaks the
-  zero-setup promise that makes the tool spread. Pluggable backends can
-  come later without breaking the file format.
-- **Light Arabic stemming.** A full morphological analyzer would be a
-  dependency; the seed dictionary covers the frequent broken plurals and
-  the co-occurrence index absorbs the rest.
-- **Not for millions of documents.** The graph is JSON on disk; the target
-  is personal/project agent memory (10²–10³ nodes) where recall is measured
-  from sub-millisecond at 100 nodes to low-single-digit milliseconds at 1,000.
+- the persistent server is attempted first when explicitly configured;
+- otherwise one batch command is attempted;
+- every vector must share model identity and dimension;
+- any failure selects offline scoring for the entire ranking.
+
+Receipts retain direct, spread, fused, semantic, final, backend, call, latency,
+and fallback information.
+
+## Storage And Provenance
+
+Graph format 2 stores typed metadata and directed relation fields. Journal
+format 2 stores compatible local ISO time, UTC epoch nanoseconds, and stable
+event IDs.
+
+Current journals segment as whole append-only files. Segment creation records
+the segment digest in the new current journal. Reads present current and
+segments as one logical log. Active archives rotate in constant time at their
+budget.
+
+Backups are plain files under `.mind/backups/` with a SHA-256 manifest. Restore
+is dry-run by default, creates a pre-restore checkpoint, executes an exact
+write/delete plan, and resumes an interrupted plan before graph loading.
+
+## Automatic Maintenance
+
+Telemetry and scheduling are separate:
+
+- `signals.jsonl` is bounded observational data;
+- `scheduler.json` is bounded authoritative state;
+- a lease prevents overlapping dream cycles;
+- a claimed pending count is subtracted only after successful completion;
+- oversized or unreadable telemetry resets without disabling scheduling.
+
+Dream inputs are graph weights and metadata, not replayed signal text.
+
+## Privacy
+
+Automatic policy rejects secrets and identity-like or transient data. Typed
+metadata controls expiry, pinning, trust, sensitivity, promotion, and
+slot-aware conflicts.
+
+Forget is a retrieval tombstone. Redact and purge use a lifecycle outbox that
+rewrites managed stores one path at a time and resumes after interruption.
+Backup manifests are recalculated after privacy rewrites.
+
+## Merge
+
+Three-way journal merge accepts an explicit common ancestor. Events already in
+the base are excluded from branch suffixes. Suffix events deduplicate by stable
+ID and sort by UTC time, actor, and event ID. Replay recomputes graph weights
+from operations, so counters add exactly and floats are not snapshot-merged.
+
+## Automation Surfaces
+
+The generated agent contract is the broad fallback. Structured integrations
+are available through `context --json`, `integrations --json`, JSONL bulk
+ingest, and the standard-input/output protocol server.
+
+No mechanism can force a host that ignores both instruction files and
+integration calls. Documentation states this boundary explicitly.
+
+## Verification Pyramid
+
+- focused unit and regression tests;
+- source/artifact differential tests;
+- concurrency and crash injection;
+- foreign-writer and line-ending tests;
+- multilingual, discrimination, fuzz, and soak suites;
+- immutable LongMemEval and paraphrase evidence;
+- mutation self-tests and structured mutation reports;
+- thirty-session and five-year autonomy simulation;
+- nine operating-system/Python CI cells;
+- claims and privacy gates before publication.

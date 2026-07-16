@@ -110,13 +110,22 @@ class TestCommandEmbed(TmpDirTest):
         script = self.tmp / "embedder.py"
         script.write_text(
             "import json, sys\n"
-            "text = sys.stdin.read().lower()\n"
-            "if 'tailwind' in text:\n"
-            "    print(json.dumps([0.0, 1.0]))\n"
-            "elif 'alpha' in text or 'bootstrap' in text or 'css framework' in text:\n"
-            "    print(json.dumps([1.0, 0.0]))\n"
+            "raw = sys.stdin.read()\n"
+            "def vector(text):\n"
+            "    text = text.lower()\n"
+            "    if 'tailwind' in text:\n"
+            "        return [0.0, 1.0]\n"
+            "    if 'alpha' in text or 'bootstrap' in text or 'css framework' in text:\n"
+            "        return [1.0, 0.0]\n"
+            "    return [0.0, 1.0]\n"
+            "try:\n"
+            "    request = json.loads(raw)\n"
+            "except json.JSONDecodeError:\n"
+            "    print(json.dumps(vector(raw)))\n"
             "else:\n"
-            "    print(json.dumps([0.0, 1.0]))\n",
+            "    print(json.dumps({'protocol': 'mind-embed-v1',\n"
+            "                      'model': 'test-embedder',\n"
+            "                      'vectors': [vector(t) for t in request['texts']]}))\n",
             encoding="utf-8",
         )
         return "%s %s" % (sys.executable, script)
@@ -399,6 +408,7 @@ class TestDecay(TmpDirTest):
             datetime.now() - timedelta(days=days)).isoformat()
         h.nodes[nid]["created"] = (
             datetime.now() - timedelta(days=created_days or days)).isoformat()
+        h._save()
 
     def test_unused_memory_decays_and_prunes(self):
         h = self.hippo()
@@ -563,6 +573,7 @@ class TestDreamer(TmpDirTest):
                 datetime.now() - timedelta(days=50)).isoformat()
             h.nodes[nid]["created"] = (
                 datetime.now() - timedelta(days=50)).isoformat()
+        h._save()
         d.dream()
         self.assertNotIn(stale, h.nodes)
         self.assertIn(keep, h.nodes)
@@ -843,10 +854,7 @@ class TestAuditFindings2(TmpDirTest):
                         "the edge must exist under the real (cleaned) node id")
 
     def test_pruned_edges_do_not_clobber_a_fresh_conflict_link(self):
-        """Auditor finding (my own fix's regression): a conflict edge that
-        _rem_conflicts creates must survive even when that same pair had an
-        edge pruned earlier the same night. Also: _pruned_edges must not
-        poison a later _save in the same process."""
+        """A conflict edge created after pruning must survive the commit."""
         h = self.hippo()
         c = Cortex(self.mind_dir / "cortex")
         d = Dreamer(self.mind_dir, h, c)
@@ -858,7 +866,6 @@ class TestAuditFindings2(TmpDirTest):
         # give them a nearly-dead edge so this night's dream prunes it
         h.edges.setdefault(a, {})[b] = {"relation": "related", "weight": 0.05}
         h.edges.setdefault(b, {})[a] = {"relation": "related", "weight": 0.05}
-        h._edge_updates.update(((a, b), (b, a)))
         h._save()
         _, text = d.dream()
         reloaded = Hippocampus(self.mind_dir / "graph.json")
@@ -867,23 +874,17 @@ class TestAuditFindings2(TmpDirTest):
                             "a flagged conflict must actually be linked on disk")
 
     def test_prune_then_recreate_same_op_keeps_the_edge(self):
-        """Directly exercise the merge: an edge pruned then re-created before
-        the next save must persist, not be stripped by _pruned_edges."""
+        """An explicitly removed edge can be re-created without stale state."""
         h = self.hippo()
         h.remember("alpha widget one")
         h.remember("beta gadget two")
         a, b = h._id("alpha widget one"), h._id("beta gadget two")
-        h.edges.setdefault(a, {})[b] = {"relation": "related", "weight": 0.05}
-        h._edge_updates.add((a, b))
-        h._save()
-        # simulate a prune (record it) then a legitimate re-link in the same op
-        h._pruned_edges.add((a, b))
+        h.link("alpha widget one", "beta gadget two", "temporary")
+        self.assertTrue(h.unlink(a, b))
         h.link("alpha widget one", "beta gadget two", "reconnected")
         reloaded = Hippocampus(self.mind_dir / "graph.json")
         self.assertTrue(reloaded.edges.get(a, {}).get(b),
-                        "a re-created edge must survive a same-session prune record")
-        self.assertEqual(h._pruned_edges, set(),
-                         "_pruned_edges must be cleared after a save")
+                        "a re-created edge must survive removal and re-link")
 
     def test_lock_symlink_does_not_truncate_target(self):
         """A symlinked graph.json.lock must never truncate its target."""
@@ -927,8 +928,12 @@ class TestAuditFindings2(TmpDirTest):
         finally:
             builtins.__import__ = real_import
 
-        self.assertEqual(calls, [(FakeMsvcrt.LK_LOCK, 1),
-                                 (FakeMsvcrt.LK_UNLCK, 1)])
+        self.assertEqual(calls, [
+            (FakeMsvcrt.LK_LOCK, 1),    # graph
+            (FakeMsvcrt.LK_LOCK, 1),    # scheduler, nested in graph order
+            (FakeMsvcrt.LK_UNLCK, 1),  # scheduler
+            (FakeMsvcrt.LK_UNLCK, 1),  # graph
+        ])
 
     def test_msvcrt_lock_blocks_through_contention(self):
         """LK_LOCK gives up with OSError after ~10s of contention; the save
@@ -964,10 +969,18 @@ class TestAuditFindings2(TmpDirTest):
         finally:
             builtins.__import__ = real_import
 
-        # One lock covers the fresh read, decision, and commit. Two denied
-        # attempts are followed by one successful acquisition and release.
-        self.assertEqual(calls, [(ContendedMsvcrt.LK_LOCK, 1)] * 3 +
-                         [(ContendedMsvcrt.LK_UNLCK, 1)])
+        # The graph lock covers the fresh read, decision, and commit. Two
+        # denied attempts are followed by one successful graph acquisition;
+        # signal accounting then acquires the scheduler lock inside the fixed
+        # graph -> scheduler order before both locks are released.
+        self.assertEqual(calls, [
+            (ContendedMsvcrt.LK_LOCK, 1),
+            (ContendedMsvcrt.LK_LOCK, 1),
+            (ContendedMsvcrt.LK_LOCK, 1),
+            (ContendedMsvcrt.LK_LOCK, 1),
+            (ContendedMsvcrt.LK_UNLCK, 1),
+            (ContendedMsvcrt.LK_UNLCK, 1),
+        ])
         reloaded = Hippocampus(self.mind_dir / "graph.json")
         self.assertTrue(any("contention" in n["text"]
                             for n in reloaded.nodes.values()),
@@ -1383,6 +1396,7 @@ class TestProvenance(TmpDirTest):
         past = (datetime.now() - timedelta(days=10)).isoformat()
         h.nodes[old_id]["valid_from"] = past
         h.nodes[old_id]["created"] = past
+        h._save()
         h.correct("database mysql", "the database is postgres sixteen")
         yesterday = (datetime.now() - timedelta(days=1)).isoformat()
         results, _, _ = h.recall("which database do we use", at=yesterday)
@@ -1412,6 +1426,7 @@ class TestProvenance(TmpDirTest):
         old_id = h._id("the region is eu-west one")
         h.nodes[old_id]["valid_to"] = (
             datetime.now() - timedelta(days=60)).isoformat()
+        h._save()
         pruned = h.decay()
         self.assertNotIn(old_id, h.nodes)
         self.assertTrue(any("superseded" in t for t in pruned))
@@ -1427,6 +1442,7 @@ class TestProvenance(TmpDirTest):
         h.nodes[nid]["last_accessed"] = (
             datetime.now() - timedelta(days=50)).isoformat()
         h.nodes[nid]["created"] = h.nodes[nid]["last_accessed"]
+        h._save()
         h.decay()
         self.assertNotIn(nid, h.nodes)
         # the journal still knows it existed and that it was pruned
@@ -1833,7 +1849,7 @@ class TestFourthAudit(TmpDirTest):
             old = h._id("the region is eu-west one")
             h.nodes[old]["valid_to"] = (
                 datetime.now() - timedelta(days=60)).isoformat()
-            h._dirty.add(old)      # direct mutation → mark for the merge
+            h._save()
             h.decay()
             self.assertNotIn(old, h.nodes)
             code, out = run("why", old)
@@ -1857,6 +1873,7 @@ class TestFourthAudit(TmpDirTest):
         h.nodes[nid]["last_accessed"] = (
             datetime.now() - timedelta(days=50)).isoformat()
         h.nodes[nid]["created"] = h.nodes[nid]["last_accessed"]
+        h._save()
         h.decay()
         arch = self.mind_dir / "archive.md"
         first = arch.read_text("utf-8")
@@ -1865,6 +1882,7 @@ class TestFourthAudit(TmpDirTest):
         h.nodes[nid2]["last_accessed"] = (
             datetime.now() - timedelta(days=50)).isoformat()
         h.nodes[nid2]["created"] = h.nodes[nid2]["last_accessed"]
+        h._save()
         h.decay()
         both = arch.read_text("utf-8")
         self.assertIn("first pruned", both)
@@ -2323,7 +2341,8 @@ class TestAutomatic(unittest.TestCase):
         script = self._install(self.proj)
         self._cli(self.proj, script, "init")
         text = (self.proj / "AGENTS.md").read_text("utf-8")
-        self.assertIn("`python3 mind.py remember", text)
+        launcher = "py -3" if os.name == "nt" else "python3"
+        self.assertIn("`%s mind.py remember" % launcher, text)
 
     def test_export_uses_absolute_invocation_outside_root(self):
         tooldir = self.tmp / "tools"
@@ -2331,13 +2350,13 @@ class TestAutomatic(unittest.TestCase):
         script = self._install(tooldir)
         self._cli(self.proj, script, "init")
         text = (self.proj / "AGENTS.md").read_text("utf-8")
-        # compare against the RESOLVED path: on Windows, tempdirs come back
-        # in 8.3 short form (RUNNER~1) while the tool exports the resolved
-        # long form — both name the same file (windows-latest CI finding)
-        self.assertIn(str(Path(script).resolve()), text,
-                      "commands must carry the real path when mind.py is "
-                      "not in the project root (field finding)")
-        self.assertNotIn("`python3 mind.py recall", text)
+        self.assertTrue((self.proj / ".mind" / M.RUNTIME_FILE).is_file())
+        self.assertIn(".mind/%s" % M.RUNTIME_FILE, text)
+        self.assertNotIn(str(Path(script).resolve()), text,
+                         "committed agent files must not contain a "
+                         "machine-specific home or tool path")
+        launcher = "py -3" if os.name == "nt" else "python3"
+        self.assertNotIn("`%s mind.py recall" % launcher, text)
 
     def test_health_line_present(self):
         script = self._install(self.proj)
@@ -2407,10 +2426,13 @@ class TestAutomatic(unittest.TestCase):
         script = self._install(self.proj)
         self._cli(self.proj, script, "init")
         self._cli(self.proj, script, "remember", "server is in frankfurt")
-        # make the last dream stale (>24h): rename today's journal to 2001
-        ddir = self.proj / ".mind" / "dreams"
-        for p2 in ddir.glob("*.md"):
-            p2.rename(ddir / "2001-01-01.md")
+        # Scheduling state is deliberately independent from dream journals:
+        # journals are user-visible receipts and may be moved or removed.
+        # Make the bounded scheduler state stale directly.
+        scheduler = self.proj / ".mind" / M.SCHEDULER_FILE
+        state = json.loads(scheduler.read_text("utf-8"))
+        state["last_dream_ns"] = 0
+        scheduler.write_text(json.dumps(state), "utf-8")
         r = self._cli(self.proj, script, "correct",
                       "frankfurt", "server is in helsinki")
         self.assertIn("auto-dream", r.stdout,
@@ -2672,8 +2694,7 @@ class TestEighthAudit(TmpDirTest):
 
 
 class TestNinthAudit(TmpDirTest):
-    """6.2.6 — final panel: every runtime guidance string is path-aware
-    (the recall footer still said bare `python3 mind.py confirm`)."""
+    """Runtime guidance stays executable without leaking host paths."""
 
     def test_runtime_hints_carry_real_path(self):
         import subprocess
@@ -2690,11 +2711,13 @@ class TestNinthAudit(TmpDirTest):
             run("init")
             run("remember", "the database is postgres")
             r = run("recall", "which database")
-            self.assertIn(str(script.resolve()), r.stdout,
-                          "recall confirm-hint must carry the real path")
+            portable = ".mind/%s" % M.RUNTIME_FILE
+            self.assertIn(portable, r.stdout)
+            self.assertNotIn(str(script.resolve()), r.stdout)
             self.assertNotIn(" python3 mind.py confirm", r.stdout)
             r2 = run("init")   # already-exists hint
-            self.assertIn(str(script.resolve()), r2.stdout)
+            self.assertIn(portable, r2.stdout)
+            self.assertNotIn(str(script.resolve()), r2.stdout)
 
 
 class TestTenthAudit(TmpDirTest):
@@ -2756,7 +2779,6 @@ class TestTenthAudit(TmpDirTest):
         ia, ib = h0._id(a), h0._id(b)
         h0.edges[ia][ib]["weight"] = 0.4
         h0.edges[ib][ia]["weight"] = 0.4
-        h0._edge_updates.update(((ia, ib), (ib, ia)))
         h0._save()
         stale = Hippocampus(gpath)
         fresh = Hippocampus(gpath)
@@ -2786,7 +2808,6 @@ class TestTenthAudit(TmpDirTest):
         nid = h0.remember("concurrent low-weight confirmation target")
         h0.nodes[nid]["weight"] = 0.20
         h0.nodes[nid]["peak_weight"] = 0.20
-        h0._dirty.add(nid)
         h0._save()
         h1 = Hippocampus(gpath)
         h2 = Hippocampus(gpath)
@@ -2965,7 +2986,6 @@ class TestTenthAudit(TmpDirTest):
             b = h._id("beta higher weight fact")
             h.nodes[a]["weight"] = 0.70
             h.nodes[b]["weight"] = 0.80
-            h._dirty.update((a, b))
             h._save()
             with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                 Mind(self.tmp).confirm([a])
@@ -3044,12 +3064,15 @@ class TestTenthAudit(TmpDirTest):
         help_result = subprocess.run(
             [sys.executable, str(script), "--help"], cwd=str(project),
             capture_output=True, text=True)
-        self.assertIn(str(script.resolve()), help_result.stdout)
+        launcher = "py -3" if os.name == "nt" else "python3"
+        self.assertIn("%s mind.py" % launcher, help_result.stdout)
+        self.assertNotIn(str(script.resolve()), help_result.stdout)
         bad = subprocess.run(
             [sys.executable, str(script), "status", "extra"],
             cwd=str(project), capture_output=True, text=True)
         self.assertEqual(bad.returncode, 2)
-        self.assertIn(str(script.resolve()), bad.stderr)
+        self.assertIn("%s mind.py" % launcher, bad.stderr)
+        self.assertNotIn(str(script.resolve()), bad.stderr)
 
     def test_hostile_loaded_text_and_actor_metadata_are_sanitized(self):
         gpath = self.mind_dir / "graph.json"
@@ -3084,14 +3107,7 @@ class TestEleventhAudit(TmpDirTest):
     """6.2.9 — independent re-audit of the 6.2.8 hardening release."""
 
     def test_confidence_upgrade_does_not_clobber_concurrent_confirm(self):
-        """6.2.8 regression (reproduced): persisting a duplicate-remember
-        confidence upgrade marked the whole node _dirty, so the merge
-        whole-copied this session's stale counters over a concurrent
-        confirm — the third member of the reinforcement-loss family
-        (after whole-graph clobber, 6.1.0, and decay whole-copy, 6.1.2).
-        Confidence must merge as its own field (max-wins), exactly like
-        counters merge as deltas: the concurrent access_count AND the
-        raised confidence must BOTH land."""
+        """A confidence upgrade must not overwrite a concurrent confirm."""
         g = self.mind_dir / "graph.json"
         h0 = Hippocampus(g)
         nid = h0.remember("confidence race target fact", confidence=0.5)
@@ -3118,7 +3134,6 @@ class TestEleventhAudit(TmpDirTest):
         h0.nodes[nid]["created"] = old
         h0.nodes[nid]["weight"] = 0.05
         h0.nodes[nid]["peak_weight"] = 0.05
-        h0._dirty.add(nid)
         h0._save()
         stale = Hippocampus(g)          # the dreamer's stale view
         fresh = Hippocampus(g)
@@ -3144,7 +3159,6 @@ class TestEleventhAudit(TmpDirTest):
         old = (datetime.now() - timedelta(days=40)).isoformat()
         h0.nodes[nid]["last_accessed"] = old
         h0.nodes[nid]["created"] = old
-        h0._dirty.add(nid)
         h0._save()
         stale = Hippocampus(g)
         fresh = Hippocampus(g)
@@ -3234,10 +3248,7 @@ class TestEleventhAudit(TmpDirTest):
                         "the skip must be reported: %r" % written)
 
     def test_reopen_dup_boost_matches_persisted_delta(self):
-        """Consistency: the duplicate-remember boost must be the same
-        BOOST_PER_ACCESS the merge replays on disk. The reopen path
-        (_dirty) persisted +0.2 while the plain path persisted +0.15 —
-        one action, two different persisted boosts."""
+        """Reopening and an ordinary duplicate use the same boost."""
         g = self.mind_dir / "graph.json"
         h = Hippocampus(g)
         t = "boost alignment target fact"
@@ -3245,9 +3256,8 @@ class TestEleventhAudit(TmpDirTest):
         h.correct("boost alignment", "boost replacement target fact")
         h.nodes[nid]["weight"] = 0.5
         h.nodes[nid]["peak_weight"] = 0.5
-        h._dirty.add(nid)
         h._save()
-        h.remember(t)                   # reopens the closed fact (_dirty)
+        h.remember(t)
         on_disk = Hippocampus(g).nodes[nid]["weight"]
         self.assertAlmostEqual(
             on_disk, 0.5 + M.BOOST_PER_ACCESS,
@@ -3265,7 +3275,6 @@ class TestTwelfthAudit(TmpDirTest):
         h.nodes[nid]["weight"] = 0.05
         h.nodes[nid]["peak_weight"] = 0.05
         h.nodes[nid]["access_count"] = 0
-        h._dirty.add(nid)
         h._save()
 
     def test_stale_dream_preserves_concurrent_link_and_endpoint(self):
@@ -3758,7 +3767,6 @@ class TestThirteenthAudit(TmpDirTest):
             '"edges":{}}', "utf-8")
         h = Hippocampus(graph)
         self.assertEqual(h.nodes["aaa"]["text"], "safetext")
-        h._dirty.add("aaa")
         h._save()
         self.assertIn("safetext", graph.read_text("utf-8"))
 
@@ -4088,7 +4096,6 @@ class TestThirteenthAudit(TmpDirTest):
             h.nodes[nid]["weight"] = 0.05
             h.nodes[nid]["peak_weight"] = 0.05
             h.nodes[nid]["access_count"] = 0
-            h._dirty.add(nid)
         h._save()
         original = M.MAX_PRUNES_PER_CYCLE
         M.MAX_PRUNES_PER_CYCLE = 2
@@ -4126,7 +4133,6 @@ class TestThirteenthAudit(TmpDirTest):
         for index in range(12):
             h._journal_immediate("confirm", ids=[nid], sequence=str(index))
         del h.nodes[nid]
-        h._deleted.add(nid)
         h._save()
 
         output = io.StringIO()

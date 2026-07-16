@@ -2,23 +2,36 @@
 
 ## Unreleased
 
-- Added `bench/longmemeval.py`, an independent LongMemEval retrieval harness
-  that downloads the official cleaned oracle dataset by default, maps history
-  sessions to `remember()` and questions to `recall()`, and reports exact
-  evidence-turn retrieval (with answer-session fallback only for unannotated
-  sessions), answer-string retrieval, latency, dataset SHA-256, git commit,
-  and the exact command.
-- CI now smoke-tests the LongMemEval harness against a tiny local fixture,
-  keeping the public dataset download out of the test matrix.
-- Added an optional `MIND_EMBED_CMD` recall re-ranker. The command reads text
-  from stdin and returns a numeric vector as JSON or whitespace-separated
-  floats; failures, timeouts, invalid vectors, and unset commands fall back to
-  the deterministic hash embedder without mixing vector spaces. Transient
-  failures are retried after a short cache window, and oversized output stays
-  off the Python heap.
-- Benchmarks now report the default offline recall column and, when
-  `MIND_EMBED_CMD` is set, a second embedded re-rank column so semantic
-  backend gains can be measured without changing the offline baseline.
+- Development identity is now `7.0.0.dev0`, distinct from the pinned stable
+  `6.2.10` artifact. Verbose version output includes commit and artifact hash.
+- Split development source into ten domain fragments under `src/mind/` while
+  preserving one deterministic, standard-library-only `mind.py` artifact.
+- Closed archive, signals, CRLF/BOM export, cortex ownership, failed
+  transaction, directional relation, journal accounting, FIPS, Windows,
+  command resolution, cache-bound, dash-query, conflict-age, temporary-file,
+  and redundant-write defects from the consolidated audit.
+- Replaced per-candidate semantic processes with one versioned batch per
+  ranking, a total deadline, process-group termination, whole-ranking
+  fallback, bounded caches, explain receipts, and an optional persistent
+  framed sidecar.
+- Added policy-gated automatic capture, quarantine approval, typed/scoped
+  memory, explicit user-global memory, slot conflicts, context recipes, and a
+  same-file stdio protocol server with seventeen tools.
+- Added journal format 2 with stable event IDs and UTC nanoseconds,
+  deterministic three-way journal replay merge, backup/checkpoint/restore,
+  segmentation/compaction, doctor, growth, and crash-resumable
+  forget/unlink/redact/purge.
+- Rebuilt mutation analysis with a green baseline preflight, complete staging,
+  structured classifications, bounded diagnostics, source hashes, and a
+  second LongMemEval-harness target.
+- Added immutable LongMemEval manifests, an identical-mapping BM25 baseline,
+  paraphrase, bulk-ingest, thirty-session, five-year, and public raw-result
+  gates with privacy-safe clean-commit provenance.
+- Replaced hand-maintained volatile claims with generated facts and benchmark
+  tables, restored English/Arabic structural parity, and documented the
+  default/optional security boundary and three host quickstarts.
+- Added code ownership, pinned-action update automation, bounded CI jobs,
+  release and privacy gates, and an explicit solo-maintainer review policy.
 
 ## 6.2.10 — 2026-07-12
 

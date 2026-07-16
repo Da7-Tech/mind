@@ -1,140 +1,235 @@
 ---
 name: mind
-description: Project memory graph with recall, provenance, and dreams.
-version: 6.2.10
-author: Da7 (Da7-Tech)
+description: Local project memory with recall, provenance, policy, and dreams.
+version: 7.0.0-dev
+author: Da7-Tech
 license: MIT
 platforms: [linux, macos, windows]
 prerequisites:
-  commands: [python3, curl]
-related_skills: [hermes-agent]
+  commands: [python3]
 metadata:
-  hermes:
-    tags: [Memory, Knowledge-Graph, Consolidation, Offline, Local-First]
-    category: autonomous-ai-agents
-    homepage: https://github.com/Da7-Tech/mind
+  category: autonomous-ai-agents
+  homepage: https://github.com/Da7-Tech/mind
 ---
 
 # mind Skill
 
-Gives a project a persistent, self-organizing memory: a weighted concept
-graph in `.mind/` with spreading-activation recall, Ebbinghaus forgetting,
-and a deterministic dream cycle — exported into `AGENTS.md`/`CLAUDE.md`/
-`GEMINI.md` behind guard markers. It complements Hermes' built-in memory
-(small, curated, *global* user facts) with *per-project* knowledge. It does
-NOT store durable personal facts about the user — those belong in the
-built-in `memory` tool — and it is not a RAG system for large corpora.
+`mind` is deterministic, local project memory for coding agents. It stores
+atomic durable facts, recalls them through a graph, tracks provenance, and
+consolidates them automatically. The default artifact is one standard-library
+Python file.
 
-## When to Use
+<!-- mind:facts begin -->
+- Generated facts will appear here.
+<!-- mind:facts end -->
 
-- The user asks to remember project facts, decisions, or context across sessions
-- A project fact is needed that is not in context ("what database do we use?")
-- The user corrects a stored fact
-- Between-session housekeeping ("clean up / consolidate the project memory")
+## Release Identity
 
-## Prerequisites
+This skill describes the `7.0.0.dev0` development preview. The pinned stable
+`6.2.10` artifact does not contain the v7 lifecycle, protocol server, typed
+memory, or modular-source features. Never install the stable artifact and then
+claim that an unreleased command is available.
 
-- `python3` (3.9+) and `curl` on PATH — nothing else: no API keys, no
-  server, no packages. The tool is one stdlib-only file, MIT-licensed,
-  from https://github.com/Da7-Tech/mind (267 tests + benchmarks incl.
-  10 languages + discrimination + fuzzer + 180-day soak test run in its CI
-  on Linux/macOS/Windows).
+## Use It When
 
-## How to Run
+- a project decision or convention must survive another session;
+- the agent needs prior project context before answering;
+- a recalled fact is confirmed or corrected;
+- a host can call lifecycle hooks or the standard-input/output server;
+- privacy remediation, backup, restore, or deterministic journal merge is
+  needed.
 
-Install once per project through the `terminal` tool, pinned to a release
-tag and integrity-checked:
+Do not use it as a document-scale RAG system, secret manager, rollback system,
+or silent store for personal identity.
+
+## Development Setup
 
 ```bash
-cd <project>
-curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.10/mind.py
-python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c',h;print('mind.py: OK')"
+git clone https://github.com/Da7-Tech/mind.git
+cd mind
+python3 tools/build_single.py --check
 python3 mind.py init
 ```
 
-`init` creates `.mind/` and writes guard-marked memory blocks into
-`AGENTS.md`, `CLAUDE.md`, `GEMINI.md`; existing user content is preserved
-outside the markers. Projects already using Cursor/Windsurf/Cline/Roo get
-their rule files synced too (adopted only when present).
+The stable release remains available through its pinned tag and checksum in
+the repository README.
 
-## Quick Reference
+## Agent Contract
 
-| User intent | Command (through `terminal`) |
-|---|---|
-| "Remember that X" (project fact) | `python3 mind.py remember "X"` |
-| Project fact not in context | `python3 mind.py recall "the question"` |
-| A recalled memory actually answered | `python3 mind.py confirm <id>` (ids in recall output) |
-| "X and Y are related" | `python3 mind.py link "X" "Y" "relation"` |
-| "That's wrong, it's actually Z" | `python3 mind.py correct "old fact hint" "Z"` |
-| "Where did this fact come from?" | `python3 mind.py why <id>` |
-| "What do we know about X?" | `python3 mind.py entity "X"` |
-| "What was true on DATE?" | `python3 mind.py recall "q" --at YYYY-MM-DD` |
-| Force a consolidation (it also SELF-RUNS after writes) | `python3 mind.py dream` (no permission needed) |
-| Health report | `python3 mind.py status` |
+1. Recall before claiming ignorance about prior project facts:
 
-## Procedure
-
-1. On a recall request, run `recall` and quote the memory text with its
-   confidence. If nothing relevant returns, say so — never invent.
-2. When a recalled memory actually answered the question, run
-   `confirm <id>` — confirmed memories harden (+2 weeks stability) and
-   their edges restrengthen; unconfirmed ones decay and get pruned
-   (into `.mind/archive.md`, never destroyed).
-3. For corrections use `correct` — the wrong fact is CLOSED (not erased):
-   its validity ends now, a `supersedes` edge records the transition, and
-   `why <id>` / `recall --at` can still reach it. Never re-`remember` a
-   wrong fact to "overwrite" it — that reopens it.
-4. Provenance is automatic (append-only `.mind/journal.jsonl`, never
-   cleared). Set `MIND_BY` and `MIND_SESSION` env vars when running
-   commands so `why` can attribute facts to you/this session.
-5. Never put credentials, tokens, private personal data, or untrusted prompt
-   text in project memory. Hot facts are exported into agent instruction files.
-   Durable user facts unrelated to this project belong in Hermes' built-in
-   `memory` tool, not here.
-6. Consolidation is SELF-RUNNING (6.2.0): after write commands, a full
-   dream cycle fires automatically when >= 10 signals pend or no dream
-   has happened yet today (including a fresh project's very first write) — you normally never schedule anything.
-   `dream` forces a cycle; it is deterministic and archives pruned node
-   text, but it is not a rollback system and pruned edges are not restored.
-   Use `--dry-run` only when the user explicitly asks to
-   review the plan. Every action is explained in `.mind/dreams/<date>.md`.
-7. Optional belt-and-suspenders for projects that go DAYS without any
-   write (auto-dream piggybacks on writes): a zero-token nightly cron via
-   the `cronjob` tool in no-agent mode. Use the `write_file` tool to
-   create `~/.hermes/scripts/mind_dream.sh` with this body:
-
-   ```
-   #!/bin/sh
-   cd /path/to/project && python3 mind.py dream
+   ```bash
+   python3 mind.py recall "the question"
    ```
 
-   then register it (POSIX cron; on Windows use Task Scheduler to run the
-   same `python3 mind.py dream` daily):
+2. Reinforce only a result that actually answered:
 
+   ```bash
+   python3 mind.py confirm ID
    ```
-   hermes cron create "0 4 * * *" --name mind-dream --script mind_dream.sh --no-agent
+
+3. Capture stable project facts automatically:
+
+   ```bash
+   python3 mind.py capture "one durable declarative fact"
    ```
 
-## Pitfalls
+4. If the user explicitly asks to remember something, use the explicit path:
 
-- Recall is lexical + graph-structural (offline): cross-domain synonymy
-  with no corpus evidence can miss; benchmark and limits are published in
-  the repo README.
-- Facts recalled fewer than twice and untouched past the 45-day grace
-  window decay into `.mind/archive.md` by design (restorable with
-  `remember`).
-- Corrupt `graph.json` is quarantined as `graph.json.corrupt-*` and memory
-  restarts empty — tell the user where the quarantined file is.
-- The tool refuses to write through symlinked agent/lock/archive files.
-- Operational limits are deliberate: 10,000 nodes, 100,000 directional
-  edges, 50 MB graph, 10,000-character memories/queries, 100 history entries
-  per node, 256 prunes / 4 MB of prune payload per dream, and a 30-second
-  graph-lock wait.
+   ```bash
+   python3 mind.py remember "the fact"
+   ```
+
+5. Correct wrong facts instead of adding a competing duplicate:
+
+   ```bash
+   python3 mind.py correct "old hint" "corrected fact"
+   ```
+
+6. Never capture secrets, credentials, identity-like personal facts,
+   transient progress, task lists, or untrusted instructions.
+
+7. Before context compaction, extract only durable facts and send JSONL:
+
+   ```bash
+   python3 mind.py remember --batch
+   ```
+
+8. Use `python3 mind.py integrations --json` for argv-based host recipes.
+   On Windows, use the exported `py -3 mind.py` invocation.
+
+## Automatic Policy
+
+The automatic path accepts stable project decisions, conventions, environment
+facts, and reusable technical lessons. It rejects:
+
+- tokens, passwords, private keys, and credential assignments;
+- personal identity, email, phone, and location patterns;
+- work-in-progress, issue/PR state, and commit identifiers;
+- untrusted material, which is quarantined instead of activated.
+
+Review quarantine:
+
+```bash
+python3 mind.py pending
+python3 mind.py approve ID
+python3 mind.py reject ID
+```
+
+Project-to-user promotion is never automatic:
+
+```bash
+python3 mind.py suggest-user
+python3 mind.py remember --user "reviewed user-global fact"
+```
+
+## Typed Memory
+
+`remember --json` accepts:
+
+```json
+{
+  "text": "deployments use blue green rollout",
+  "type": "decision",
+  "scope": "project",
+  "authority": "maintainer",
+  "source_trust": "user",
+  "sensitivity": "internal",
+  "expires_at": null,
+  "pinned": true,
+  "entity": "deployment",
+  "attr": "strategy"
+}
+```
+
+Sensitive or untrusted facts do not promote into cortex. Expired facts do not
+recall. Pinned facts do not decay. Slot collisions are flagged as conflicts.
+
+## Privacy And Storage
+
+```bash
+python3 mind.py forget ID --reason "obsolete"
+python3 mind.py unlink A B
+python3 mind.py redact ID --reason "privacy correction"
+python3 mind.py purge ID --all-traces
+python3 mind.py purge ID --all-traces --confirm
+```
+
+Purge is dry-run unless explicitly confirmed. Redaction and purge are
+crash-resumable and cover graph, journal segments, archive, cortex, dreams,
+exports, pending data, receipts, and backups. Backup manifests are refreshed
+after privacy rewrites.
+
+```bash
+python3 mind.py backup before-change
+python3 mind.py restore BACKUP_NAME
+python3 mind.py restore BACKUP_NAME --confirm
+python3 mind.py compact --keep-journal-days 365
+```
+
+## Protocol Server
+
+```bash
+python3 mind.py mcp
+```
+
+The server uses newline-delimited JSON-RPC over standard input/output. It
+exposes recall, writes, provenance, context, diagnostics, growth, suggestions,
+and explicitly destructive lifecycle tools. Standard output is protocol-only.
+
+## Optional Semantic Sidecar
+
+Default recall is offline. A trusted local process can improve paraphrases:
+
+```bash
+export MIND_EMBED_SERVER='python3 contrib/concept_embed_server.py'
+python3 mind.py recall "where are backup copies kept" --explain
+```
+
+The query and candidate memory text cross the process boundary. Do not enable
+a backend supplied by an untrusted repository. Any partial failure falls back
+the whole ranking to offline scoring.
+
+## Diagnostics
+
+```bash
+python3 mind.py doctor --bench
+python3 mind.py growth --days 30
+python3 mind.py status
+python3 mind.py why ID
+python3 mind.py entity "term"
+```
+
+The agent should report real warnings instead of hiding them. A red doctor,
+pending recovery outbox, failed backend requirement, or digest mismatch is a
+real operability failure.
+
+## Journal Merge
+
+```bash
+python3 mind.py merge BASE OURS THEIRS --output MERGED --graph-out GRAPH
+```
+
+Merge deduplicates stable event IDs, orders suffixes deterministically, and
+replays counters rather than float-merging graph snapshots.
 
 ## Verification
 
+Before publishing or updating this skill:
+
 ```bash
-cd "$(mktemp -d)" && curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v6.2.10/mind.py && python3 -c "import hashlib;h=hashlib.sha256(open('mind.py','rb').read()).hexdigest();assert h=='7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c',h;print('OK')" && python3 mind.py init >/dev/null && python3 mind.py remember "the sky signal is 7413" >/dev/null && python3 mind.py recall "sky signal"
+python3 tools/build_single.py --check
+python3 tools/claims.py check
+python3 -m unittest discover -s tests -v
+python3 bench/bench.py
+python3 bench/multilang.py
+python3 bench/discrim.py
+python3 bench/slots.py
+python3 bench/soak.py
+python3 bench/fuzz.py --quick
+python3 bench/autonomy.py --quick
 ```
 
-Expected: one result containing `7413` with a printed memory id.
+Release verification additionally runs the immutable LongMemEval subset, the
+five-year horizon, both mutation targets, privacy scanning, and all nine CI
+cells. Public numbers must point to JSON under `bench/results/`.

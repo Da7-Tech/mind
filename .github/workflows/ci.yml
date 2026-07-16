@@ -3,10 +3,14 @@ on:
   push:
     branches: [main]
   pull_request:
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 jobs:
   test:
+    timeout-minutes: 35
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -20,10 +24,26 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python }}
-      - run: python3 -m unittest discover -s tests -v
-      - run: python3 bench/bench.py
-      - run: python3 bench/multilang.py
-      - run: python3 bench/discrim.py
-      - run: python3 bench/longmemeval.py --data tests/fixtures/longmemeval_tiny.json --limit 2
-      - run: python3 bench/soak.py
-      - run: python3 bench/fuzz.py --quick
+      - name: Structural and claims gates
+        run: |
+          python tools/build_single.py --check
+          python tools/claims.py check
+          python tools/privacy_scan.py --tracked
+          python -m py_compile mind.py src/mind/*.py bench/*.py contrib/*.py tools/*.py
+      - name: Complete test suite
+        run: python -m unittest discover -s tests -v
+      - name: Retrieval and lifecycle benchmarks
+        run: |
+          python bench/bench.py
+          python bench/multilang.py
+          python bench/discrim.py
+          python bench/slots.py
+          python bench/soak.py
+          python bench/fuzz.py --quick
+      - name: Immutable-harness smoke tests
+        run: |
+          python bench/longmemeval.py --data tests/fixtures/longmemeval_tiny.json --limit 2
+          python bench/longmemeval.py --data tests/fixtures/longmemeval_tiny.json --limit 2 --engine bm25
+          python bench/paraphrase.py --server-cmd "python contrib/concept_embed_server.py"
+          python bench/bulk.py --records 1000 --serial-sample 50 --serial-repetitions 1
+          python bench/autonomy.py --quick

@@ -1,0 +1,13 @@
+* @Da7-Tech
+
+/src/mind/00_prelude.py @Da7-Tech
+/src/mind/20_embedding.py @Da7-Tech
+/src/mind/30_graph.py @Da7-Tech
+/src/mind/70_policy.py @Da7-Tech
+/src/mind/80_lifecycle.py @Da7-Tech
+/src/mind/90_cli.py @Da7-Tech
+/SECURITY.md @Da7-Tech
+/.github/workflows/ @Da7-Tech
+/tools/build_single.py @Da7-Tech
+/tools/claims.py @Da7-Tech
+/tools/privacy_scan.py @Da7-Tech

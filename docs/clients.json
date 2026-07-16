@@ -1,0 +1,63 @@
+{
+  "format": 1,
+  "protocol_version": "2025-11-25",
+  "clients": {
+    "claude-code": {
+      "args": [
+        "mind.py",
+        "mcp"
+      ],
+      "command": "python3",
+      "official_reference": "https://code.claude.com/docs/en/mcp",
+      "project_add_argv": [
+        "claude",
+        "mcp",
+        "add",
+        "--transport",
+        "stdio",
+        "--scope",
+        "project",
+        "mind",
+        "--",
+        "python3",
+        "mind.py",
+        "mcp"
+      ]
+    },
+    "codex": {
+      "args": [
+        "mind.py",
+        "mcp"
+      ],
+      "command": "python3",
+      "official_reference": "https://developers.openai.com/codex/mcp",
+      "project_config": {
+        "args": [
+          "mind.py",
+          "mcp"
+        ],
+        "command": "python3"
+      }
+    },
+    "gemini-cli": {
+      "args": [
+        "mind.py",
+        "mcp"
+      ],
+      "command": "python3",
+      "official_reference": "https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md",
+      "project_config": {
+        "mcpServers": {
+          "mind": {
+            "args": [
+              "mind.py",
+              "mcp"
+            ],
+            "command": "python3",
+            "cwd": "."
+          }
+        }
+      }
+    }
+  }
+}

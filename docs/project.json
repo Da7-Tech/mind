@@ -1,0 +1,40 @@
+{
+  "format": 1,
+  "development_status": "preview",
+  "stable_release": {
+    "version": "6.2.10",
+    "tag": "v6.2.10",
+    "mind_sha256": "7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c"
+  },
+  "supported_python": [
+    "3.9",
+    "3.12",
+    "3.14"
+  ],
+  "ci_cells": 9,
+  "capabilities": [
+    "atomic local graph storage",
+    "spreading-activation recall",
+    "temporal provenance",
+    "automatic policy-gated capture",
+    "bounded autonomous consolidation",
+    "typed and scoped memory",
+    "user-global explicit tier",
+    "privacy lifecycle",
+    "backup restore and compaction",
+    "deterministic journal merge",
+    "stdio protocol server",
+    "persistent semantic sidecar protocol",
+    "deterministic single-file distribution"
+  ],
+  "public_results": [
+    "bench/results/longmemeval-offline-v7-dev.json",
+    "bench/results/longmemeval-bm25-v7-dev.json",
+    "bench/results/longmemeval-concept-v7-dev.json",
+    "bench/results/paraphrase-v7-dev.json",
+    "bench/results/bulk-v7-dev.json",
+    "bench/results/autonomy-five-year-v7-dev.json",
+    "bench/results/mutation-mind-v7-dev.json",
+    "bench/results/mutation-longmemeval-v7-dev.json"
+  ]
+}
