@@ -31,7 +31,7 @@ from pathlib import Path
 from collections import Counter, defaultdict, deque
 from contextlib import contextmanager
 
-__version__ = "7.0.0"
+__version__ = "7.0.1.dev0"
 
 # ────────────────────────────────────────────────────────────────
 # Tunables (see docs/DESIGN.md for the reasoning behind each value)

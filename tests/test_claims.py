@@ -1,5 +1,4 @@
 """Claims-as-code tests for generated docs and public evidence."""
-import hashlib
 import importlib.util
 import json
 import unittest
@@ -19,8 +18,7 @@ class ClaimsTests(unittest.TestCase):
 
     def test_public_results_share_clean_artifact_provenance(self):
         facts = CLAIMS.computed_facts()
-        expected_hash = hashlib.sha256(
-            (ROOT / "mind.py").read_bytes()).hexdigest()
+        expected_hash = CLAIMS.public_result_artifact_sha256(facts)
 
         self.assertEqual(len(facts["public_results"]), 8)
         for relative in facts["public_results"]:
@@ -31,6 +29,20 @@ class ClaimsTests(unittest.TestCase):
             self.assertEqual(
                 provenance["mind_sha256"], expected_hash, relative)
             self.assertNotIn("--json-out", result.get("command", ""))
+
+    def test_preview_evidence_remains_bound_to_stable_release(self):
+        facts = {
+            "development_status": "preview",
+            "artifact_sha256": "development-bytes",
+            "stable_release": {"mind_sha256": "stable-bytes"},
+        }
+        self.assertEqual(
+            CLAIMS.public_result_artifact_sha256(facts), "stable-bytes")
+
+        facts["development_status"] = "stable"
+        self.assertEqual(
+            CLAIMS.public_result_artifact_sha256(facts),
+            "development-bytes")
 
     def test_scoreboard_discloses_scope_and_links_every_report(self):
         english = (ROOT / "README.md").read_text("utf-8")

@@ -1,7 +1,7 @@
 {
-  "artifact_bytes": 336396,
+  "artifact_bytes": 336401,
   "artifact_lines": 7829,
-  "artifact_sha256": "ae2fc389b3b09c93cb432ab55b71063d98b400da6b18d6bc178322bc8f3fcf69",
+  "artifact_sha256": "182322c812686d5885423f90943a66898236ec04a1ed84ce5b52feb9a4364aee",
   "capabilities": [
     "atomic local graph storage",
     "spreading-activation recall",
@@ -71,8 +71,8 @@
     "unlink",
     "why"
   ],
-  "development_status": "stable",
-  "development_version": "7.0.0",
+  "development_status": "preview",
+  "development_version": "7.0.1.dev0",
   "environment_variables": [
     "MIND_AUTO_DREAM",
     "MIND_BY",
@@ -127,5 +127,5 @@
     "3.12",
     "3.14"
   ],
-  "test_count": 381
+  "test_count": 382
 }

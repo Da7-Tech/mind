@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Development resumes as `7.0.1.dev0`. The signed `v7.0.0` tag and its
+  pinned single-file checksum remain the current stable release.
+
 ## 7.0.0 — 2026-07-18
 
 The memory-platform release. Version 7 turns the audited single-file memory

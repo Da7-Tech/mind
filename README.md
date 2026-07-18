@@ -25,17 +25,17 @@ builder reconstructs the single-file artifact byte-for-byte.
 ## Verified Status
 
 <!-- mind:facts begin -->
-- Development version: `7.0.0` (stable).
+- Development version: `7.0.1.dev0` (preview).
 - Stable release: `7.0.0`; pinned `mind.py` SHA-256 `ae2fc389b3b09c93cb432ab55b71063d98b400da6b18d6bc178322bc8f3fcf69`.
-- Discovered tests: **381**.
-- Distribution: **10** source-domain fragments build one deterministic file; current artifact SHA-256 `ae2fc389b3b09c93cb432ab55b71063d98b400da6b18d6bc178322bc8f3fcf69`.
+- Discovered tests: **382**.
+- Distribution: **10** source-domain fragments build one deterministic file; current artifact SHA-256 `182322c812686d5885423f90943a66898236ec04a1ed84ce5b52feb9a4364aee`.
 - CI matrix: **9** operating-system/Python cells.
 - Command line: **30** commands; protocol server: **17** tools.
 <!-- mind:facts end -->
 
-`7.0.0` is the stable memory-platform release. It contains the lifecycle,
-protocol-server, typed-memory, privacy, automatic-capture, and modular-source
-features documented below.
+`7.0.1.dev0` is the current development preview. The production-ready release
+is `7.0.0`, which contains the lifecycle, protocol-server, typed-memory,
+privacy, automatic-capture, and modular-source features documented below.
 
 <!-- mind:section install -->
 ## Install

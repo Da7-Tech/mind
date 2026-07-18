@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "development_status": "stable",
+  "development_status": "preview",
   "stable_release": {
     "version": "7.0.0",
     "tag": "v7.0.0",

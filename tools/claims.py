@@ -189,6 +189,13 @@ def computed_facts():
     return facts
 
 
+def public_result_artifact_sha256(facts):
+    """Bind release evidence to stable bytes while main is a preview."""
+    if facts["development_status"] == "preview":
+        return facts["stable_release"]["mind_sha256"]
+    return facts["artifact_sha256"]
+
+
 def facts_block(facts, language):
     stable = facts["stable_release"]
     if language == "ar":
@@ -502,7 +509,8 @@ def validate_docs(facts):
         if not re.fullmatch(
                 r"[0-9a-f]{40}", str(provenance.get("commit", ""))):
             errors.append("invalid commit provenance in %s" % relative)
-        if provenance.get("mind_sha256") != facts["artifact_sha256"]:
+        if provenance.get("mind_sha256") != \
+                public_result_artifact_sha256(facts):
             errors.append("artifact hash mismatch in %s" % relative)
         if "--json-out" in str(data.get("command", "")):
             errors.append("output path retained in command: %s" % relative)
