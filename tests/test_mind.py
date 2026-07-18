@@ -2223,6 +2223,21 @@ class TestCLI(TmpDirTest):
         code, out, _ = self.run_cli("status")
         self.assertIn("nodes:", out)
 
+    def test_plain_remember_never_reads_standard_input(self):
+        class RefuseRead:
+            def read(self, *_args, **_kwargs):
+                raise AssertionError(
+                    "plain remember must not read standard input")
+
+        original_stdin = sys.stdin
+        sys.stdin = RefuseRead()
+        try:
+            code, _, _ = self.run_cli(
+                "remember", "a durable plain-text project fact")
+        finally:
+            sys.stdin = original_stdin
+        self.assertEqual(code, 0)
+
     def test_unknown_command_suggests(self):
         code, _, err = self.run_cli("remembr", "x")
         self.assertEqual(code, 2, "usage errors exit 2 (documented contract)")

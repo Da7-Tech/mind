@@ -27,7 +27,7 @@ builder reconstructs the single-file artifact byte-for-byte.
 <!-- mind:facts begin -->
 - Development version: `7.0.0` (stable).
 - Stable release: `7.0.0`; pinned `mind.py` SHA-256 `ae2fc389b3b09c93cb432ab55b71063d98b400da6b18d6bc178322bc8f3fcf69`.
-- Discovered tests: **379**.
+- Discovered tests: **380**.
 - Distribution: **10** source-domain fragments build one deterministic file; current artifact SHA-256 `ae2fc389b3b09c93cb432ab55b71063d98b400da6b18d6bc178322bc8f3fcf69`.
 - CI matrix: **9** operating-system/Python cells.
 - Command line: **30** commands; protocol server: **17** tools.
