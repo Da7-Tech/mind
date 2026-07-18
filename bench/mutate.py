@@ -107,7 +107,7 @@ class Mutator(ast.NodeTransformer):
             return node
         replacement = (
             node.value + 1 if isinstance(node.value, int)
-            else node.value * 2
+            else (1.0 if node.value == 0.0 else node.value * 2)
         )
         if self._hit(
                 node.lineno, "%r -> %r" % (node.value, replacement)):

@@ -52,6 +52,17 @@ class TestMutationBench(unittest.TestCase):
         self.assertEqual(len(digest), 64)
         self.assertNotEqual(mutated, source)
 
+    def test_zero_float_mutation_is_not_equivalent(self):
+        source = "VALUE = 0.0\n"
+
+        mutated, applied = MUTATE.make_mutant(source, 0)
+
+        self.assertEqual(applied, (1, "0.0 -> 1.0"))
+        self.assertNotEqual(mutated, source)
+        namespace = {}
+        exec(compile(mutated, "<mutant>", "exec"), namespace)
+        self.assertEqual(namespace["VALUE"], 1.0)
+
     def test_mutated_artifact_and_modular_source_stay_in_sync(self):
         MUTATE.prepare_workspace(self.tmp)
         source = (self.tmp / "mind.py").read_text("utf-8")
