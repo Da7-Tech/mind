@@ -23,8 +23,10 @@ Required invariants:
   count, version, checksum, and result link matches executable state;
 - every public result comes from a clean tree and carries the current
   `mind.py` digest;
-- mutation reports use the current corpus, a green baseline, complete
-  classification, and isolated confirmation for every parallel kill;
+- mutation reports use the current corpus, a green product-suite baseline,
+  complete classification, and isolated confirmation for every parallel kill;
+  the three self-referential claims tests run after report generation, and the
+  report records both this exclusion and the exact baseline test count;
 - English and Arabic documentation expose the same marked sections;
 - no private path, email address, secret pattern, private audit, or local task
   ledger enters the public tree.

@@ -37,6 +37,11 @@ MUTATION_SOURCES = {
     "mind.py",
     "bench/longmemeval.py",
 }
+MUTATION_EXCLUDED_TEST_PREFIXES = ("test_claims.",)
+MUTATION_EXCLUSION_REASON = (
+    "public evidence assertions validate the completed mutation report and "
+    "therefore run after, not inside, report generation"
+)
 
 CMP_SWAP = {
     ast.Lt: ast.LtE,
@@ -144,6 +149,7 @@ def sampled_targets(total, sample, seed=SEED):
 
 def prepare_workspace(destination):
     shutil.copy2(ROOT / "mind.py", destination / "mind.py")
+    shutil.copy2(ROOT / ".gitattributes", destination / ".gitattributes")
     for directory in (
             "tests", "bench", "src", "tools", "contrib", "docs"):
         shutil.copytree(
@@ -186,12 +192,33 @@ def _diagnostic(text, workdir):
     return text[-MAX_DIAGNOSTIC_CHARS:]
 
 
+def _suite_command():
+    code = """
+import unittest
+
+excluded = %r
+discovered = unittest.defaultTestLoader.discover("tests")
+selected = unittest.TestSuite()
+
+def add(item):
+    if isinstance(item, unittest.TestSuite):
+        for child in item:
+            add(child)
+    elif not item.id().startswith(excluded):
+        selected.addTest(item)
+
+add(discovered)
+result = unittest.TextTestRunner(verbosity=0).run(selected)
+raise SystemExit(0 if result.wasSuccessful() else 1)
+""" % (MUTATION_EXCLUDED_TEST_PREFIXES,)
+    return [sys.executable, "-c", code]
+
+
 def run_suite(workdir, timeout=DEFAULT_TIMEOUT):
     started = time.perf_counter()
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "unittest", "discover",
-             "-s", "tests", "-q"],
+            _suite_command(),
             cwd=str(workdir),
             capture_output=True,
             text=True,
@@ -214,9 +241,10 @@ def run_suite(workdir, timeout=DEFAULT_TIMEOUT):
             "failing_tests": [],
         }
     combined = result.stdout + "\n" + result.stderr
+    run_match = re.search(r"Ran\s+(\d+)\s+tests?", combined)
     if result.returncode == 0:
         outcome = "survived"
-    elif re.search(r"Ran\s+\d+\s+tests?", combined):
+    elif run_match:
         outcome = "killed"
     else:
         outcome = "infrastructure_error"
@@ -228,6 +256,7 @@ def run_suite(workdir, timeout=DEFAULT_TIMEOUT):
         "stdout": _diagnostic(result.stdout, workdir),
         "stderr": _diagnostic(result.stderr, workdir),
         "failing_tests": _failing_tests(combined),
+        "tests_run": int(run_match.group(1)) if run_match else None,
     }
 
 
@@ -427,6 +456,12 @@ def main(argv=None):
         "site_count": total,
         "sample_size": len(targets),
         "targets": targets,
+        "suite": {
+            "discovery": "tests",
+            "excluded_test_prefixes": list(
+                MUTATION_EXCLUDED_TEST_PREFIXES),
+            "exclusion_reason": MUTATION_EXCLUSION_REASON,
+        },
         "baseline": None,
         "mutants": [],
         "summary": {},

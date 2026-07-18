@@ -332,10 +332,13 @@ ID, session ID, and role. These prefixes improve provenance and isolation but
 also add query-independent tokens; evidence metrics therefore use exact
 node labels, and answer-string metrics are reported separately.
 
-Mutation analysis performs a green baseline preflight, stages every test
-dependency, mutates modular source and artifact consistently, preserves
-bounded diagnostics, and distinguishes killed, survived, timed out, compile
-error, and infrastructure error.
+Mutation analysis performs a green product-suite baseline preflight, stages
+every product-test dependency, mutates modular source and artifact
+consistently, preserves bounded diagnostics, and distinguishes killed,
+survived, timed out, compile error, and infrastructure error. The three
+self-referential public-evidence tests run after report generation because
+they validate the completed report itself; every report records this exclusion
+and the exact baseline test count.
 
 <!-- mind:section limits -->
 ## Boundaries And Non-Goals

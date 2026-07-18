@@ -28,6 +28,7 @@ class TestMutationBench(unittest.TestCase):
         MUTATE.prepare_workspace(self.tmp)
 
         self.assertTrue((self.tmp / "mind.py").is_file())
+        self.assertTrue((self.tmp / ".gitattributes").is_file())
         self.assertTrue((self.tmp / "tests").is_dir())
         self.assertTrue((self.tmp / "bench" / "longmemeval.py").is_file())
         self.assertTrue((self.tmp / "src" / "mind").is_dir())
@@ -78,6 +79,29 @@ class TestMutationBench(unittest.TestCase):
             (self.tmp / "src" / "mind" / "source.json")
             .read_text("utf-8"))
         self.assertEqual(len(manifest["fragments"]), 10)
+
+    def test_mutation_suite_excludes_self_referential_claims_only(self):
+        tests = self.tmp / "tests"
+        tests.mkdir()
+        (tests / "test_claims.py").write_text(
+            "import unittest\n"
+            "class Claims(unittest.TestCase):\n"
+            "    def test_report_already_exists(self):\n"
+            "        self.fail('report is still being generated')\n",
+            encoding="utf-8",
+        )
+        (tests / "test_product.py").write_text(
+            "import unittest\n"
+            "class Product(unittest.TestCase):\n"
+            "    def test_behavior(self):\n"
+            "        self.assertEqual(2 + 2, 4)\n",
+            encoding="utf-8",
+        )
+
+        result = MUTATE.run_suite(self.tmp, timeout=5)
+
+        self.assertEqual(result["outcome"], "survived")
+        self.assertEqual(result["tests_run"], 1)
 
     def test_red_baseline_aborts_without_classifying_mutants(self):
         report_path = self.tmp / "report.json"
