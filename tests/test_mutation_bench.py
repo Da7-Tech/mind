@@ -34,6 +34,8 @@ class TestMutationBench(unittest.TestCase):
         self.assertTrue((self.tmp / "tools" / "build_single.py").is_file())
         self.assertTrue(
             (self.tmp / "contrib" / "concept_embed_server.py").is_file())
+        self.assertTrue(
+            (self.tmp / "docs" / "clients.json").is_file())
 
     def test_report_binds_versioned_corpus_and_manifest(self):
         source = (ROOT / "mind.py").read_text("utf-8")

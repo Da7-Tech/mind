@@ -139,7 +139,8 @@ def sampled_targets(total, sample, seed=SEED):
 
 def prepare_workspace(destination):
     shutil.copy2(ROOT / "mind.py", destination / "mind.py")
-    for directory in ("tests", "bench", "src", "tools", "contrib"):
+    for directory in (
+            "tests", "bench", "src", "tools", "contrib", "docs"):
         shutil.copytree(
             ROOT / directory,
             destination / directory,
