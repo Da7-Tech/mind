@@ -141,6 +141,59 @@ class TestMutationBench(unittest.TestCase):
         self.assertNotIn(str(self.tmp), result["stderr"])
         self.assertIn("<workspace>", result["stderr"])
 
+    def test_parallel_kill_must_repeat_in_isolation(self):
+        initial = [{
+            "outcome": "killed",
+            "returncode": 1,
+            "duration_ms": 5.0,
+            "stdout": "",
+            "stderr": "transient lock failure",
+            "failing_tests": ["test_unrelated_lock"],
+        }]
+
+        def execute(_record):
+            return {
+                "outcome": "survived",
+                "returncode": 0,
+                "duration_ms": 3.0,
+                "stdout": "",
+                "stderr": "",
+                "failing_tests": [],
+            }
+
+        results, summary = MUTATE.confirm_parallel_candidates(
+            initial, [(1, 10)], execute, workers=4)
+
+        self.assertEqual(results[0]["outcome"], "survived")
+        self.assertEqual(
+            results[0]["execution_mode"], "isolated_confirmation")
+        self.assertEqual(
+            results[0]["initial_attempt"]["outcome"], "killed")
+        self.assertTrue(results[0]["reclassified_parallel_noise"])
+        self.assertEqual(summary["candidate_rechecks"], 1)
+        self.assertEqual(summary["parallel_noise_reclassified"], 1)
+
+    def test_repeated_parallel_kill_remains_killed(self):
+        initial = [{
+            "outcome": "killed",
+            "returncode": 1,
+            "duration_ms": 5.0,
+            "stdout": "",
+            "stderr": "assertion failed",
+            "failing_tests": ["test_behavior"],
+        }]
+
+        def execute(_record):
+            return dict(initial[0])
+
+        results, summary = MUTATE.confirm_parallel_candidates(
+            initial, [(1, 10)], execute, workers=2)
+
+        self.assertEqual(results[0]["outcome"], "killed")
+        self.assertFalse(results[0]["reclassified_parallel_noise"])
+        self.assertEqual(summary["candidate_rechecks"], 1)
+        self.assertEqual(summary["parallel_noise_reclassified"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

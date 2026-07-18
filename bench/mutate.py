@@ -28,6 +28,11 @@ SEED = 99
 DEFAULT_SAMPLE = 120
 DEFAULT_TIMEOUT = 120
 MAX_DIAGNOSTIC_CHARS = 50_000
+RECHECK_OUTCOMES = frozenset({
+    "killed",
+    "timed_out",
+    "infrastructure_error",
+})
 MUTATION_SOURCES = {
     "mind.py",
     "bench/longmemeval.py",
@@ -278,6 +283,35 @@ def classify_mutant(
     return run_suite(workdir, timeout=timeout)
 
 
+def confirm_parallel_candidates(
+        initial_results, selected, execute, workers):
+    """Re-run every non-surviving parallel result without contention."""
+    final_results = []
+    rechecked = 0
+    reclassified = 0
+    for record, initial in zip(selected, initial_results):
+        if workers == 1:
+            initial["execution_mode"] = "isolated"
+            final_results.append(initial)
+            continue
+        initial["execution_mode"] = "parallel"
+        if initial["outcome"] not in RECHECK_OUTCOMES:
+            final_results.append(initial)
+            continue
+        rechecked += 1
+        confirmation = execute(record)
+        confirmation["execution_mode"] = "isolated_confirmation"
+        confirmation["initial_attempt"] = initial
+        changed = confirmation["outcome"] != initial["outcome"]
+        confirmation["reclassified_parallel_noise"] = changed
+        reclassified += int(changed)
+        final_results.append(confirmation)
+    return final_results, {
+        "candidate_rechecks": rechecked,
+        "parallel_noise_reclassified": reclassified,
+    }
+
+
 def default_report_path(source_relative, source_digest):
     stem = source_relative.replace("/", "-").replace(".", "-")
     return ROOT / "bench" / "results" / (
@@ -364,8 +398,8 @@ def main(argv=None):
     report_path = Path(args.json_out) if args.json_out else \
         default_report_path(args.source, digest)
     report = {
-        "format": 1,
-        "benchmark": "deterministic-mutation-v2",
+        "format": 2,
+        "benchmark": "deterministic-mutation-v3",
         "command": reproducible_command(),
         "provenance": repo_provenance((
             args.source,
@@ -450,20 +484,29 @@ def main(argv=None):
         return result
 
     if args.workers == 1:
-        results = map(execute, selected)
+        initial_results = list(map(execute, selected))
     else:
         executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=args.workers)
-        results = executor.map(execute, selected)
-    try:
-        for progress, result in enumerate(results, 1):
-            counts[result["outcome"]] += 1
-            report["mutants"].append(result)
-            if progress % 20 == 0:
-                print("  ... %d/%d done" % (progress, len(targets)))
-    finally:
-        if args.workers != 1:
+        try:
+            initial_results = list(executor.map(execute, selected))
+        finally:
             executor.shutdown(wait=True, cancel_futures=True)
+    for progress in range(20, len(targets) + 1, 20):
+        print("  ... %d/%d initial runs done" % (
+            progress, len(targets)))
+    final_results, confirmation = confirm_parallel_candidates(
+        initial_results, selected, execute, args.workers)
+    if confirmation["candidate_rechecks"]:
+        print(
+            "  ... %d non-surviving candidates rechecked in isolation; "
+            "%d parallel outcomes reclassified" % (
+                confirmation["candidate_rechecks"],
+                confirmation["parallel_noise_reclassified"],
+            ))
+    for result in final_results:
+        counts[result["outcome"]] += 1
+        report["mutants"].append(result)
 
     attempted = sum(counts.values())
     classified = counts["killed"] + counts["survived"]
@@ -473,6 +516,7 @@ def main(argv=None):
     report["summary"]["attempted"] = attempted
     report["summary"]["classified"] = classified
     report["summary"]["kill_rate"] = kill_rate
+    report["summary"].update(confirmation)
     manifest_rows = [
         {
             "sequence": mutant["sequence"],
