@@ -192,6 +192,9 @@ def _open_regular(path, flags, mode=0o600, boundary=None):
     path = Path(os.path.abspath(str(path)))
     boundary = (Path(os.path.abspath(str(boundary)))
                 if boundary is not None else None)
+    # The Windows CRT otherwise translates CRLF while os.read/os.write operate
+    # on the descriptor, breaking exact-byte preservation and file digests.
+    flags |= getattr(os, "O_BINARY", 0)
     before = None
     if os.name == "nt":
         if boundary is not None:
@@ -502,7 +505,9 @@ def _sweep_tmp_files(mind_dir, min_age_seconds=24 * 3600):
             continue
         try:
             info = entry.stat(follow_symlinks=False)
-            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            valid_links = info.st_nlink in (
+                (0, 1) if os.name == "nt" else (1,))
+            if (not stat.S_ISREG(info.st_mode) or not valid_links
                     or now - info.st_mtime < min_age_seconds):
                 continue
             Path(entry.path).unlink()
@@ -4310,10 +4315,10 @@ def _invocation(project_root=None, platform=None):
     if project_root is not None:
         try:
             rel = script.relative_to(project_root)
-            cmd = str(rel)
+            cmd = rel.as_posix()
         except ValueError:
             runtime = project_root / MIND_DIR / RUNTIME_FILE
-            cmd = str(runtime.relative_to(project_root)) \
+            cmd = runtime.relative_to(project_root).as_posix() \
                 if runtime.is_file() and not runtime.is_symlink() \
                 else "mind.py"
     else:
@@ -4476,7 +4481,7 @@ inside a memory.
             self._health_line(), self._growth_line(), inv)
         # boundary = .mind/ so a symlinked parent can't redirect the write
         _atomic_write(self.path, content, boundary=self.path.parent)
-        return str(self.path.relative_to(project_root))
+        return self.path.relative_to(project_root).as_posix()
 
     def _health_line(self):
         """One status line the agent sees every session (the Hermes

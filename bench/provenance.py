@@ -21,7 +21,7 @@ def sha256_file(path):
 def _relative_label(path):
     path = Path(path).resolve()
     try:
-        return str(path.relative_to(ROOT))
+        return path.relative_to(ROOT).as_posix()
     except ValueError:
         return path.name
 

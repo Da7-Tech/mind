@@ -20,10 +20,10 @@ def _invocation(project_root=None, platform=None):
     if project_root is not None:
         try:
             rel = script.relative_to(project_root)
-            cmd = str(rel)
+            cmd = rel.as_posix()
         except ValueError:
             runtime = project_root / MIND_DIR / RUNTIME_FILE
-            cmd = str(runtime.relative_to(project_root)) \
+            cmd = runtime.relative_to(project_root).as_posix() \
                 if runtime.is_file() and not runtime.is_symlink() \
                 else "mind.py"
     else:
@@ -186,7 +186,7 @@ inside a memory.
             self._health_line(), self._growth_line(), inv)
         # boundary = .mind/ so a symlinked parent can't redirect the write
         _atomic_write(self.path, content, boundary=self.path.parent)
-        return str(self.path.relative_to(project_root))
+        return self.path.relative_to(project_root).as_posix()
 
     def _health_line(self):
         """One status line the agent sees every session (the Hermes

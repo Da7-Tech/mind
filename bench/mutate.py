@@ -261,16 +261,14 @@ def _sync_modular_mutant(workdir, mutated_source):
         fragment = mutated_source[
             positions[index]:positions[index + 1]]
         compile(fragment, str(source_dir / name), "exec")
-        (source_dir / name).write_text(
-            fragment, encoding="utf-8")
-    (source_dir / "source.json").write_text(
-        json.dumps({
+        (source_dir / name).write_bytes(fragment.encode("utf-8"))
+    manifest_payload = json.dumps({
             "format": 1,
             "artifact": "mind.py",
             "fragments": names,
-        }, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+        }, indent=2, sort_keys=True) + "\n"
+    (source_dir / "source.json").write_bytes(
+        manifest_payload.encode("utf-8"))
 
 
 def classify_mutant(
@@ -287,7 +285,7 @@ def classify_mutant(
             "failing_tests": [],
         }
     target = workdir / source_relative
-    target.write_text(mutated_source, encoding="utf-8")
+    target.write_bytes(mutated_source.encode("utf-8"))
     if source_relative == "mind.py":
         _sync_modular_mutant(workdir, mutated_source)
     return run_suite(workdir, timeout=timeout)
@@ -332,10 +330,9 @@ def write_report(path, report):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    tmp.write_bytes(
+        (json.dumps(report, indent=2, sort_keys=True) + "\n")
+        .encode("utf-8"))
     tmp.replace(path)
 
 
