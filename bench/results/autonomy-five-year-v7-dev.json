@@ -1,0 +1,48 @@
+{
+  "benchmark": "auto-first-autonomy-v1",
+  "command": "python3.14 bench/autonomy.py --days 1825 --payload-chars 5000",
+  "horizon": {
+    "active_archive_bytes": 900142,
+    "archive_files": 2,
+    "archive_rotated": true,
+    "archive_total_bytes": 8875887,
+    "current_nodes": 50,
+    "doctor_ok": true,
+    "guard_counts": {
+      "AGENTS.md": 1,
+      "CLAUDE.md": 1,
+      "GEMINI.md": 1
+    },
+    "payload_chars": 5000,
+    "scheduler_pending": 4,
+    "signals_bytes": 20220,
+    "simulated_days": 1825,
+    "simulated_years": 5.0
+  },
+  "provenance": {
+    "commit": "47fc542fb2da757d8a213c10735a7b076fd584b3",
+    "dirty": false,
+    "mind_sha256": "fd37e04c42f013bb5b46e56dd1ed4afcfc90c6a3ef38e2f3557cede03e31ec83",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "python": "3.14.6",
+    "python_implementation": "CPython",
+    "sources": {
+      "bench/autonomy.py": "1ea0d98a66cdbdeb1793548227f301578141223af171694d41754c25ea0fdfc9"
+    }
+  },
+  "sessions": {
+    "accepted": 30,
+    "all_durable_present": true,
+    "conflict_edges": 110,
+    "cortex_topics": 2,
+    "doctor_ok": true,
+    "dream_files": 3,
+    "growth_learned": 30,
+    "growth_matches_journal": true,
+    "rejected_secrets": 30,
+    "rejected_transient": 30,
+    "secret_absent": true,
+    "sessions": 30,
+    "transient_absent": true
+  }
+}

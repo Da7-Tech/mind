@@ -20,7 +20,12 @@ consolidates them automatically. The default artifact is one standard-library
 Python file.
 
 <!-- mind:facts begin -->
-- Generated facts will appear here.
+- Development version: `7.0.0.dev0` (preview).
+- Stable release: `6.2.10`; pinned `mind.py` SHA-256 `7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c`.
+- Discovered tests: **377**.
+- Distribution: **10** source-domain fragments build one deterministic file; development artifact SHA-256 `fd37e04c42f013bb5b46e56dd1ed4afcfc90c6a3ef38e2f3557cede03e31ec83`.
+- CI matrix: **9** operating-system/Python cells.
+- Command line: **30** commands; protocol server: **17** tools.
 <!-- mind:facts end -->
 
 ## Release Identity

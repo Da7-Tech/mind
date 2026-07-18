@@ -1,0 +1,35 @@
+{
+  "accuracy_gain": 1.0,
+  "benchmark": "paraphrase-ranking-v1",
+  "command": "python3.14 bench/paraphrase.py --server-cmd 'python3 contrib/concept_embed_server.py'",
+  "offline": {
+    "accuracy": 0.0,
+    "backend": "offline",
+    "cases": 20,
+    "cold_latency_ms": 0.9442497976124287,
+    "correct": 0,
+    "p95_latency_ms": 1.3097911141812801,
+    "warm_median_latency_ms": 0.822459114715457
+  },
+  "provenance": {
+    "commit": "47fc542fb2da757d8a213c10735a7b076fd584b3",
+    "dirty": false,
+    "mind_sha256": "fd37e04c42f013bb5b46e56dd1ed4afcfc90c6a3ef38e2f3557cede03e31ec83",
+    "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
+    "python": "3.14.6",
+    "python_implementation": "CPython",
+    "sources": {
+      "bench/paraphrase.py": "549eed485418da4c29c5255b4180d14e791da04cf71bd41fd0146ff58c135c89",
+      "contrib/concept_embed_server.py": "7cf04ae0d0f9bd1d8ada5ec0e2f34276cf32097cc2b82208944d81aca2fffc0f"
+    }
+  },
+  "server": {
+    "accuracy": 1.0,
+    "backend": "server",
+    "cases": 20,
+    "cold_latency_ms": 137.6131249126047,
+    "correct": 20,
+    "p95_latency_ms": 6.688999943435192,
+    "warm_median_latency_ms": 3.9329170249402523
+  }
+}

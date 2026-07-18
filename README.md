@@ -25,7 +25,12 @@ builder reconstructs the single-file artifact byte-for-byte.
 ## Verified Status
 
 <!-- mind:facts begin -->
-- Generated facts will appear here.
+- Development version: `7.0.0.dev0` (preview).
+- Stable release: `6.2.10`; pinned `mind.py` SHA-256 `7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c`.
+- Discovered tests: **377**.
+- Distribution: **10** source-domain fragments build one deterministic file; development artifact SHA-256 `fd37e04c42f013bb5b46e56dd1ed4afcfc90c6a3ef38e2f3557cede03e31ec83`.
+- CI matrix: **9** operating-system/Python cells.
+- Command line: **30** commands; protocol server: **17** tools.
 <!-- mind:facts end -->
 
 `7.0.0.dev0` is a development preview. The pinned stable release remains
@@ -303,13 +308,20 @@ Every public result is JSON tied to an immutable input, source identity,
 backend identity, and exact command.
 
 <!-- mind:benchmarks begin -->
-| Result | Current development evidence |
-|---|---|
-| LongMemEval offline | evidence-turn@1 `0.500`, @5 `0.840`, answer-string@5 `0.580` |
-| LongMemEval reference sidecar | evidence-turn@1 `0.560`, @5 `0.840`, answer-string@5 `0.520` |
-| Paraphrase traps | offline `0/20`; reference sidecar `20/20` |
-| 10,000-fact bulk ingest | one commit; conservative lower-bound speedup above `50x` |
-| Auto-first horizon | 30 sessions and five simulated years pass |
+| Result | Current evidence | Raw report |
+|---|---:|---|
+| BM25 baseline | 0.660 / 0.920 / 0.560 | [`longmemeval-bm25-v7-dev.json`](bench/results/longmemeval-bm25-v7-dev.json) |
+| mind offline | 0.500 / 0.840 / 0.580 | [`longmemeval-offline-v7-dev.json`](bench/results/longmemeval-offline-v7-dev.json) |
+| mind with concept sidecar | 0.560 / 0.840 / 0.520 | [`longmemeval-concept-v7-dev.json`](bench/results/longmemeval-concept-v7-dev.json) |
+| Paraphrase traps | offline 0/20; sidecar 20/20 | [`paraphrase-v7-dev.json`](bench/results/paraphrase-v7-dev.json) |
+| 10,000-fact bulk ingest | one commit; conservative 98.0x speedup | [`bulk-v7-dev.json`](bench/results/bulk-v7-dev.json) |
+| Auto-first horizon | 30 sessions and 1825 simulated days | [`autonomy-five-year-v7-dev.json`](bench/results/autonomy-five-year-v7-dev.json) |
+| Single-file mutations | 40/120 killed (33.3%); 80 survived | [`mutation-mind-v7-dev.json`](bench/results/mutation-mind-v7-dev.json) |
+| LongMemEval-harness mutations | 35/120 killed (29.2%); 85 survived | [`mutation-longmemeval-v7-dev.json`](bench/results/mutation-longmemeval-v7-dev.json) |
+
+On this subset, BM25 leads both evidence metrics. This benchmark does not measure graph traversal, temporal validity, contradiction handling, or lifecycle operations, so it does not establish overall product superiority.
+
+LongMemEval values are evidence@1 / evidence@5 / answer-string@5.
 <!-- mind:benchmarks end -->
 
 Raw files live under `bench/results/`. The LongMemEval input is pinned by
@@ -371,6 +383,8 @@ python3 bench/autonomy.py --quick
 
 Release-only gates also run the full five-year autonomy horizon, immutable
 LongMemEval subset, both mutation targets, privacy scan, and all nine CI cells.
+See the [V7 verification record](docs/VERIFICATION.md) for the three-method
+gate, raw evidence, limitations, and remote completion requirements.
 
 <!-- mind:section security -->
 ## Security
