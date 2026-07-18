@@ -27,8 +27,8 @@ builder reconstructs the single-file artifact byte-for-byte.
 <!-- mind:facts begin -->
 - Development version: `7.0.0.dev0` (preview).
 - Stable release: `6.2.10`; pinned `mind.py` SHA-256 `7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c`.
-- Discovered tests: **378**.
-- Distribution: **10** source-domain fragments build one deterministic file; development artifact SHA-256 `fd37e04c42f013bb5b46e56dd1ed4afcfc90c6a3ef38e2f3557cede03e31ec83`.
+- Discovered tests: **379**.
+- Distribution: **10** source-domain fragments build one deterministic file; development artifact SHA-256 `c1cf48ce3c2cbadfd59497d40f68bc8d5e2f4c45d1448bd617a672b07f9f139a`.
 - CI matrix: **9** operating-system/Python cells.
 - Command line: **30** commands; protocol server: **17** tools.
 <!-- mind:facts end -->
@@ -314,9 +314,9 @@ backend identity, and exact command.
 | mind offline | 0.500 / 0.840 / 0.580 | [`longmemeval-offline-v7-dev.json`](bench/results/longmemeval-offline-v7-dev.json) |
 | mind with concept sidecar | 0.560 / 0.840 / 0.520 | [`longmemeval-concept-v7-dev.json`](bench/results/longmemeval-concept-v7-dev.json) |
 | Paraphrase traps | offline 0/20; sidecar 20/20 | [`paraphrase-v7-dev.json`](bench/results/paraphrase-v7-dev.json) |
-| 10,000-fact bulk ingest | one commit; conservative 98.0x speedup | [`bulk-v7-dev.json`](bench/results/bulk-v7-dev.json) |
+| 10,000-fact bulk ingest | one commit; conservative 109.2x speedup | [`bulk-v7-dev.json`](bench/results/bulk-v7-dev.json) |
 | Auto-first horizon | 30 sessions and 1825 simulated days | [`autonomy-five-year-v7-dev.json`](bench/results/autonomy-five-year-v7-dev.json) |
-| Single-file mutations | 40/120 killed (33.3%); 80 survived | [`mutation-mind-v7-dev.json`](bench/results/mutation-mind-v7-dev.json) |
+| Single-file mutations | 43/120 killed (35.8%); 77 survived | [`mutation-mind-v7-dev.json`](bench/results/mutation-mind-v7-dev.json) |
 | LongMemEval-harness mutations | 35/120 killed (29.2%); 85 survived | [`mutation-longmemeval-v7-dev.json`](bench/results/mutation-longmemeval-v7-dev.json) |
 
 On this subset, BM25 leads both evidence metrics. This benchmark does not measure graph traversal, temporal validity, contradiction handling, or lifecycle operations, so it does not establish overall product superiority.

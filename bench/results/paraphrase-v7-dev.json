@@ -6,15 +6,15 @@
     "accuracy": 0.0,
     "backend": "offline",
     "cases": 20,
-    "cold_latency_ms": 0.9442497976124287,
+    "cold_latency_ms": 0.8458329830318689,
     "correct": 0,
-    "p95_latency_ms": 1.3097911141812801,
-    "warm_median_latency_ms": 0.822459114715457
+    "p95_latency_ms": 1.3152910396456718,
+    "warm_median_latency_ms": 0.5086660385131836
   },
   "provenance": {
-    "commit": "47fc542fb2da757d8a213c10735a7b076fd584b3",
+    "commit": "b8bc57eeeb50a60779e9d37267bf6a8d284aab8a",
     "dirty": false,
-    "mind_sha256": "fd37e04c42f013bb5b46e56dd1ed4afcfc90c6a3ef38e2f3557cede03e31ec83",
+    "mind_sha256": "c1cf48ce3c2cbadfd59497d40f68bc8d5e2f4c45d1448bd617a672b07f9f139a",
     "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
     "python": "3.14.6",
     "python_implementation": "CPython",
@@ -27,9 +27,9 @@
     "accuracy": 1.0,
     "backend": "server",
     "cases": 20,
-    "cold_latency_ms": 137.6131249126047,
+    "cold_latency_ms": 135.3718750178814,
     "correct": 20,
-    "p95_latency_ms": 6.688999943435192,
-    "warm_median_latency_ms": 3.9329170249402523
+    "p95_latency_ms": 6.302834022790194,
+    "warm_median_latency_ms": 2.173250075429678
   }
 }

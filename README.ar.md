@@ -26,8 +26,8 @@
 <!-- mind:facts begin -->
 - نسخة التطوير: `7.0.0.dev0`، وحالتها معاينة قبل الإصدار.
 - الإصدار المستقر: `6.2.10`، وبصمة ملفه `7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c`.
-- الاختبارات المكتشفة آليا: **378**.
-- التوزيع: **10** مجالات مصدرية تبني ملفا واحدا حتميا؛ بصمة ملف التطوير `fd37e04c42f013bb5b46e56dd1ed4afcfc90c6a3ef38e2f3557cede03e31ec83`.
+- الاختبارات المكتشفة آليا: **379**.
+- التوزيع: **10** مجالات مصدرية تبني ملفا واحدا حتميا؛ بصمة ملف التطوير `c1cf48ce3c2cbadfd59497d40f68bc8d5e2f4c45d1448bd617a672b07f9f139a`.
 - مصفوفة التكامل: **9** خلايا لأنظمة وإصدارات بايثون.
 - سطر الأوامر: **30** أمرا؛ خادم البروتوكول: **17** أداة.
 <!-- mind:facts end -->
@@ -279,9 +279,9 @@ python3 mind.py suggest-user
 | مايند المحلي | 0.500 / 0.840 / 0.580 | [`longmemeval-offline-v7-dev.json`](bench/results/longmemeval-offline-v7-dev.json) |
 | مايند مع الخادم المفاهيمي | 0.560 / 0.840 / 0.520 | [`longmemeval-concept-v7-dev.json`](bench/results/longmemeval-concept-v7-dev.json) |
 | فخاخ إعادة الصياغة | المحلي 0/20؛ الخادم 20/20 | [`paraphrase-v7-dev.json`](bench/results/paraphrase-v7-dev.json) |
-| إدخال عشرة آلاف حقيقة | التزام واحد؛ تحسن محافظ 98.0 ضعفا | [`bulk-v7-dev.json`](bench/results/bulk-v7-dev.json) |
+| إدخال عشرة آلاف حقيقة | التزام واحد؛ تحسن محافظ 109.2 ضعفا | [`bulk-v7-dev.json`](bench/results/bulk-v7-dev.json) |
 | الأفق التلقائي | 30 جلسة و1825 يوما محاكى | [`autonomy-five-year-v7-dev.json`](bench/results/autonomy-five-year-v7-dev.json) |
-| طفرات الملف الموزع | 40/120 مقتولة (33.3%)؛ 80 ناجية | [`mutation-mind-v7-dev.json`](bench/results/mutation-mind-v7-dev.json) |
+| طفرات الملف الموزع | 43/120 مقتولة (35.8%)؛ 77 ناجية | [`mutation-mind-v7-dev.json`](bench/results/mutation-mind-v7-dev.json) |
 | طفرات مقياس الذاكرة الطويلة | 35/120 مقتولة (29.2%)؛ 85 ناجية | [`mutation-longmemeval-v7-dev.json`](bench/results/mutation-longmemeval-v7-dev.json) |
 
 في هذه العينة يتفوق خط أساس بي إم خمسة وعشرين في مقياسي دليل الأول ودليل الخمسة. لا يقيس هذا التقييم اجتياز الرسم أو الصلاحية الزمنية أو معالجة التناقض أو عمليات دورة الحياة، ولذلك لا يثبت تفوقا شاملا لأي منتج.

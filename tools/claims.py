@@ -106,11 +106,23 @@ def environment_names(source):
         name for name in names if re.fullmatch(r"MIND_[A-Z0-9_]+", name))
 
 
-def test_count():
-    script = (
-        "import unittest;"
-        "print(unittest.defaultTestLoader.discover('tests').countTestCases())"
-    )
+def discovered_test_ids():
+    script = """
+import json
+import unittest
+
+tests = []
+
+def add(item):
+    if isinstance(item, unittest.TestSuite):
+        for child in item:
+            add(child)
+    else:
+        tests.append(item.id())
+
+add(unittest.defaultTestLoader.discover("tests"))
+print(json.dumps(tests))
+"""
     result = subprocess.run(
         [sys.executable, "-c", script],
         cwd=ROOT,
@@ -118,7 +130,28 @@ def test_count():
         text=True,
         check=True,
     )
-    return int(result.stdout.strip())
+    return json.loads(result.stdout)
+
+
+def test_count():
+    return len(discovered_test_ids())
+
+
+def mutation_excluded_test_prefixes():
+    source = (ROOT / "bench" / "mutate.py").read_text("utf-8")
+    tree = ast.parse(source)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        if any(
+                isinstance(target, ast.Name)
+                and target.id == "MUTATION_EXCLUDED_TEST_PREFIXES"
+                for target in node.targets):
+            value = ast.literal_eval(node.value)
+            if isinstance(value, tuple) and all(
+                    isinstance(prefix, str) for prefix in value):
+                return value
+    raise ValueError("mutation exclusion contract not found")
 
 
 def computed_facts():
@@ -379,6 +412,10 @@ def section_flags(path):
 
 def validate_docs(facts):
     errors = []
+    mutation_prefixes = mutation_excluded_test_prefixes()
+    mutation_tests = sum(
+        not test_id.startswith(mutation_prefixes)
+        for test_id in discovered_test_ids())
     english_sections = section_ids(ROOT / "README.md")
     arabic_sections = section_ids(ROOT / "README.ar.md")
     if not english_sections or english_sections != arabic_sections:
@@ -476,6 +513,17 @@ def validate_docs(facts):
             baseline = data.get("baseline", {})
             if baseline.get("outcome") != "survived":
                 errors.append("mutation baseline is not green: %s" % relative)
+            suite = data.get("suite", {})
+            if suite.get("excluded_test_prefixes") != list(
+                    mutation_prefixes) or not isinstance(
+                        suite.get("exclusion_reason"), str):
+                errors.append(
+                    "mutation suite exclusion contract mismatch in %s"
+                    % relative)
+            if baseline.get("tests_run") != mutation_tests:
+                errors.append(
+                    "mutation baseline test count mismatch in %s"
+                    % relative)
             if summary.get("timed_out") or \
                     summary.get("infrastructure_error") or \
                     summary.get("invalid"):
