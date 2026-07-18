@@ -220,6 +220,7 @@ def run_suite(workdir, timeout=DEFAULT_TIMEOUT):
         result = subprocess.run(
             _suite_command(),
             cwd=str(workdir),
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,

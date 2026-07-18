@@ -147,6 +147,22 @@ class TestMutationBench(unittest.TestCase):
 
         self.assertEqual(result["outcome"], "timed_out")
 
+    def test_mutation_suite_closes_standard_input(self):
+        tests = self.tmp / "tests"
+        tests.mkdir()
+        (tests / "test_stdin.py").write_text(
+            "import sys, unittest\n"
+            "class StandardInput(unittest.TestCase):\n"
+            "    def test_eof(self):\n"
+            "        self.assertEqual(sys.stdin.read(), '')\n",
+            encoding="utf-8",
+        )
+
+        result = MUTATE.run_suite(self.tmp, timeout=5)
+
+        self.assertEqual(result["outcome"], "survived")
+        self.assertEqual(result["tests_run"], 1)
+
     def test_failing_test_names_are_preserved(self):
         tests = self.tmp / "tests"
         tests.mkdir()
