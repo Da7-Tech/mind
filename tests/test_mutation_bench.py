@@ -141,6 +141,19 @@ class TestMutationBench(unittest.TestCase):
         self.assertNotIn(str(self.tmp), result["stderr"])
         self.assertIn("<workspace>", result["stderr"])
 
+    def test_diagnostics_remove_runtime_install_paths(self):
+        runtime_file = Path(sys.prefix) / "lib" / "python" / "threading.py"
+        text = (
+            'File "%s", line 1\ncommand %s\n'
+            % (runtime_file, sys.executable))
+
+        diagnostic = MUTATE._diagnostic(text, self.tmp)
+
+        self.assertNotIn(sys.prefix, diagnostic)
+        self.assertNotIn(sys.executable, diagnostic)
+        self.assertIn("<python-root>", diagnostic)
+        self.assertIn("<python>", diagnostic)
+
     def test_parallel_kill_must_repeat_in_isolation(self):
         initial = [{
             "outcome": "killed",

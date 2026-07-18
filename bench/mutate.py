@@ -169,7 +169,17 @@ def _diagnostic(text, workdir):
         str(Path(workdir).resolve()): "<workspace>",
         str(Path(tempfile.gettempdir())): "<tmp>",
         str(Path(tempfile.gettempdir()).resolve()): "<tmp>",
+        str(Path(sys.executable)): "<python>",
+        str(Path(sys.executable).resolve()): "<python>",
     }
+    for runtime_root in {
+            sys.prefix,
+            sys.exec_prefix,
+            getattr(sys, "base_prefix", sys.prefix),
+            getattr(sys, "base_exec_prefix", sys.exec_prefix),
+    }:
+        replacements[str(Path(runtime_root))] = "<python-root>"
+        replacements[str(Path(runtime_root).resolve())] = "<python-root>"
     for value, replacement in sorted(
             replacements.items(), key=lambda item: -len(item[0])):
         text = text.replace(value, replacement)

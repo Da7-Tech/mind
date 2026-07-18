@@ -7,7 +7,6 @@ import json
 import re
 import subprocess
 import sys
-import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +23,9 @@ PERSONAL_PATTERNS = (
     re.compile(r"(?i)[A-Z]:\\\\Users\\\\[^\\\\\s]+\\\\"),
     re.compile(r"/(?:private/)?var/folders/"),
     re.compile(r"/tmp/"),
+    re.compile(
+        r"/(?:opt/homebrew|usr/local)/(?:Cellar|opt)/"
+        r"|/Library/Frameworks/Python\.framework/Versions/"),
     re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"),
 )
 
@@ -105,8 +107,18 @@ def environment_names(source):
 
 
 def test_count():
-    suite = unittest.defaultTestLoader.discover(str(ROOT / "tests"))
-    return suite.countTestCases()
+    script = (
+        "import unittest;"
+        "print(unittest.defaultTestLoader.discover('tests').countTestCases())"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return int(result.stdout.strip())
 
 
 def computed_facts():
@@ -322,6 +334,15 @@ def benchmark_block(facts, language):
         for label, value, path in rows
     )
     lines.append(
+        "\nOn this subset, BM25 leads both evidence metrics. This "
+        "benchmark does not measure graph traversal, temporal validity, "
+        "contradiction handling, or lifecycle operations, so it does not "
+        "establish overall product superiority." if language == "en" else
+        "\nفي هذه العينة يتفوق خط أساس بي إم خمسة وعشرين في مقياسي "
+        "دليل الأول ودليل الخمسة. لا يقيس هذا التقييم اجتياز الرسم أو "
+        "الصلاحية الزمنية أو معالجة التناقض أو عمليات دورة الحياة، ولذلك "
+        "لا يثبت تفوقا شاملا لأي منتج.")
+    lines.append(
         "\nLongMemEval values are evidence@1 / evidence@5 / "
         "answer-string@5." if language == "en" else
         "\nقيم الذاكرة الطويلة هي دليل الأول ثم دليل الخمسة ثم نص "
@@ -444,7 +465,13 @@ def validate_docs(facts):
             errors.append("artifact hash mismatch in %s" % relative)
         if "--json-out" in str(data.get("command", "")):
             errors.append("output path retained in command: %s" % relative)
-        if data.get("benchmark") == "deterministic-mutation-v2":
+        benchmark = data.get("benchmark")
+        if isinstance(benchmark, str) and benchmark.startswith(
+                "deterministic-mutation-"):
+            if benchmark != "deterministic-mutation-v3" or \
+                    data.get("format") != 2:
+                errors.append(
+                    "obsolete mutation report format in %s" % relative)
             summary = data.get("summary", {})
             baseline = data.get("baseline", {})
             if baseline.get("outcome") != "survived":
@@ -461,6 +488,39 @@ def validate_docs(facts):
                         str(corpus.get("manifest_sha256", ""))):
                 errors.append(
                     "invalid mutation corpus identity in %s" % relative)
+            if corpus.get("generator_sha256") != sha256(
+                    ROOT / "bench" / "mutate.py"):
+                errors.append(
+                    "stale mutation generator identity in %s" % relative)
+            mutants = data.get("mutants", [])
+            rechecks = [
+                mutant for mutant in mutants
+                if isinstance(mutant, dict)
+                and "initial_attempt" in mutant
+            ]
+            reclassified = [
+                mutant for mutant in rechecks
+                if mutant.get("reclassified_parallel_noise") is True
+            ]
+            if summary.get("candidate_rechecks") != len(rechecks) or \
+                    summary.get("parallel_noise_reclassified") != len(
+                        reclassified):
+                errors.append(
+                    "mutation confirmation accounting mismatch in %s"
+                    % relative)
+            if any(
+                    mutant.get("outcome") == "killed"
+                    and mutant.get("execution_mode") not in (
+                        "isolated", "isolated_confirmation")
+                    for mutant in mutants
+                    if isinstance(mutant, dict)):
+                errors.append(
+                    "unconfirmed parallel kill in %s" % relative)
+            if summary.get("attempted") != data.get("sample_size") or \
+                    summary.get("classified") != data.get("sample_size"):
+                errors.append(
+                    "mutation sample is not fully classified in %s"
+                    % relative)
     manifest = json.loads(
         (ROOT / "bench" / "manifests" /
          "longmemeval.json").read_text("utf-8"))

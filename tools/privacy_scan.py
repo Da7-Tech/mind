@@ -18,6 +18,9 @@ PATTERNS = (
         r"(?:/Users/|/home/)[^/\s]+/|(?i:[A-Z]:\\\\Users\\\\[^\\\\\s]+\\\\)")),
     ("private temporary path", re.compile(
         r"/(?:private/)?var/folders/|/tmp/")),
+    ("machine-specific package path", re.compile(
+        r"/(?:opt/homebrew|usr/local)/(?:Cellar|opt)/"
+        r"|/Library/Frameworks/Python\.framework/Versions/")),
     ("owner personal name", re.compile(r"(?i)\braif\b|رائف")),
     ("private audit artifact", re.compile(
         r"mind-final-consolidated-audit|mind-implementation-task")),
