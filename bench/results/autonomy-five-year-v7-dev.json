@@ -20,9 +20,9 @@
     "simulated_years": 5.0
   },
   "provenance": {
-    "commit": "b8bc57eeeb50a60779e9d37267bf6a8d284aab8a",
-    "dirty": false,
-    "mind_sha256": "c1cf48ce3c2cbadfd59497d40f68bc8d5e2f4c45d1448bd617a672b07f9f139a",
+    "commit": "aa6dfa9774a0e5480989e3495a71543fdc5bb96f",
+    "dirty": true,
+    "mind_sha256": "ae2fc389b3b09c93cb432ab55b71063d98b400da6b18d6bc178322bc8f3fcf69",
     "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
     "python": "3.14.6",
     "python_implementation": "CPython",
