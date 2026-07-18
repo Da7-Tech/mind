@@ -29,7 +29,7 @@ jobs:
           python tools/build_single.py --check
           python tools/claims.py check
           python tools/privacy_scan.py --tracked
-          python -m py_compile mind.py src/mind/*.py bench/*.py contrib/*.py tools/*.py
+          python -m compileall -q mind.py src/mind bench contrib tools
       - name: Complete test suite
         run: python -m unittest discover -s tests -v
       - name: Retrieval and lifecycle benchmarks

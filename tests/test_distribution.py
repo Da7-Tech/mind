@@ -13,6 +13,17 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class TestDistribution(unittest.TestCase):
+    def test_public_text_artifacts_are_lf_stable(self):
+        attributes = (ROOT / ".gitattributes").read_text("utf-8")
+        for pattern in (
+                "*.json text eol=lf",
+                "*.jsonl text eol=lf",
+                "*.md text eol=lf",
+                "*.py text eol=lf",
+                "*.yaml text eol=lf",
+                "*.yml text eol=lf"):
+            self.assertIn(pattern, attributes)
+
     def test_manifest_has_named_domain_fragments(self):
         manifest = json.loads(
             (ROOT / "src" / "mind" / "source.json").read_text("utf-8"))
