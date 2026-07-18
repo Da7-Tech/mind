@@ -4,15 +4,15 @@
     "journal_batches": 1,
     "signal_batches": 1
   },
-  "batch_seconds": 1.3750266251154244,
+  "batch_seconds": 1.5511990000959486,
   "benchmark": "transactional-bulk-ingest-v1",
   "command": "python3.14 bench/bulk.py --records 10000 --serial-sample 200 --serial-repetitions 3",
-  "conservative_lower_bound_speedup": 107.88860785963467,
-  "conservative_serial_seconds": 148.34970835363492,
+  "conservative_lower_bound_speedup": 91.01543789215874,
+  "conservative_serial_seconds": 141.18305625161156,
   "method": "serial projection uses the measured average cost of the first sample as a lower bound; later serial writes process a no-smaller graph, so the projection does not overstate speedup",
   "provenance": {
-    "commit": "aa6dfa9774a0e5480989e3495a71543fdc5bb96f",
-    "dirty": true,
+    "commit": "91cbbf0089e6aa366a15556968a73faf4f83a3cd",
+    "dirty": false,
     "mind_sha256": "ae2fc389b3b09c93cb432ab55b71063d98b400da6b18d6bc178322bc8f3fcf69",
     "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
     "python": "3.14.6",
@@ -31,5 +31,5 @@
   },
   "serial_repetitions": 3,
   "serial_sample": 200,
-  "serial_sample_median_seconds": 2.9669941670726985
+  "serial_sample_median_seconds": 2.823661125032231
 }

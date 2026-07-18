@@ -279,7 +279,7 @@ python3 mind.py suggest-user
 | مايند المحلي | 0.500 / 0.840 / 0.580 | [`longmemeval-offline-v7-dev.json`](bench/results/longmemeval-offline-v7-dev.json) |
 | مايند مع الخادم المفاهيمي | 0.560 / 0.840 / 0.520 | [`longmemeval-concept-v7-dev.json`](bench/results/longmemeval-concept-v7-dev.json) |
 | فخاخ إعادة الصياغة | المحلي 0/20؛ الخادم 20/20 | [`paraphrase-v7-dev.json`](bench/results/paraphrase-v7-dev.json) |
-| إدخال عشرة آلاف حقيقة | التزام واحد؛ تحسن محافظ 109.2 ضعفا | [`bulk-v7-dev.json`](bench/results/bulk-v7-dev.json) |
+| إدخال عشرة آلاف حقيقة | التزام واحد؛ تحسن محافظ 91.0 ضعفا | [`bulk-v7-dev.json`](bench/results/bulk-v7-dev.json) |
 | الأفق التلقائي | 30 جلسة و1825 يوما محاكى | [`autonomy-five-year-v7-dev.json`](bench/results/autonomy-five-year-v7-dev.json) |
 | طفرات الملف الموزع | 43/120 مقتولة (35.8%)؛ 77 ناجية | [`mutation-mind-v7-dev.json`](bench/results/mutation-mind-v7-dev.json) |
 | طفرات مقياس الذاكرة الطويلة | 35/120 مقتولة (29.2%)؛ 85 ناجية | [`mutation-longmemeval-v7-dev.json`](bench/results/mutation-longmemeval-v7-dev.json) |

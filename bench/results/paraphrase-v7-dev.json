@@ -6,13 +6,13 @@
     "accuracy": 0.0,
     "backend": "offline",
     "cases": 20,
-    "cold_latency_ms": 0.5789580754935741,
+    "cold_latency_ms": 1.505125081166625,
     "correct": 0,
-    "p95_latency_ms": 2.346999943256378,
-    "warm_median_latency_ms": 0.8674999698996544
+    "p95_latency_ms": 1.6781250014901161,
+    "warm_median_latency_ms": 1.0512499138712883
   },
   "provenance": {
-    "commit": "aa6dfa9774a0e5480989e3495a71543fdc5bb96f",
+    "commit": "91cbbf0089e6aa366a15556968a73faf4f83a3cd",
     "dirty": false,
     "mind_sha256": "ae2fc389b3b09c93cb432ab55b71063d98b400da6b18d6bc178322bc8f3fcf69",
     "platform": "macOS-26.4.1-arm64-arm-64bit-Mach-O",
@@ -27,9 +27,9 @@
     "accuracy": 1.0,
     "backend": "server",
     "cases": 20,
-    "cold_latency_ms": 205.93295781873167,
+    "cold_latency_ms": 231.37541697360575,
     "correct": 20,
-    "p95_latency_ms": 10.611082892864943,
-    "warm_median_latency_ms": 5.672917002812028
+    "p95_latency_ms": 8.298333967104554,
+    "warm_median_latency_ms": 5.438665859401226
   }
 }

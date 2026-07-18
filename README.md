@@ -313,7 +313,7 @@ backend identity, and exact command.
 | mind offline | 0.500 / 0.840 / 0.580 | [`longmemeval-offline-v7-dev.json`](bench/results/longmemeval-offline-v7-dev.json) |
 | mind with concept sidecar | 0.560 / 0.840 / 0.520 | [`longmemeval-concept-v7-dev.json`](bench/results/longmemeval-concept-v7-dev.json) |
 | Paraphrase traps | offline 0/20; sidecar 20/20 | [`paraphrase-v7-dev.json`](bench/results/paraphrase-v7-dev.json) |
-| 10,000-fact bulk ingest | one commit; conservative 109.2x speedup | [`bulk-v7-dev.json`](bench/results/bulk-v7-dev.json) |
+| 10,000-fact bulk ingest | one commit; conservative 91.0x speedup | [`bulk-v7-dev.json`](bench/results/bulk-v7-dev.json) |
 | Auto-first horizon | 30 sessions and 1825 simulated days | [`autonomy-five-year-v7-dev.json`](bench/results/autonomy-five-year-v7-dev.json) |
 | Single-file mutations | 43/120 killed (35.8%); 77 survived | [`mutation-mind-v7-dev.json`](bench/results/mutation-mind-v7-dev.json) |
 | LongMemEval-harness mutations | 35/120 killed (29.2%); 85 survived | [`mutation-longmemeval-v7-dev.json`](bench/results/mutation-longmemeval-v7-dev.json) |
