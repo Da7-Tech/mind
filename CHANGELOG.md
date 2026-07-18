@@ -1,8 +1,13 @@
 # Changelog
 
-## Unreleased
+## 7.0.0 — 2026-07-18
 
-- Development identity is now `7.0.0.dev0`, distinct from the pinned stable
+The memory-platform release. Version 7 turns the audited single-file memory
+engine into an auto-first, typed, privacy-complete, agent-neutral platform
+while preserving deterministic offline operation and a standard-library-only
+runtime.
+
+- Release identity is now `7.0.0`, distinct from the previous stable
   `6.2.10` artifact. Verbose version output includes commit and artifact hash.
 - Split development source into ten domain fragments under `src/mind/` while
   preserving one deterministic, standard-library-only `mind.py` artifact.

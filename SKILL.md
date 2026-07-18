@@ -1,7 +1,7 @@
 ---
 name: mind
 description: Local project memory with recall, provenance, policy, and dreams.
-version: 7.0.0-dev
+version: 7.0.0
 author: Da7-Tech
 license: MIT
 platforms: [linux, macos, windows]
@@ -20,20 +20,19 @@ consolidates them automatically. The default artifact is one standard-library
 Python file.
 
 <!-- mind:facts begin -->
-- Development version: `7.0.0.dev0` (preview).
-- Stable release: `6.2.10`; pinned `mind.py` SHA-256 `7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c`.
+- Development version: `7.0.0` (stable).
+- Stable release: `7.0.0`; pinned `mind.py` SHA-256 `ae2fc389b3b09c93cb432ab55b71063d98b400da6b18d6bc178322bc8f3fcf69`.
 - Discovered tests: **379**.
-- Distribution: **10** source-domain fragments build one deterministic file; development artifact SHA-256 `c1cf48ce3c2cbadfd59497d40f68bc8d5e2f4c45d1448bd617a672b07f9f139a`.
+- Distribution: **10** source-domain fragments build one deterministic file; current artifact SHA-256 `ae2fc389b3b09c93cb432ab55b71063d98b400da6b18d6bc178322bc8f3fcf69`.
 - CI matrix: **9** operating-system/Python cells.
 - Command line: **30** commands; protocol server: **17** tools.
 <!-- mind:facts end -->
 
 ## Release Identity
 
-This skill describes the `7.0.0.dev0` development preview. The pinned stable
-`6.2.10` artifact does not contain the v7 lifecycle, protocol server, typed
-memory, or modular-source features. Never install the stable artifact and then
-claim that an unreleased command is available.
+This skill describes the stable `7.0.0` release. Its pinned single-file
+artifact contains the v7 lifecycle, protocol server, typed memory, privacy,
+automatic capture, and modular-source features documented here.
 
 ## Use It When
 
@@ -47,17 +46,14 @@ claim that an unreleased command is available.
 Do not use it as a document-scale RAG system, secret manager, rollback system,
 or silent store for personal identity.
 
-## Development Setup
+## Installation
 
 ```bash
-git clone https://github.com/Da7-Tech/mind.git
-cd mind
-python3 tools/build_single.py --check
+curl -fsSLO https://raw.githubusercontent.com/Da7-Tech/mind/v7.0.0/mind.py
 python3 mind.py init
 ```
 
-The stable release remains available through its pinned tag and checksum in
-the repository README.
+Verify the release checksum with the command in the repository README.
 
 ## Agent Contract
 

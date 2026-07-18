@@ -192,16 +192,20 @@ def computed_facts():
 def facts_block(facts, language):
     stable = facts["stable_release"]
     if language == "ar":
+        status = {
+            "preview": "معاينة قبل الإصدار",
+            "stable": "مستقرة",
+        }.get(facts["development_status"], facts["development_status"])
         body = [
             BEGIN,
-            "- نسخة التطوير: `%s`، وحالتها معاينة قبل الإصدار."
-            % facts["development_version"],
+            "- النسخة الحالية: `%s`، وحالتها %s."
+            % (facts["development_version"], status),
             "- الإصدار المستقر: `%s`، وبصمة ملفه `%s`."
             % (stable["version"], stable["mind_sha256"]),
             "- الاختبارات المكتشفة آليا: **%d**."
             % facts["test_count"],
             "- التوزيع: **%d** مجالات مصدرية تبني ملفا واحدا حتميا؛ "
-            "بصمة ملف التطوير `%s`."
+            "بصمة الملف الحالي `%s`."
             % (facts["source_fragments"], facts["artifact_sha256"]),
             "- مصفوفة التكامل: **%d** خلايا لأنظمة وإصدارات بايثون."
             % facts["ci_cells"],
@@ -219,7 +223,7 @@ def facts_block(facts, language):
             "- Discovered tests: **%d**."
             % facts["test_count"],
             "- Distribution: **%d** source-domain fragments build one "
-            "deterministic file; development artifact SHA-256 `%s`."
+            "deterministic file; current artifact SHA-256 `%s`."
             % (facts["source_fragments"], facts["artifact_sha256"]),
             "- CI matrix: **%d** operating-system/Python cells."
             % facts["ci_cells"],

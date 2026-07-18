@@ -1,10 +1,10 @@
 {
   "format": 1,
-  "development_status": "preview",
+  "development_status": "stable",
   "stable_release": {
-    "version": "6.2.10",
-    "tag": "v6.2.10",
-    "mind_sha256": "7cb64a6bb96824a6ac00d8871b889b02d57526fc9a70cf33488ae443c8bf139c"
+    "version": "7.0.0",
+    "tag": "v7.0.0",
+    "mind_sha256": "ae2fc389b3b09c93cb432ab55b71063d98b400da6b18d6bc178322bc8f3fcf69"
   },
   "supported_python": [
     "3.9",
