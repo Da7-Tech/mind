@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import mind as M
 
@@ -53,12 +54,17 @@ class TestMCPServer(unittest.TestCase):
         server = M.MCPServer()
         server.initialized = True
 
+        class ForbiddenFallback:
+            def __iter__(self):
+                raise AssertionError("explicit empty stdin was ignored")
+
         self.assertIsNone(server.handle({
             "jsonrpc": "2.0",
             "method": "notifications/cancelled",
             "params": {"requestId": 42, "reason": "client closed"},
         }))
-        with tempfile.SpooledTemporaryFile(mode="w+") as output:
+        with tempfile.SpooledTemporaryFile(mode="w+") as output, \
+                mock.patch.object(M.sys, "stdin", ForbiddenFallback()):
             self.assertEqual(
                 server.run_stdio(stdin=[], stdout=output), 0)
             output.seek(0)

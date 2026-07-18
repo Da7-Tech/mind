@@ -1368,8 +1368,10 @@ class MCPServer:
                 -32601, "Method not found: %s" % method))
 
     def run_stdio(self, stdin=None, stdout=None):
-        stdin = stdin or sys.stdin
-        stdout = stdout or sys.stdout
+        if stdin is None:
+            stdin = sys.stdin
+        if stdout is None:
+            stdout = sys.stdout
         for raw in stdin:
             if not raw.strip():
                 continue
